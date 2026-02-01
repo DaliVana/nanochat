@@ -32,7 +32,7 @@ class GPTConfig:
     vocab_size: int = 32768
     n_layer: int = 12
     n_head: int = 6 # number of query heads
-    n_kv_head: int = 6 # number of key/value heads (GQA)
+    n_kv_head: int = 6 # number of key/value heads (GQA) - ignored when use_mla=True
     n_embd: int = 768
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (half context)
@@ -43,6 +43,39 @@ class GPTConfig:
     mod_capacity: float = 1.0                # Fraction of tokens processed (1.0 = disabled)
     mod_fixed_layers_start: int = 5          # First N layers always full capacity
     mod_fixed_layers_end: int = 1            # Last N layers always full capacity
+    # Multi-Head Latent Attention (MLA) parameters
+    use_mla: bool = True           # Enable MLA (False = standard attention)
+    mla_d_c: int = 0                # KV compression dimension (0 = auto-scale: n_embd // 3)
+    mla_d_c1: int = 0               # Q compression dimension (0 = same as mla_d_c)
+    mla_d_rope: int = 0             # Decoupled RoPE dimension (0 = auto-scale: head_dim // 2)
+
+
+def get_mla_dims(config):
+    """Compute MLA dimensions with automatic scaling based on model size."""
+    head_dim = config.n_embd // config.n_head
+
+    if config.mla_d_c > 0:
+        d_c = config.mla_d_c
+    else:
+        # Auto-scale: d_c = n_embd // 3 (moderate ~3x compression)
+        d_c = config.n_embd // 3
+
+    if config.mla_d_c1 > 0:
+        d_c1 = config.mla_d_c1
+    else:
+        # Default: same as d_c for query compression
+        d_c1 = d_c
+
+    if config.mla_d_rope > 0:
+        d_rope = config.mla_d_rope
+    else:
+        # Auto-scale: d_rope = head_dim // 2 (half for position, half for content)
+        d_rope = head_dim // 2
+
+    # Ensure d_rope < head_dim (need room for non-positional part)
+    assert d_rope < head_dim, f"d_rope ({d_rope}) must be less than head_dim ({head_dim})"
+
+    return d_c, d_c1, d_rope
 
 
 def norm(x):
@@ -148,6 +181,128 @@ class CausalSelfAttention(nn.Module):
         return self.c_proj(y)
 
 
+class MLACausalSelfAttention(nn.Module):
+    """
+    Multi-Head Latent Attention (MLA) from DeepSeek-V2/V3.
+
+    Key differences from standard attention:
+    - KV are compressed through a low-rank bottleneck (d_c dimension)
+    - Q is optionally compressed through a separate bottleneck (d_c1 dimension)
+    - RoPE is decoupled: position-independent part goes through compression,
+      position-aware part (d_rope) is computed separately and concatenated
+    - All heads share the same compressed KV latent
+    """
+
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.n_layer = config.n_layer
+        self.head_dim = config.n_embd // config.n_head
+
+        # Get MLA dimensions
+        d_c, d_c1, d_rope = get_mla_dims(config)
+        self.d_c = d_c
+        self.d_c1 = d_c1
+        self.d_rope = d_rope
+        self.d_nope = self.head_dim - d_rope  # non-positional dim per head
+
+        assert self.d_nope > 0, f"d_rope ({d_rope}) must be less than head_dim ({self.head_dim})"
+
+        # KV compression: X -> c_kv -> K_nope, V
+        self.w_dkv = nn.Linear(config.n_embd, self.d_c, bias=False)  # down-project
+        self.w_uk = nn.Linear(self.d_c, self.n_head * self.d_nope, bias=False)  # up-project K (non-positional)
+        self.w_uv = nn.Linear(self.d_c, self.n_head * self.head_dim, bias=False)  # up-project V
+
+        # Decoupled RoPE key: computed directly from X, shared across heads
+        self.w_kr = nn.Linear(config.n_embd, self.d_rope, bias=False)
+
+        # Q compression
+        if self.d_c1 > 0:
+            self.w_dq = nn.Linear(config.n_embd, self.d_c1, bias=False)  # down-project
+            self.w_uq = nn.Linear(self.d_c1, self.n_head * self.d_nope, bias=False)  # up-project Q (non-positional)
+            self.w_qr = nn.Linear(self.d_c1, self.n_head * self.d_rope, bias=False)  # Q RoPE part
+        else:
+            # No Q compression - direct projection
+            self.w_dq = None
+            self.w_uq = nn.Linear(config.n_embd, self.n_head * self.d_nope, bias=False)
+            self.w_qr = nn.Linear(config.n_embd, self.n_head * self.d_rope, bias=False)
+
+        # Output projection
+        self.c_proj = nn.Linear(self.n_head * self.head_dim, config.n_embd, bias=False)
+
+        # Value embedding (keep for compatibility with existing architecture)
+        self.ve_gate_channels = 32
+        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_head, bias=False)
+
+    def forward(self, x, ve, cos, sin, window_size, kv_cache=None):
+        B, T, C = x.size()
+
+        # 1. Compress KV
+        c_kv = self.w_dkv(x)  # (B, T, d_c)
+
+        # 2. Decompress K (non-positional part)
+        k_nope = self.w_uk(c_kv).view(B, T, self.n_head, self.d_nope)
+
+        # 3. Compute positional K (decoupled RoPE) - shared across heads then expanded
+        k_rope = self.w_kr(x).view(B, T, 1, self.d_rope)
+        k_rope = k_rope.expand(B, T, self.n_head, self.d_rope)
+
+        # 4. Decompress V
+        v = self.w_uv(c_kv).view(B, T, self.n_head, self.head_dim)
+
+        # 5. Value embedding (if applicable)
+        if ve is not None:
+            ve = ve.view(B, T, self.n_head, self.head_dim)
+            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_head), range (0, 2)
+            v = v + gate.unsqueeze(-1) * ve
+
+        # 6. Compute Q
+        if self.w_dq is not None:
+            c_q = self.w_dq(x)  # (B, T, d_c1)
+            q_nope = self.w_uq(c_q).view(B, T, self.n_head, self.d_nope)
+            q_rope = self.w_qr(c_q).view(B, T, self.n_head, self.d_rope)
+        else:
+            q_nope = self.w_uq(x).view(B, T, self.n_head, self.d_nope)
+            q_rope = self.w_qr(x).view(B, T, self.n_head, self.d_rope)
+
+        # 7. Apply RoPE to positional parts only
+        q_rope = apply_rotary_emb(q_rope, cos, sin)
+        k_rope = apply_rotary_emb(k_rope, cos, sin)
+
+        # 8. Concatenate positional and non-positional parts
+        # K = [K_nope ; K_rope], Q = [Q_nope ; Q_rope]
+        k = torch.cat([k_nope, k_rope], dim=-1)  # (B, T, n_head, head_dim)
+        q = torch.cat([q_nope, q_rope], dim=-1)  # (B, T, n_head, head_dim)
+
+        # 9. QK norm
+        q, k = norm(q), norm(k)
+
+        # 10. Attention (same interface as standard attention)
+        if kv_cache is None:
+            # Training: causal attention with optional sliding window
+            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        else:
+            # Inference: use flash_attn_with_kvcache (compatibility mode - store full K/V)
+            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+            y = flash_attn.flash_attn_with_kvcache(
+                q, k_cache, v_cache,
+                k=k, v=v,
+                cache_seqlens=kv_cache.cache_seqlens,
+                causal=True,
+                window_size=window_size,
+            )
+            # Advance position after last layer processes
+            if self.layer_idx == kv_cache.n_layers - 1:
+                kv_cache.advance(T)
+
+        # 11. Re-assemble and project
+        y = y.contiguous().view(B, T, -1)
+        y = self.c_proj(y)
+        return y
+
+
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -165,7 +320,10 @@ class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.layer_idx = layer_idx
-        self.attn = CausalSelfAttention(config, layer_idx)
+        if config.use_mla:
+            self.attn = MLACausalSelfAttention(config, layer_idx)
+        else:
+            self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos, sin, window_size, kv_cache):
@@ -237,15 +395,27 @@ class GPT(nn.Module):
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
         # Value embeddings (ResFormer-style): every layer
         head_dim = config.n_embd // config.n_head
-        kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer)})
+        if config.use_mla:
+            # MLA: value embeddings have full n_head (no GQA)
+            ve_dim = config.n_head * head_dim
+        else:
+            # Standard: value embeddings use n_kv_head (GQA support)
+            ve_dim = config.n_kv_head * head_dim
+        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, ve_dim) for i in range(config.n_layer)})
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
         # In the future we can dynamically grow the cache, for now it's fine.
         self.rotary_seq_len = config.sequence_len * 10 # 10X over-compute should be enough, TODO make nicer?
         head_dim = config.n_embd // config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        if config.use_mla:
+            # MLA: RoPE is applied only to the d_rope portion of each head
+            _, _, d_rope = get_mla_dims(config)
+            rope_dim = d_rope
+        else:
+            # Standard: RoPE is applied to full head_dim
+            rope_dim = head_dim
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, rope_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
 
@@ -257,10 +427,20 @@ class GPT(nn.Module):
         wte (embedding):     normal, std=1.0
         lm_head:             normal, std=0.001
         for each block:
-            attn.c_q:        uniform, std=1/sqrt(n_embd)
-            attn.c_k:        uniform, std=1/sqrt(n_embd)
-            attn.c_v:        uniform, std=1/sqrt(n_embd)
-            attn.c_proj:     zeros
+            Standard attention:
+                attn.c_q:        uniform, std=1/sqrt(n_embd)
+                attn.c_k:        uniform, std=1/sqrt(n_embd)
+                attn.c_v:        uniform, std=1/sqrt(n_embd)
+                attn.c_proj:     zeros
+            MLA attention:
+                attn.w_dkv:      uniform, std=1/sqrt(n_embd)
+                attn.w_uk:       uniform, std=1/sqrt(d_c)
+                attn.w_uv:       uniform, std=1/sqrt(d_c)
+                attn.w_kr:       uniform, std=1/sqrt(n_embd)
+                attn.w_dq:       uniform, std=1/sqrt(n_embd) (if exists)
+                attn.w_uq:       uniform, std=1/sqrt(d_c1 or n_embd)
+                attn.w_qr:       uniform, std=1/sqrt(d_c1 or n_embd)
+                attn.c_proj:     zeros
             mlp.c_fc:        uniform, std=1/sqrt(n_embd)
             mlp.c_proj:      zeros
         """
@@ -272,13 +452,40 @@ class GPT(nn.Module):
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
-        for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+
+        if self.config.use_mla:
+            # MLA attention initialization
+            d_c, d_c1, _ = get_mla_dims(self.config)
+            s_dc = 3**0.5 * d_c**-0.5
+            s_dc1 = 3**0.5 * (d_c1 if d_c1 > 0 else n_embd)**-0.5
+            for block in self.transformer.h:
+                # KV compression path
+                torch.nn.init.uniform_(block.attn.w_dkv.weight, -s, s)  # down-project from n_embd
+                torch.nn.init.uniform_(block.attn.w_uk.weight, -s_dc, s_dc)  # up-project from d_c
+                torch.nn.init.uniform_(block.attn.w_uv.weight, -s_dc, s_dc)  # up-project from d_c
+                torch.nn.init.uniform_(block.attn.w_kr.weight, -s, s)  # RoPE key from n_embd
+                # Q compression path
+                if block.attn.w_dq is not None:
+                    torch.nn.init.uniform_(block.attn.w_dq.weight, -s, s)  # down-project from n_embd
+                    torch.nn.init.uniform_(block.attn.w_uq.weight, -s_dc1, s_dc1)  # up-project from d_c1
+                    torch.nn.init.uniform_(block.attn.w_qr.weight, -s_dc1, s_dc1)  # RoPE query from d_c1
+                else:
+                    torch.nn.init.uniform_(block.attn.w_uq.weight, -s, s)  # direct from n_embd
+                    torch.nn.init.uniform_(block.attn.w_qr.weight, -s, s)  # direct from n_embd
+                # Output projection
+                torch.nn.init.zeros_(block.attn.c_proj.weight)
+                # MLP
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
+        else:
+            # Standard attention initialization
+            for block in self.transformer.h:
+                torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
+                torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+                torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)   # 1.0 => typical residual connections at init
@@ -294,7 +501,12 @@ class GPT(nn.Module):
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        if self.config.use_mla:
+            _, _, d_rope = get_mla_dims(self.config)
+            rope_dim = d_rope
+        else:
+            rope_dim = head_dim
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, rope_dim)
         self.cos, self.sin = cos, sin
 
         # Cast embeddings to bf16: optimizer can tolerate it and it saves memory
