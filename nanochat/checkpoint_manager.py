@@ -26,6 +26,13 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    # MoD defaults (disabled for backward compatibility, capacity=1.0 means disabled)
+    if "mod_capacity" not in model_config_kwargs:
+        model_config_kwargs["mod_capacity"] = 1.0  # disabled by default
+    if "mod_fixed_layers_start" not in model_config_kwargs:
+        model_config_kwargs["mod_fixed_layers_start"] = 5
+    if "mod_fixed_layers_end" not in model_config_kwargs:
+        model_config_kwargs["mod_fixed_layers_end"] = 1
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""

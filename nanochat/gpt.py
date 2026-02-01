@@ -12,6 +12,7 @@ Notable features:
 - Flash Attention 3 integration
 """
 
+import math
 from functools import partial
 from dataclasses import dataclass
 
@@ -37,6 +38,11 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Mixture of Depths (MoD) configuration
+    # mod_capacity=1.0 disables MoD (all tokens processed), <1.0 enables routing
+    mod_capacity: float = 1.0                # Fraction of tokens processed (1.0 = disabled)
+    mod_fixed_layers_start: int = 5          # First N layers always full capacity
+    mod_fixed_layers_end: int = 1            # Last N layers always full capacity
 
 
 def norm(x):
@@ -44,9 +50,28 @@ def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 
-def has_ve(layer_idx, n_layer):
-    """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
-    return layer_idx % 2 == (n_layer - 1) % 2
+def is_mod_layer(layer_idx: int, n_layer: int, config: 'GPTConfig') -> bool:
+    """Returns True if layer uses MoD routing (alternating in middle layers).
+
+    Protected layers (always full capacity):
+    - First `mod_fixed_layers_start` layers
+    - Last `mod_fixed_layers_end` layers
+
+    MoD layers (capacity-limited):
+    - Alternating layers in the middle range
+
+    MoD is disabled when mod_capacity >= 1.0.
+    """
+    if config.mod_capacity >= 1.0:
+        return False
+    if layer_idx < config.mod_fixed_layers_start:
+        return False
+    if layer_idx >= n_layer - config.mod_fixed_layers_end:
+        return False
+    # Alternating pattern in routable range
+    # routable_idx = layer_idx - config.mod_fixed_layers_start
+    # return routable_idx % 2 == 0
+    return True
 
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4  # multihead attention
@@ -71,9 +96,17 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos, sin, window_size, kv_cache=None):
+        """
+        Args:
+            x: (B, T, C) input
+            ve: value embeddings or None
+            cos, sin: RoPE tensors, already sliced to correct positions
+            window_size: sliding window tuple
+            kv_cache: KV cache for inference (None for training)
+        """
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -85,16 +118,14 @@ class CausalSelfAttention(nn.Module):
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 2)
+            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
             v = v + gate.unsqueeze(-1) * ve
 
-        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
-        cos, sin = cos_sin
+        # Apply Rotary Embeddings
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k) # QK norm
+        q, k = norm(q), norm(k)  # QK norm
 
         # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
-        # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
             # Training: causal attention with optional sliding window
             y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
@@ -114,8 +145,7 @@ class CausalSelfAttention(nn.Module):
 
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
-        y = self.c_proj(y)
-        return y
+        return self.c_proj(y)
 
 
 class MLP(nn.Module):
@@ -134,13 +164,47 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
+        self.layer_idx = layer_idx
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos, sin, window_size, kv_cache):
+        x = x + self.attn(norm(x), ve, cos, sin, window_size, kv_cache)
         x = x + self.mlp(norm(x))
         return x
+
+    def forward_mod(self, x, ve, cos, sin, window_size, capacity):
+        """MoD forward using norm-based routing (parameter-free)."""
+        B, T, C = x.size()
+
+        # Norm-based routing: tokens with larger L2 norm are more "important"
+        routing_scores = x.norm(dim=-1)  # (B, T)
+
+        # Top-k selection (sorted for causal order)
+        _, top_indices = torch.topk(routing_scores, capacity, dim=-1)
+        top_indices = torch.sort(top_indices, dim=-1)[0]
+
+        batch_idx = torch.arange(B, device=x.device, dtype=torch.long).unsqueeze(1)
+        x_selected = x[batch_idx, top_indices]
+        ve_selected = ve[batch_idx, top_indices] if ve is not None else None
+
+        # Index cos/sin for selected positions
+        cos_selected = cos[0, :, 0, :][top_indices].unsqueeze(2)  # (B, k, 1, head_dim/2)
+        sin_selected = sin[0, :, 0, :][top_indices].unsqueeze(2)
+
+        # Attention on selected tokens
+        attn_out = self.attn(norm(x_selected), ve_selected, cos_selected, sin_selected, window_size)
+
+        # MLP
+        mlp_input = x_selected + attn_out
+        mlp_out = self.mlp(norm(mlp_input))
+        block_out = mlp_input + mlp_out
+
+        # Scatter back (direct indexing instead of scatter + expand)
+        output = x.clone()
+        output[batch_idx, top_indices] = block_out
+
+        return output
 
 
 class GPT(nn.Module):
@@ -171,10 +235,10 @@ class GPT(nn.Module):
         # Separate parameters so they can have different optimizer treatment
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))   # fake init, real init in init_weights()
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
-        # Value embeddings (ResFormer-style): alternating layers, last layer always included
+        # Value embeddings (ResFormer-style): every layer
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer)})
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -226,8 +290,7 @@ class GPT(nn.Module):
 
         # Gate weights init to zero so gates start at sigmoid(0) = 0.5, scaled by 2 -> 1.0 (neutral)
         for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
-                torch.nn.init.zeros_(block.attn.ve_gate.weight)
+            torch.nn.init.zeros_(block.attn.ve_gate.weight)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -394,16 +457,36 @@ class GPT(nn.Module):
         assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+        cos, sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
 
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx) # embed current token
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
+
+        # MoD: enabled during training only (not with KV cache), disabled when capacity >= 1.0
+        # Log-scale capacity: full capacity at short contexts, mod_capacity fraction at max context
+        # This matches compute savings to where attention is expensive (long contexts)
+        mod_active = self.config.mod_capacity < 1.0 and kv_cache is None
+        if mod_active:
+            max_T = self.config.sequence_len
+            log_ratio = math.log(T) / math.log(max_T) if T > 1 else 0.0
+            capacity_ratio = 1.0 - (log_ratio * (1.0 - self.config.mod_capacity))
+            capacity = max(1, int(T * capacity_ratio))
+        else:
+            capacity = T
+
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            ve = self.value_embeds[str(i)](idx)
+
+            if mod_active and is_mod_layer(i, self.config.n_layer, self.config):
+                # MoD layer with norm-based routing
+                x = block.forward_mod(x, ve, cos, sin, self.window_sizes[i], capacity)
+            else:
+                # Standard layer
+                x = block(x, ve, cos, sin, self.window_sizes[i], kv_cache)
+
         x = norm(x)
 
         # Forward the lm_head (compute logits)
@@ -416,8 +499,7 @@ class GPT(nn.Module):
         if targets is not None:
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
+            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
         else:
             # inference: just return the logits directly
             return logits
