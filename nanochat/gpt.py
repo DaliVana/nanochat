@@ -107,10 +107,20 @@ def is_mod_layer(layer_idx: int, n_layer: int, config: 'GPTConfig') -> bool:
     return True
 
 def apply_rotary_emb(x, cos, sin):
-    x1, x2 = x.chunk(2, dim=-1) # split up last dim into two halves
-    y1 = x1 * cos + x2 * sin # rotate pairs of dims
+    """
+    Apply rotary position embeddings.
+
+    Args:
+        x: (B, T, H, D) tensor to rotate
+        cos, sin: (B, T, D//2) tensors - will be broadcast to match x
+    """
+    # Add head dim for broadcasting: (B, T, D//2) -> (B, T, 1, D//2)
+    cos = cos.unsqueeze(2)
+    sin = sin.unsqueeze(2)
+    x1, x2 = x.chunk(2, dim=-1)  # split last dim into two halves
+    y1 = x1 * cos + x2 * sin  # rotate pairs of dims
     y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3)
+    return torch.cat([y1, y2], dim=-1)
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
@@ -241,10 +251,9 @@ class MLACausalSelfAttention(nn.Module):
         kv = self.w_ukv(c_kv).view(B, T, self.n_head, self.d_nope + self.head_dim)
         k_nope, v = kv.split([self.d_nope, self.head_dim], dim=-1)
 
-        # 2. Compute positional K (decoupled RoPE) - apply RoPE before expanding to save compute
+        # 2. Compute positional K (decoupled RoPE) - apply RoPE on single head, broadcast during cat
         k_rope = self.w_kr(x).view(B, T, 1, self.d_rope)
-        k_rope = apply_rotary_emb(k_rope, cos, sin)  # RoPE on single head
-        k_rope = k_rope.expand(B, T, self.n_head, self.d_rope)  # then expand
+        k_rope = apply_rotary_emb(k_rope, cos, sin)  # (B, T, 1, d_rope)
 
         # 3. Value embedding (if applicable)
         if ve is not None:
@@ -265,7 +274,8 @@ class MLACausalSelfAttention(nn.Module):
 
         # 6. Concatenate positional and non-positional parts
         # K = [K_nope ; K_rope], Q = [Q_nope ; Q_rope]
-        k = torch.cat([k_nope, k_rope], dim=-1)  # (B, T, n_head, head_dim)
+        # k_rope is (B, T, 1, d_rope), expand to match k_nope's n_head dimension during cat
+        k = torch.cat([k_nope, k_rope.expand(-1, -1, self.n_head, -1)], dim=-1)  # (B, T, n_head, head_dim)
         q = torch.cat([q_nope, q_rope], dim=-1)  # (B, T, n_head, head_dim)
 
         # 9. QK norm
@@ -324,7 +334,10 @@ class Block(nn.Module):
         return x
 
     def forward_mod(self, x, ve, cos, sin, window_size, capacity):
-        """MoD forward using norm-based routing (parameter-free)."""
+        """MoD forward using norm-based routing (parameter-free).
+
+        Uses gather/scatter instead of advanced indexing for better torch.compile compatibility.
+        """
         B, T, C = x.size()
 
         # Norm-based routing: tokens with larger L2 norm are more "important"
@@ -332,15 +345,18 @@ class Block(nn.Module):
 
         # Top-k selection (sorted for causal order)
         _, top_indices = torch.topk(routing_scores, capacity, dim=-1)
-        top_indices = torch.sort(top_indices, dim=-1)[0]
+        top_indices = torch.sort(top_indices, dim=-1)[0]  # (B, k)
 
-        batch_idx = torch.arange(B, device=x.device, dtype=torch.long).unsqueeze(1)
-        x_selected = x[batch_idx, top_indices]
-        ve_selected = ve[batch_idx, top_indices] if ve is not None else None
+        # Gather selected tokens (more compile-friendly than advanced indexing)
+        indices_x = top_indices.unsqueeze(-1).expand(-1, -1, C)  # (B, k, C)
+        x_selected = torch.gather(x, 1, indices_x)  # (B, k, C)
+        ve_selected = torch.gather(ve, 1, indices_x) if ve is not None else None
 
-        # Index cos/sin for selected positions
-        cos_selected = cos[0, :, 0, :][top_indices].unsqueeze(2)  # (B, k, 1, head_dim/2)
-        sin_selected = sin[0, :, 0, :][top_indices].unsqueeze(2)
+        # Gather cos/sin for selected positions (cos/sin are already (B, T, rope_dim))
+        rope_dim = cos.size(-1)
+        indices_rope = top_indices.unsqueeze(-1).expand(-1, -1, rope_dim)  # (B, k, rope_dim)
+        cos_selected = torch.gather(cos, 1, indices_rope)  # (B, k, rope_dim)
+        sin_selected = torch.gather(sin, 1, indices_rope)
 
         # Attention on selected tokens
         attn_out = self.attn(norm(x_selected), ve_selected, cos_selected, sin_selected, window_size)
@@ -350,9 +366,8 @@ class Block(nn.Module):
         mlp_out = self.mlp(norm(mlp_input))
         block_out = mlp_input + mlp_out
 
-        # Scatter back (direct indexing instead of scatter + expand)
-        output = x.clone()
-        output[batch_idx, top_indices] = block_out
+        # Scatter back (more compile-friendly than indexed assignment)
+        output = x.scatter(1, indices_x, block_out)
 
         return output
 
@@ -393,7 +408,7 @@ class GPT(nn.Module):
         else:
             # Standard: value embeddings use n_kv_head (GQA support)
             ve_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, ve_dim) for i in range(config.n_layer)})
+        self.value_embeds = nn.ModuleList([nn.Embedding(padded_vocab_size, ve_dim) for _ in range(config.n_layer)])
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -481,7 +496,7 @@ class GPT(nn.Module):
         self.x0_lambdas.fill_(0.1)      # 0.1 => small initial weight for skip connection to input embedding
 
         # Value embeddings (init like c_v: uniform with same std)
-        for ve in self.value_embeds.values():
+        for ve in self.value_embeds:
             torch.nn.init.uniform_(ve.weight, -s, s)
 
         # Gate weights init to zero so gates start at sigmoid(0) = 0.5, scaled by 2 -> 1.0 (neutral)
@@ -501,7 +516,7 @@ class GPT(nn.Module):
         # Cast embeddings to bf16: optimizer can tolerate it and it saves memory
         if self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
-            for ve in self.value_embeds.values():
+            for ve in self.value_embeds:
                 ve.to(dtype=torch.bfloat16)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
@@ -517,8 +532,8 @@ class GPT(nn.Module):
         # calculate the rotation frequencies at each (time, channel) pair
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16() # keep them in bfloat16
-        cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
+        cos, sin = cos.bfloat16(), sin.bfloat16()  # keep them in bfloat16
+        # Return flat (seq_len, rope_dim) - apply_rotary_emb handles broadcasting
         return cos, sin
 
     def _compute_window_sizes(self, config):
@@ -567,7 +582,7 @@ class GPT(nn.Module):
         """
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
-        value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
+        value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds)
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
@@ -652,13 +667,15 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
 
-        # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
-        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+        # Grab the rotary embeddings for the current sequence length
+        assert T <= self.cos.size(0), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(0)}"
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
         assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos, sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+        # Slice and expand to (B, T, rope_dim) for unified interface
+        cos = self.cos[T0:T0+T].unsqueeze(0).expand(B, -1, -1)
+        sin = self.sin[T0:T0+T].unsqueeze(0).expand(B, -1, -1)
 
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx) # embed current token
@@ -679,7 +696,7 @@ class GPT(nn.Module):
 
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx)
+            ve = self.value_embeds[i](idx)
 
             if mod_active and is_mod_layer(i, self.config.n_layer, self.config):
                 # MoD layer with norm-based routing
