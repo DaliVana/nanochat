@@ -30,7 +30,7 @@ python -m scripts.tok_eval
 # I tuned this run to complete in about 30 minutes on my MacBook Pro M3 Max.
 # To get better results, try increasing num_iterations, or get other ideas from your favorite LLM.
 python -m scripts.base_train \
-    --depth=6 \
+    --depth=8 \
     --head-dim=64 \
     --window-pattern=L \
     --max-seq-len=512 \
@@ -41,6 +41,7 @@ python -m scripts.base_train \
     --core-metric-every=-1 \
     --sample-every=100 \
     --num-iterations=5000 \
+    --mod-capacity=0.125 \
     --run=$WANDB_RUN
 python -m scripts.base_eval --device-batch-size=1 --split-tokens=16384 --max-per-task=16
 
