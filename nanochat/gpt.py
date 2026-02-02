@@ -107,9 +107,7 @@ def is_mod_layer(layer_idx: int, n_layer: int, config: 'GPTConfig') -> bool:
     return True
 
 def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4  # multihead attention
-    d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:] # split up last dim into two halves
+    x1, x2 = x.chunk(2, dim=-1) # split up last dim into two halves
     y1 = x1 * cos + x2 * sin # rotate pairs of dims
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
@@ -210,24 +208,23 @@ class MLACausalSelfAttention(nn.Module):
 
         assert self.d_nope > 0, f"d_rope ({d_rope}) must be less than head_dim ({self.head_dim})"
 
-        # KV compression: X -> c_kv -> K_nope, V
+        # KV compression: X -> c_kv -> K_nope, V (fused up-projection)
         self.w_dkv = nn.Linear(config.n_embd, self.d_c, bias=False)  # down-project
-        self.w_uk = nn.Linear(self.d_c, self.n_head * self.d_nope, bias=False)  # up-project K (non-positional)
-        self.w_uv = nn.Linear(self.d_c, self.n_head * self.head_dim, bias=False)  # up-project V
+        # Fused: [K_nope, V] = w_ukv(c_kv), then split
+        self.w_ukv = nn.Linear(self.d_c, self.n_head * (self.d_nope + self.head_dim), bias=False)
 
         # Decoupled RoPE key: computed directly from X, shared across heads
         self.w_kr = nn.Linear(config.n_embd, self.d_rope, bias=False)
 
-        # Q compression
+        # Q projection (fused nope + rope parts)
         if self.d_c1 > 0:
             self.w_dq = nn.Linear(config.n_embd, self.d_c1, bias=False)  # down-project
-            self.w_uq = nn.Linear(self.d_c1, self.n_head * self.d_nope, bias=False)  # up-project Q (non-positional)
-            self.w_qr = nn.Linear(self.d_c1, self.n_head * self.d_rope, bias=False)  # Q RoPE part
+            # Fused: [Q_nope, Q_rope] = w_q(c_q), then split
+            self.w_q = nn.Linear(self.d_c1, self.n_head * self.head_dim, bias=False)
         else:
             # No Q compression - direct projection
             self.w_dq = None
-            self.w_uq = nn.Linear(config.n_embd, self.n_head * self.d_nope, bias=False)
-            self.w_qr = nn.Linear(config.n_embd, self.n_head * self.d_rope, bias=False)
+            self.w_q = nn.Linear(config.n_embd, self.n_head * self.head_dim, bias=False)
 
         # Output projection
         self.c_proj = nn.Linear(self.n_head * self.head_dim, config.n_embd, bias=False)
@@ -239,39 +236,34 @@ class MLACausalSelfAttention(nn.Module):
     def forward(self, x, ve, cos, sin, window_size, kv_cache=None):
         B, T, C = x.size()
 
-        # 1. Compress KV
+        # 1. Compress KV and decompress with fused projection
         c_kv = self.w_dkv(x)  # (B, T, d_c)
+        kv = self.w_ukv(c_kv).view(B, T, self.n_head, self.d_nope + self.head_dim)
+        k_nope, v = kv.split([self.d_nope, self.head_dim], dim=-1)
 
-        # 2. Decompress K (non-positional part)
-        k_nope = self.w_uk(c_kv).view(B, T, self.n_head, self.d_nope)
-
-        # 3. Compute positional K (decoupled RoPE) - shared across heads then expanded
+        # 2. Compute positional K (decoupled RoPE) - apply RoPE before expanding to save compute
         k_rope = self.w_kr(x).view(B, T, 1, self.d_rope)
-        k_rope = k_rope.expand(B, T, self.n_head, self.d_rope)
+        k_rope = apply_rotary_emb(k_rope, cos, sin)  # RoPE on single head
+        k_rope = k_rope.expand(B, T, self.n_head, self.d_rope)  # then expand
 
-        # 4. Decompress V
-        v = self.w_uv(c_kv).view(B, T, self.n_head, self.head_dim)
-
-        # 5. Value embedding (if applicable)
+        # 3. Value embedding (if applicable)
         if ve is not None:
             ve = ve.view(B, T, self.n_head, self.head_dim)
             gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_head), range (0, 2)
             v = v + gate.unsqueeze(-1) * ve
 
-        # 6. Compute Q
+        # 4. Compute Q with fused projection, then split
         if self.w_dq is not None:
             c_q = self.w_dq(x)  # (B, T, d_c1)
-            q_nope = self.w_uq(c_q).view(B, T, self.n_head, self.d_nope)
-            q_rope = self.w_qr(c_q).view(B, T, self.n_head, self.d_rope)
+            q = self.w_q(c_q).view(B, T, self.n_head, self.head_dim)
         else:
-            q_nope = self.w_uq(x).view(B, T, self.n_head, self.d_nope)
-            q_rope = self.w_qr(x).view(B, T, self.n_head, self.d_rope)
+            q = self.w_q(x).view(B, T, self.n_head, self.head_dim)
+        q_nope, q_rope = q.split([self.d_nope, self.d_rope], dim=-1)
 
-        # 7. Apply RoPE to positional parts only
+        # 5. Apply RoPE to Q positional part
         q_rope = apply_rotary_emb(q_rope, cos, sin)
-        k_rope = apply_rotary_emb(k_rope, cos, sin)
 
-        # 8. Concatenate positional and non-positional parts
+        # 6. Concatenate positional and non-positional parts
         # K = [K_nope ; K_rope], Q = [Q_nope ; Q_rope]
         k = torch.cat([k_nope, k_rope], dim=-1)  # (B, T, n_head, head_dim)
         q = torch.cat([q_nope, q_rope], dim=-1)  # (B, T, n_head, head_dim)
@@ -459,19 +451,16 @@ class GPT(nn.Module):
             s_dc = 3**0.5 * d_c**-0.5
             s_dc1 = 3**0.5 * (d_c1 if d_c1 > 0 else n_embd)**-0.5
             for block in self.transformer.h:
-                # KV compression path
+                # KV compression path (fused w_ukv)
                 torch.nn.init.uniform_(block.attn.w_dkv.weight, -s, s)  # down-project from n_embd
-                torch.nn.init.uniform_(block.attn.w_uk.weight, -s_dc, s_dc)  # up-project from d_c
-                torch.nn.init.uniform_(block.attn.w_uv.weight, -s_dc, s_dc)  # up-project from d_c
+                torch.nn.init.uniform_(block.attn.w_ukv.weight, -s_dc, s_dc)  # fused up-project from d_c
                 torch.nn.init.uniform_(block.attn.w_kr.weight, -s, s)  # RoPE key from n_embd
-                # Q compression path
+                # Q path (fused w_q)
                 if block.attn.w_dq is not None:
                     torch.nn.init.uniform_(block.attn.w_dq.weight, -s, s)  # down-project from n_embd
-                    torch.nn.init.uniform_(block.attn.w_uq.weight, -s_dc1, s_dc1)  # up-project from d_c1
-                    torch.nn.init.uniform_(block.attn.w_qr.weight, -s_dc1, s_dc1)  # RoPE query from d_c1
+                    torch.nn.init.uniform_(block.attn.w_q.weight, -s_dc1, s_dc1)  # fused up-project from d_c1
                 else:
-                    torch.nn.init.uniform_(block.attn.w_uq.weight, -s, s)  # direct from n_embd
-                    torch.nn.init.uniform_(block.attn.w_qr.weight, -s, s)  # direct from n_embd
+                    torch.nn.init.uniform_(block.attn.w_q.weight, -s, s)  # direct from n_embd
                 # Output projection
                 torch.nn.init.zeros_(block.attn.c_proj.weight)
                 # MLP
