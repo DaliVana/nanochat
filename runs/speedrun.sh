@@ -74,9 +74,9 @@ echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
 # d24 model (slightly overtrained is enough to beat GPT-2 => increase data:params ratio from compute optimal 10.5 (default) to 12)
-torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --mod-capacity=0.125 --device-batch-size=44 --target-param-data-ratio=18 --total-batch-size=720896 --run=$WANDB_RUN --warmdown-ratio=0.75 
+torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --mod-capacity=0.125 --device-batch-size=44 --target-param-data-ratio=16 --total-batch-size=720896 --run=$WANDB_RUN --warmup-ratio=0.02 --warmdown-ratio=0.75 --matrix-lr=0.04
 # evaluate the model: CORE metric, BPB on train/val, and draw samples
-torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=40
+torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=44
 # -----------------------------------------------------------------------------
 # SFT (teach the model conversation special tokens, tool use, multiple choice)
 
@@ -85,7 +85,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-
 curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 
 # run SFT and eval the model
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-size=40 --run=$WANDB_RUN
+torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-size=44 --run=$WANDB_RUN
 torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft
 
 # chat with the model over CLI! Leave out the -p to chat interactively

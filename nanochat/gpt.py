@@ -218,23 +218,17 @@ class MLACausalSelfAttention(nn.Module):
 
         assert self.d_nope > 0, f"d_rope ({d_rope}) must be less than head_dim ({self.head_dim})"
 
-        # KV compression: X -> c_kv -> K_nope, V (fused up-projection)
-        self.w_dkv = nn.Linear(config.n_embd, self.d_c, bias=False)  # down-project
-        # Fused: [K_nope, V] = w_ukv(c_kv), then split
+        # Fused down-projection: project x to [c_kv, c_q, k_rope] in one matmul
+        # This reduces 3 separate matmuls to 1, improving memory bandwidth utilization
+        q_intermediate = self.d_c1 if self.d_c1 > 0 else self.d_c
+        self.q_intermediate = q_intermediate
+        self.w_down = nn.Linear(config.n_embd, self.d_c + q_intermediate + self.d_rope, bias=False)
+
+        # Up-projections (separate because they have different input dimensions in unfused version)
+        # w_ukv: d_c -> n_head * (d_nope + head_dim) for K_nope and V
         self.w_ukv = nn.Linear(self.d_c, self.n_head * (self.d_nope + self.head_dim), bias=False)
-
-        # Decoupled RoPE key: computed directly from X, shared across heads
-        self.w_kr = nn.Linear(config.n_embd, self.d_rope, bias=False)
-
-        # Q projection (fused nope + rope parts)
-        if self.d_c1 > 0:
-            self.w_dq = nn.Linear(config.n_embd, self.d_c1, bias=False)  # down-project
-            # Fused: [Q_nope, Q_rope] = w_q(c_q), then split
-            self.w_q = nn.Linear(self.d_c1, self.n_head * self.head_dim, bias=False)
-        else:
-            # No Q compression - direct projection
-            self.w_dq = None
-            self.w_q = nn.Linear(config.n_embd, self.n_head * self.head_dim, bias=False)
+        # w_uq: q_intermediate -> n_head * head_dim for Q
+        self.w_uq = nn.Linear(q_intermediate, self.n_head * self.head_dim, bias=False)
 
         # Output projection
         self.c_proj = nn.Linear(self.n_head * self.head_dim, config.n_embd, bias=False)
@@ -244,49 +238,48 @@ class MLACausalSelfAttention(nn.Module):
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_head, bias=False)
 
     def forward(self, x, ve, cos, sin, window_size, kv_cache=None):
+        """
+        MLA forward pass optimized for speed and memory:
+        - Fused down-projection (3 matmuls -> 1)
+        - No conditional branches
+        - Minimal tensor reshaping
+        """
         B, T, C = x.size()
 
-        # 1. Compress KV and decompress with fused projection
-        c_kv = self.w_dkv(x)  # (B, T, d_c)
+        # 1. Fused down-projection: x -> [c_kv, c_q, k_rope_raw] in single matmul
+        down = self.w_down(x)  # (B, T, d_c + q_intermediate + d_rope)
+        c_kv, c_q, k_rope_raw = down.split([self.d_c, self.q_intermediate, self.d_rope], dim=-1)
+
+        # 2. Up-project KV: c_kv -> [K_nope, V]
         kv = self.w_ukv(c_kv).view(B, T, self.n_head, self.d_nope + self.head_dim)
         k_nope, v = kv.split([self.d_nope, self.head_dim], dim=-1)
 
-        # 2. Compute positional K (decoupled RoPE) - apply RoPE on single head, broadcast during cat
-        k_rope = self.w_kr(x).view(B, T, 1, self.d_rope)
-        k_rope = apply_rotary_emb(k_rope, cos, sin)  # (B, T, 1, d_rope)
+        # 3. Apply RoPE to k_rope (single head, then broadcast)
+        k_rope = apply_rotary_emb(k_rope_raw.view(B, T, 1, self.d_rope), cos, sin)
 
-        # 3. Value embedding (if applicable)
-        if ve is not None:
-            ve = ve.view(B, T, self.n_head, self.head_dim)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_head), range (0, 2)
-            v = v + gate.unsqueeze(-1) * ve
+        # 4. Value embedding
+        ve = ve.view(B, T, self.n_head, self.head_dim)
+        gate = 2 * torch.sigmoid(self.ve_gate(x.narrow(-1, 0, self.ve_gate_channels)))
+        v = v + gate.unsqueeze(-1) * ve
 
-        # 4. Compute Q with fused projection, then split
-        if self.w_dq is not None:
-            c_q = self.w_dq(x)  # (B, T, d_c1)
-            q = self.w_q(c_q).view(B, T, self.n_head, self.head_dim)
-        else:
-            q = self.w_q(x).view(B, T, self.n_head, self.head_dim)
+        # 5. Up-project Q: c_q -> Q, then split into nope/rope parts
+        q = self.w_uq(c_q).view(B, T, self.n_head, self.head_dim)
         q_nope, q_rope = q.split([self.d_nope, self.d_rope], dim=-1)
-
-        # 5. Apply RoPE to Q positional part
         q_rope = apply_rotary_emb(q_rope, cos, sin)
 
-        # 6. Concatenate positional and non-positional parts
-        # K = [K_nope ; K_rope], Q = [Q_nope ; Q_rope]
-        # k_rope is (B, T, 1, d_rope), expand to match k_nope's n_head dimension during cat
-        k = torch.cat([k_nope, k_rope.expand(-1, -1, self.n_head, -1)], dim=-1)  # (B, T, n_head, head_dim)
-        q = torch.cat([q_nope, q_rope], dim=-1)  # (B, T, n_head, head_dim)
+        # 6. Assemble final Q and K
+        k = torch.cat([k_nope, k_rope.expand(-1, -1, self.n_head, -1)], dim=-1)
+        q = torch.cat([q_nope, q_rope], dim=-1)
 
-        # 9. QK norm
+        # 7. QK norm
         q, k = norm(q), norm(k)
 
-        # 10. Attention (same interface as standard attention)
+        # 8. Attention
         if kv_cache is None:
             # Training: causal attention with optional sliding window
             y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
-            # Inference: use flash_attn_with_kvcache (compatibility mode - store full K/V)
+            # Inference: use flash_attn_with_kvcache
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
             y = flash_attn.flash_attn_with_kvcache(
                 q, k_cache, v_cache,
@@ -295,7 +288,6 @@ class MLACausalSelfAttention(nn.Module):
                 causal=True,
                 window_size=window_size,
             )
-            # Advance position after last layer processes
             if self.layer_idx == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
 
@@ -464,18 +456,14 @@ class GPT(nn.Module):
             # MLA attention initialization
             d_c, d_c1, _ = get_mla_dims(self.config)
             s_dc = 3**0.5 * d_c**-0.5
-            s_dc1 = 3**0.5 * (d_c1 if d_c1 > 0 else n_embd)**-0.5
+            q_intermediate = d_c1 if d_c1 > 0 else d_c
+            s_q_int = 3**0.5 * q_intermediate**-0.5
             for block in self.transformer.h:
-                # KV compression path (fused w_ukv)
-                torch.nn.init.uniform_(block.attn.w_dkv.weight, -s, s)  # down-project from n_embd
-                torch.nn.init.uniform_(block.attn.w_ukv.weight, -s_dc, s_dc)  # fused up-project from d_c
-                torch.nn.init.uniform_(block.attn.w_kr.weight, -s, s)  # RoPE key from n_embd
-                # Q path (fused w_q)
-                if block.attn.w_dq is not None:
-                    torch.nn.init.uniform_(block.attn.w_dq.weight, -s, s)  # down-project from n_embd
-                    torch.nn.init.uniform_(block.attn.w_q.weight, -s_dc1, s_dc1)  # fused up-project from d_c1
-                else:
-                    torch.nn.init.uniform_(block.attn.w_q.weight, -s, s)  # direct from n_embd
+                # Fused down-projection (all from n_embd)
+                torch.nn.init.uniform_(block.attn.w_down.weight, -s, s)
+                # Up-projections
+                torch.nn.init.uniform_(block.attn.w_ukv.weight, -s_dc, s_dc)  # from d_c
+                torch.nn.init.uniform_(block.attn.w_uq.weight, -s_q_int, s_q_int)  # from q_intermediate
                 # Output projection
                 torch.nn.init.zeros_(block.attn.c_proj.weight)
                 # MLP
