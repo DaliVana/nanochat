@@ -282,9 +282,16 @@ def main():
     # Process dataset
     print("\nProcessing documents...")
     report_interval = 10000
+    lang_samples = {}  # Track sample language codes we see
     
     for idx, row in enumerate(ds):
         og_lang = row.get("og_language", "")
+        
+        # Collect sample language codes for debugging
+        if len(lang_samples) < 50 and og_lang and og_lang not in lang_samples:
+            lang_samples[og_lang] = True
+            if len(lang_samples) <= 20:
+                print(f"  Found language code: {og_lang}")
         
         # Skip if not a target language
         if og_lang not in target_langs:
@@ -323,6 +330,9 @@ def main():
                 break
     
     print()  # New line after progress
+    print(f"\nUnique language codes seen in dataset: {len(lang_samples)}")
+    if lang_samples:
+        print("Sample codes:", sorted(list(lang_samples.keys()))[:30])
     collector.print_stats()
     
     # Get all documents
