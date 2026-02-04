@@ -175,7 +175,7 @@ def load_language_quotas(json_path: Path) -> Dict[str, int]:
     for entry in languages:
         iso_code = entry["iso639_3"]
         speakers_millions = entry["speakers_millions"]
-        char_limit = int(speakers_millions * 10000)  # speakers_millions × 1000
+        char_limit = int(speakers_millions * 1000000)  # speakers_millions × 1000
         
         # Map to language-script format
         lang_script = DEFAULT_SCRIPTS.get(iso_code)
