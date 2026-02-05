@@ -12,10 +12,12 @@ Writes mixed parquet shards to dev/finetranslations_output/
 import json
 import heapq
 import sys
+import argparse
 from pathlib import Path
 from typing import Dict, List, Tuple
 from dataclasses import dataclass
 import random
+import multiprocessing as mp
 
 from datasets import load_dataset
 import pyarrow as pa
@@ -166,7 +168,7 @@ class LanguageCollector:
             print(f"  {lang:12s}: {collected:12,} / {quota:12,} chars ({pct:5.1f}%) - {heap_size:6,} docs")
 
 
-def load_language_quotas(json_path: Path) -> Dict[str, int]:
+def load_language_quotas(json_path: Path, multiplier: int = 1000) -> Dict[str, int]:
     """Load language quotas from world_languages JSON file."""
     with open(json_path) as f:
         languages = json.load(f)
@@ -175,7 +177,7 @@ def load_language_quotas(json_path: Path) -> Dict[str, int]:
     for entry in languages:
         iso_code = entry["iso639_3"]
         speakers_millions = entry["speakers_millions"]
-        char_limit = int(speakers_millions * 1000000)  # speakers_millions × 1000
+        char_limit = int(speakers_millions * multiplier)  # speakers_millions × multiplier
         
         # Map to language-script format
         lang_script = DEFAULT_SCRIPTS.get(iso_code)
@@ -248,6 +250,14 @@ def write_parquet_shards(documents: List[str], output_dir: Path, shard_size_char
 
 def main():
     """Main download and repackaging pipeline."""
+    # Parse arguments
+    parser = argparse.ArgumentParser(description='Download and repackage FineTranslations-Edu dataset')
+    parser.add_argument('--num-workers', type=int, default=24, 
+                        help='Number of parallel workers for dataset loading (default: 24)')
+    parser.add_argument('--multiplier', type=int, default=1000,
+                        help='Multiplier for character quota: speakers_millions × multiplier (default: 1000)')
+    args = parser.parse_args()
+    
     # Setup paths
     script_dir = Path(__file__).parent
     languages_file = script_dir / "world_languages_iso639-3.json"
@@ -259,7 +269,8 @@ def main():
     
     # Load quotas
     print("Loading language quotas...")
-    quotas = load_language_quotas(languages_file)
+    print(f"Using multiplier: {args.multiplier} (speakers_millions × {args.multiplier})")
+    quotas = load_language_quotas(languages_file, multiplier=args.multiplier)
     print(f"Loaded {len(quotas)} languages")
     total_chars = sum(quotas.values())
     print(f"Total target characters: {total_chars:,} ({total_chars / 1e9:.2f}B)")
@@ -271,9 +282,15 @@ def main():
     # Load and stream dataset
     print("\nLoading dataset from HuggingFace (streaming)...")
     print("Dataset: HuggingFaceFW/finetranslations-edu")
+    print(f"Using {args.num_workers} parallel workers for faster processing")
     
     try:
-        ds = load_dataset("HuggingFaceFW/finetranslations-edu", split="train", streaming=True)
+        ds = load_dataset(
+            "HuggingFaceFW/finetranslations-edu", 
+            split="train", 
+            streaming=True,
+            num_proc=args.num_workers  # Parallel processing for faster streaming
+        )
     except Exception as e:
         print(f"Error loading dataset: {e}")
         print("Make sure you have the datasets library installed: pip install datasets")
