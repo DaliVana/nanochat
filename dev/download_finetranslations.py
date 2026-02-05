@@ -282,17 +282,15 @@ def main():
     # Load and stream dataset
     print("\nLoading dataset from HuggingFace (streaming)...")
     print("Dataset: HuggingFaceFW/finetranslations-edu")
+    print(f"Note: Streaming datasets automatically prefetch data in background")
     
     try:
-        # Note: streaming datasets prefetch data in background automatically
-        # Using .with_format() can speed up data access by skipping Arrow->Python conversion overhead
+        # Streaming mode automatically prefetches data in background
         ds = load_dataset(
             "HuggingFaceFW/finetranslations-edu", 
             split="train", 
             streaming=True
         )
-        # Prefetch batches in background for faster iteration
-        ds = ds.prefetch(buffer_size=args.num_workers * 100)
     except Exception as e:
         print(f"Error loading dataset: {e}")
         print("Make sure you have the datasets library installed: pip install datasets")
