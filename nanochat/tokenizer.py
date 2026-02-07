@@ -24,10 +24,98 @@ SPECIAL_TOKENS = [
     "<|output_end|>",
 ]
 
-# NOTE: this split pattern deviates from GPT-4 in that we use \p{N}{1,2} instead of \p{N}{1,3}
-# I did this because I didn't want to "waste" too many tokens on numbers for smaller vocab sizes.
-# I verified that 2 is the sweet spot for vocab size of 32K. 1 is a bit worse, 3 was worse still.
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+# Pre-tokenization regex: splits text into coarse chunks before BPE learns merges.
+# This is the single most impactful design choice for tokenizer quality — it determines
+# the upper bound on token length and directly affects compression ratio, context window
+# efficiency, and language fairness (see arXiv:2409.11501).
+#
+# The pattern is a sequence of alternatives tried left-to-right. First match wins.
+#
+# ---- Part 1: Words (letters + marks + apostrophe joining) ----
+#   [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+(?:'[\p{L}\p{M}]+)*
+#
+#   [\p{L}\p{M}]+    Core: one or more Unicode letters (\p{L}) or marks (\p{M}).
+#                     \p{L} covers all scripts: Latin, Cyrillic, Greek, CJK, Arabic, etc.
+#                     \p{M} covers combining marks: vowel signs, virama, tone marks, etc.
+#                     This is critical for Abugida scripts (Tamil, Hindi, Thai, Sinhala...)
+#                     where characters are multi-codepoint sequences of letters + marks.
+#                     Without \p{M}, "நன்றி" (Tamil "thanks") splits into 5 fragments
+#                     instead of staying as one word. (GPT-2/4/Llama 3 all suffer from this.)
+#
+#   (?:'[\p{L}\p{M}]+)*
+#                     Optional repeating: apostrophe followed by more letters.
+#                     Joins contractions and elisions into single pretokens:
+#                       English:  don't, I'm, they've, she'll  (contractions)
+#                       French:   L'éducation, n'est, l'homme  (elision)
+#                       Italian:  dell'arte, l'aeroporto       (elision)
+#                       Dutch:    z'n (his), m'n (my)          (informal)
+#                       Other:    O'Brien, Hawai'i, rock'n'roll
+#                     This generalizes the GPT-4 approach of listing specific English
+#                     suffixes ('s|'t|'re|...) into a language-agnostic rule.
+#                     Safe for code: string delimiters ('hello') are preceded by non-letter
+#                     chars (=, (, space), so the [^\r\n\p{L}\p{N}]? prefix routes them
+#                     to the punctuation rule instead.
+#
+#   [^\r\n\p{L}\p{N}]?
+#                     Optional non-letter/non-digit prefix (excluding newlines).
+#                     Allows a leading punctuation char to attach to the word:
+#                       " hello" -> [" hello"]  (space-prefixed words, the common case)
+#                       "'hello" -> ["'hello"]  (apostrophe + word)
+#                     This is the standard GPT-4 trick for space-prefixed tokens.
+#
+# ---- Part 2: Hex/binary/octal literals ----
+#   0[xXbBoO][\p{N}a-fA-F]+
+#
+#   Matches numeric literals with a prefix: 0xFF8800, 0b11010110, 0o755.
+#   Without this, "0xFF8800" fragments into 4+ pretokens (0, xFF, 88, 00) because
+#   the letter/number boundary splits them. Keeps the whole literal as one pretoken
+#   so BPE can learn it as a unit. Common in code (colors, bitmasks, permissions).
+#
+# ---- Part 3: Decimal numbers ----
+#   \p{N}{1,3}
+#
+#   Matches 1-3 consecutive Unicode digits. Groups like: 192 | 168 | 1 | 100.
+#   The choice of {1,3} vs {1,2} vs {1,1} is a vocab budget tradeoff:
+#     {1,1}: 10 digit tokens. No wasted vocab, but poor compression on numbers.
+#     {1,2}: 110 possible tokens (10+100). Sweet spot for small vocabs (32K).
+#     {1,3}: 1110 possible tokens. Better for IPs/dates, costs more vocab slots.
+#   We use {1,3} since the hex literal rule (Part 2) already handles the cases
+#   where {1,2} was most painful (0xFF00 etc.), and {1,3} helps with IP addresses,
+#   HTTP status codes, and other common 3-digit groups.
+#
+# ---- Part 4: Punctuation and symbols ----
+#   ?[^\s\p{L}\p{N}]++[\r\n/]*
+#
+#   Matches sequences of non-letter, non-digit, non-whitespace characters
+#   (operators, brackets, punctuation) with an optional leading space.
+#   The possessive ++ is atomic (no backtracking).
+#   [\r\n/]* allows trailing newlines or slashes to attach (helps with URLs,
+#   file paths, and line-ending punctuation like ";\n").
+#
+# ---- Part 5: Newlines ----
+#   \s*[\r\n]+
+#
+#   Matches newline sequences, including any leading whitespace (indentation
+#   before blank lines). The + on [\r\n] captures \r\n as one pretoken
+#   and groups consecutive blank lines.
+#
+# ---- Part 6: Trailing whitespace ----
+#   \s+(?!\S)
+#
+#   Whitespace at the end of input (negative lookahead: not followed by non-space).
+#   Prevents trailing spaces from being forced into the next pretoken.
+#
+# ---- Part 7: Remaining whitespace ----
+#   \s+
+#
+#   Catches any other whitespace sequences (spaces between words that weren't
+#   captured by the leading-space prefix in Part 1 or Part 4).
+#
+# Previous iterations:
+# SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+SPLIT_PATTERN = r"""[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+(?:'[\p{L}\p{M}]+)*|0[xXbBoO][\p{N}a-fA-F]+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
+
+
 
 # -----------------------------------------------------------------------------
 # Generic GPT-4-style tokenizer based on HuggingFace Tokenizer
