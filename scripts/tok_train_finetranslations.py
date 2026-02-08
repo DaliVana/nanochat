@@ -24,6 +24,9 @@ parser.add_argument('--vocab-size', type=int, default=32768,
                     help='Vocabulary size (default: 32768 = 2^15)')
 parser.add_argument('--tokenizer-name', type=str, default='tokenizer_finetranslations',
                     help='Name for saved tokenizer directory (default: tokenizer_finetranslations)')
+parser.add_argument('--ios-prune', type=float, default=None,
+                    help='IoS threshold for post-training junk token pruning (e.g. 0.8). '
+                         'Trains with 5%% inflated vocab, then prunes junk tokens.')
 args = parser.parse_args()
 
 print(f"data_dir: {args.data_dir}")
@@ -101,12 +104,44 @@ text_iter = text_iterator()
 
 # -----------------------------------------------------------------------------
 # Train the tokenizer
+# If IoS pruning is enabled, train with inflated vocab size to compensate
+train_vocab_size = args.vocab_size
+if args.ios_prune is not None:
+    ios_overshoot = int(args.vocab_size * 0.05)
+    train_vocab_size = args.vocab_size + ios_overshoot
+    print(f"IoS pruning enabled: training with inflated vocab {train_vocab_size} "
+          f"(+{ios_overshoot} overshoot, target: {args.vocab_size})")
+
 print("\nTraining tokenizer...")
 t0 = time.time()
-tokenizer = RustBPETokenizer.train_from_iterator(text_iter, args.vocab_size)
+tokenizer = RustBPETokenizer.train_from_iterator(text_iter, train_vocab_size)
 t1 = time.time()
 train_time = t1 - t0
 print(f"Training time: {train_time:.2f}s")
+
+# IoS-based junk token pruning (optional)
+pruned_count = 0
+if args.ios_prune is not None:
+    print(f"\n--- Post-training IoS junk token pruning (threshold={args.ios_prune}) ---")
+    # Re-read sample text for IoS analysis
+    ios_texts = []
+    ios_chars = 0
+    for pf_path in parquet_files[:3]:  # first 3 files should be enough
+        pf = pq.ParquetFile(pf_path)
+        for rg_idx in range(pf.num_row_groups):
+            rg = pf.read_row_group(rg_idx)
+            for doc in rg.column('text').to_pylist():
+                if doc:
+                    ios_texts.append(doc[:args.doc_cap])
+                    ios_chars += len(ios_texts[-1])
+            if ios_chars >= 10_000_000:
+                break
+        if ios_chars >= 10_000_000:
+            break
+    ios_corpus = "\n".join(ios_texts)
+    tokenizer, pruned_ids = tokenizer.prune_junk_tokens(ios_corpus, threshold=args.ios_prune)
+    pruned_count = len(pruned_ids)
+    print(f"Final vocab size after pruning: {tokenizer.get_vocab_size()}")
 
 # -----------------------------------------------------------------------------
 # Save the tokenizer to disk

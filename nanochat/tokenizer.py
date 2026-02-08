@@ -115,8 +115,6 @@ SPECIAL_TOKENS = [
 # SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 SPLIT_PATTERN = r"""[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+(?:'[\p{L}\p{M}]+)*|0[xXbBoO][\p{N}a-fA-F]+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
 
-
-
 # -----------------------------------------------------------------------------
 # Generic GPT-4-style tokenizer based on HuggingFace Tokenizer
 from tokenizers import Tokenizer as HFTokenizer
@@ -154,11 +152,7 @@ class HuggingFaceTokenizer:
         ))
         # Normalizer: None
         tokenizer.normalizer = None
-        # Pre-tokenizer: GPT-4 style
-        # the regex pattern used by GPT-4 to split text into groups before BPE
-        # NOTE: The pattern was changed from \p{N}{1,3} to \p{N}{1,2} because I suspect it is harmful to
-        # very small models and smaller vocab sizes, because it is a little bit wasteful in the token space.
-        # (but I haven't validated this! TODO)
+        # Pre-tokenizer: GPT-4+ style (see SPLIT_PATTERN comments above)
         gpt4_split_regex = Regex(SPLIT_PATTERN) # huggingface demands that you wrap it in Regex!!
         tokenizer.pre_tokenizer = pre_tokenizers.Sequence([
             pre_tokenizers.Split(pattern=gpt4_split_regex, behavior="isolated", invert=False),
@@ -172,7 +166,7 @@ class HuggingFaceTokenizer:
         trainer = BpeTrainer(
             vocab_size=vocab_size,
             show_progress=True,
-            min_frequency=0, # no minimum frequency
+            min_frequency=2, # filter noise merges (arXiv 2506.10766 uses 5; we use 2 conservatively)
             initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
             special_tokens=SPECIAL_TOKENS,
         )
@@ -267,11 +261,16 @@ class RustBPETokenizer:
         pattern = tokenizer.get_pattern()
         mergeable_ranks_list = tokenizer.get_mergeable_ranks()
         mergeable_ranks = {bytes(k): v for k, v in mergeable_ranks_list}
+        return cls._from_parts(pattern, mergeable_ranks)
+
+    @classmethod
+    def _from_parts(cls, pat_str, mergeable_ranks):
+        """Build a RustBPETokenizer from raw parts (pattern string + merge table)."""
         tokens_offset = len(mergeable_ranks)
         special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
         enc = tiktoken.Encoding(
             name="rustbpe",
-            pat_str=pattern,
+            pat_str=pat_str,
             mergeable_ranks=mergeable_ranks, # dict[bytes, int] (token bytes -> merge priority rank)
             special_tokens=special_tokens, # dict[str, int] (special token name -> token id)
         )
@@ -350,6 +349,72 @@ class RustBPETokenizer:
         with open(pickle_path, "wb") as f:
             pickle.dump(self.enc, f)
         print(f"Saved tokenizer encoding to {pickle_path}")
+
+    def prune_junk_tokens(self, text_sample, threshold=0.8):
+        """
+        Prune junk tokens (high-IoS intermediate BPE artifacts) from the vocabulary.
+
+        Intersection-over-Self (IoS) identifies tokens that almost always appear as part
+        of one specific bigram pair — they're stepping-stone artifacts of BPE merge order,
+        not independently useful tokens. Removing them and re-packing the merge table frees
+        vocabulary slots for more useful tokens. See: Picky BPE (arXiv 2409.04599).
+
+        Args:
+            text_sample: str — text corpus to encode for IoS analysis (≥10M chars recommended)
+            threshold: float — IoS threshold (default 0.8). Higher = more conservative pruning.
+
+        Returns:
+            (new_tokenizer, pruned_ids): new RustBPETokenizer with junk tokens removed,
+                                          and list of pruned token IDs.
+        """
+        from collections import Counter
+
+        # Encode sample text
+        token_ids = self.encode(text_sample)
+        n = len(token_ids)
+        print(f"  IoS analysis: {n:,} tokens from {len(text_sample):,} chars")
+
+        # Compute token frequencies and bigram pair frequencies
+        token_freq = Counter(token_ids)
+        pair_freq = Counter()
+        for i in range(n - 1):
+            pair_freq[(token_ids[i], token_ids[i + 1])] += 1
+
+        # Find junk tokens: IoS(token | pair) >= threshold
+        junk_ids = set()
+        for (a, b), pf in pair_freq.items():
+            if pf / token_freq[a] >= threshold:
+                junk_ids.add(a)
+            if pf / token_freq[b] >= threshold:
+                junk_ids.add(b)
+
+        # Don't remove base byte tokens (ranks 0-255) or special tokens
+        n_mergeable = len(self.enc._mergeable_ranks)
+        junk_ids = {t for t in junk_ids if 256 <= t < n_mergeable}
+
+        if not junk_ids:
+            print("  No junk tokens found.")
+            return self, []
+
+        # Get merge table and identify bytes to remove
+        mergeable_ranks = dict(self.enc._mergeable_ranks)
+        rank_to_bytes = {v: k for k, v in mergeable_ranks.items()}
+        junk_bytes = {rank_to_bytes[tid] for tid in junk_ids if tid in rank_to_bytes}
+
+        for jb in junk_bytes:
+            del mergeable_ranks[jb]
+
+        # Re-number ranks to be contiguous while preserving merge order
+        sorted_entries = sorted(mergeable_ranks.items(), key=lambda x: x[1])
+        new_mergeable_ranks = {k: i for i, (k, _) in enumerate(sorted_entries)}
+
+        # Build new tokenizer with pruned merge table
+        new_tokenizer = RustBPETokenizer._from_parts(self.enc._pat_str, new_mergeable_ranks)
+
+        print(f"  Pruned {len(junk_ids)} junk tokens (IoS >= {threshold})")
+        print(f"  Vocab: {self.get_vocab_size()} -> {new_tokenizer.get_vocab_size()}")
+
+        return new_tokenizer, sorted(junk_ids)
 
     def render_conversation(self, conversation, max_tokens=2048):
         """

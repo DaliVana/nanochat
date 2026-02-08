@@ -6,9 +6,18 @@ Metrics:
 - Gini coefficient (cross-lingual fairness of token costs)
 - Fertility (tokens per word / character)
 - Vocabulary utilization (fraction of vocab used per language)
+- k-gram entropies H_1..H_5 (how much local structure the tokenizer absorbs)
+- Capacity utilization η = H_1/log2(V) (how efficiently the vocab is used)
+- Rényi utilization η_2 (whether frequency mass concentrates on few tokens)
+- Intersection-over-Self (IoS) junk token analysis (intermediate BPE fragments)
 
-See: Parity-Aware BPE (arXiv 2508.04796) for metric definitions.
+See: Parity-Aware BPE (arXiv 2508.04796) for fairness metric definitions.
+See: Information-Theoretic Tokenizers (arXiv 2601.09039) for entropy metrics.
+See: Picky BPE (arXiv 2409.04599) for IoS metric.
 """
+
+import math
+from collections import Counter
 
 from nanochat.tokenizer import get_tokenizer, RustBPETokenizer
 from nanochat.dataset import parquets_iter_batched
@@ -60,6 +69,140 @@ def compute_vocab_utilization(token_ids, vocab_size):
     """
     unique_tokens = len(set(token_ids))
     return unique_tokens / vocab_size
+
+# -----------------------------------------------------------------------------
+# Information-theoretic metric functions
+# See: arXiv 2601.09039 (Information-Theoretic Perspective on LLM Tokenizers)
+# See: arXiv 2409.04599 (Picky BPE) for IoS metric.
+
+def compute_kgram_entropies(token_ids, max_k=5):
+    """
+    Compute k-gram Shannon entropies H_k for k=1..max_k on a token stream.
+
+    Returns dict with:
+      'raw': [H_1, H_2, ..., H_max_k]  — joint entropy of k-grams in bits
+      'conditional': [H_1, H_{2|1}, ..., H_{k|k-1}]  — conditional entropies
+
+    H_k = -sum(p(gram) * log2(p(gram))) over all observed k-grams.
+    H_{k|k-1} = H_k - H_{k-1} measures residual uncertainty given (k-1) context.
+
+    For a good tokenizer, conditional entropies H_{k|k-1} drop toward zero
+    as k grows — the tokenizer absorbs short-range regularity from the text.
+    """
+    n = len(token_ids)
+    if n == 0:
+        return {'raw': [0.0] * max_k, 'conditional': [0.0] * max_k}
+
+    raw_entropies = []
+    for k in range(1, max_k + 1):
+        if n < k:
+            raw_entropies.append(0.0)
+            continue
+        # Count k-gram frequencies
+        counts = Counter()
+        for i in range(n - k + 1):
+            gram = tuple(token_ids[i:i + k])
+            counts[gram] += 1
+        total = sum(counts.values())
+        # Shannon entropy H_k = -sum(p * log2(p))
+        entropy = 0.0
+        for count in counts.values():
+            p = count / total
+            entropy -= p * math.log2(p)
+        raw_entropies.append(entropy)
+
+    # Conditional entropies: H_{k|k-1} = H_k - H_{k-1}, with H_0 = 0
+    conditional = [raw_entropies[0]]  # H_{1|0} = H_1
+    for k in range(1, max_k):
+        conditional.append(raw_entropies[k] - raw_entropies[k - 1])
+
+    return {'raw': raw_entropies, 'conditional': conditional}
+
+def compute_capacity_utilization(token_ids, vocab_size):
+    """
+    Capacity utilization η = H_1 / log2(vocab_size).
+
+    Measures what fraction of the tokenizer's channel capacity is actually used.
+    BPE/WordPiece typically plateau at η ≈ 0.75-0.77 on English (arXiv 2601.09039).
+    η = 1.0 means perfectly uniform token usage; η → 0 means a few tokens dominate.
+    """
+    if vocab_size <= 1 or len(token_ids) == 0:
+        return 0.0
+    log2_v = math.log2(vocab_size)
+    # Compute H_1 (unigram entropy)
+    counts = Counter(token_ids)
+    total = sum(counts.values())
+    h1 = -sum((c / total) * math.log2(c / total) for c in counts.values())
+    return h1 / log2_v
+
+def compute_renyi_utilization(token_ids, vocab_size, alpha=2):
+    """
+    Rényi utilization η_α = H_α / log2(vocab_size).
+
+    H_α = 1/(1-α) * log2(sum(p_i^α))  (Rényi entropy of order α).
+
+    When η_2 declines even as Shannon η increases, it indicates growing probability
+    mass concentration among a few very frequent tokens while rare tokens proliferate
+    in the tail (arXiv 2601.09039, Section 6).
+    """
+    if vocab_size <= 1 or len(token_ids) == 0 or alpha == 1:
+        return 0.0
+    log2_v = math.log2(vocab_size)
+    counts = Counter(token_ids)
+    total = sum(counts.values())
+    sum_p_alpha = sum((c / total) ** alpha for c in counts.values())
+    if sum_p_alpha == 0:
+        return 0.0
+    h_alpha = (1 / (1 - alpha)) * math.log2(sum_p_alpha)
+    return h_alpha / log2_v
+
+def compute_ios_stats(token_ids, threshold=0.9):
+    """
+    Intersection-over-Self (IoS) analysis for identifying junk BPE tokens.
+
+    For each consecutive bigram (a, b) in the token stream:
+      IoS(a | a,b) = pair_freq(a,b) / token_freq(a)
+      IoS(b | a,b) = pair_freq(a,b) / token_freq(b)
+
+    A token with IoS >= threshold almost always appears as part of one specific
+    pair — it's likely an intermediate BPE artifact (e.g., 'entucky' in 'Kentucky').
+
+    Returns list of (token_id, ios_score, dominant_pair) sorted by IoS descending.
+    Only tokens with IoS >= threshold are included.
+
+    See: Picky BPE (arXiv 2409.04599).
+    """
+    if len(token_ids) < 2:
+        return []
+
+    # Count individual token frequencies and bigram pair frequencies
+    token_freq = Counter(token_ids)
+    pair_freq = Counter()
+    for i in range(len(token_ids) - 1):
+        pair_freq[(token_ids[i], token_ids[i + 1])] += 1
+
+    # For each token, find its max IoS across all pairs it participates in
+    # token -> (max_ios, dominant_pair)
+    token_max_ios = {}
+    for (a, b), pf in pair_freq.items():
+        # IoS for left constituent
+        ios_a = pf / token_freq[a]
+        if ios_a >= threshold:
+            if a not in token_max_ios or ios_a > token_max_ios[a][0]:
+                token_max_ios[a] = (ios_a, (a, b))
+        # IoS for right constituent
+        ios_b = pf / token_freq[b]
+        if ios_b >= threshold:
+            if b not in token_max_ios or ios_b > token_max_ios[b][0]:
+                token_max_ios[b] = (ios_b, (a, b))
+
+    # Sort by IoS descending
+    results = [
+        (tok_id, ios_score, pair)
+        for tok_id, (ios_score, pair) in token_max_ios.items()
+    ]
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
 
 # -----------------------------------------------------------------------------
 # Text samples: natural languages (for cross-lingual fairness metrics)
@@ -398,6 +541,89 @@ for tokenizer_name in ["gpt2", "gpt4", "ours"]:
     print(f"{'Mean fertility:':<34} {mean_fertility:.2f}")
     print(f"{'Mean vocab utilization:':<34} {mean_vocab_util:.4f}")
 
+# ---------------------------------------------------------------------------
+# Information-theoretic metrics (on fwe-train data)
+# See: arXiv 2601.09039 (Information-Theoretic Perspective on LLM Tokenizers)
+# ---------------------------------------------------------------------------
+CYAN = '\033[96m'
+BOLD = '\033[1m'
+
+print(f"\n\nInformation-Theoretic Metrics (on fwe-train)")
+print("=" * 95)
+print("H_k = joint k-gram entropy (bits). H_{k|k-1} = conditional entropy (bits).")
+print("Good tokenizers: H_{k|k-1} drops toward 0 as k grows (short-range structure absorbed).")
+
+for tokenizer_name in ["gpt2", "gpt4", "ours"]:
+    results = tokenizer_results[tokenizer_name]
+    vocab_size = vocab_sizes[tokenizer_name]
+    fwe_ids = results['fwe-train']['token_ids']
+
+    entropies = compute_kgram_entropies(fwe_ids, max_k=5)
+    cap_util = compute_capacity_utilization(fwe_ids, vocab_size)
+    renyi_util = compute_renyi_utilization(fwe_ids, vocab_size, alpha=2)
+
+    print(f"\n--- {tokenizer_name.upper()} (vocab: {vocab_size:,}) ---")
+    print(f"{'k':<4} {'H_k (raw)':<14} {'H_{k|k-1} (cond)':<18}")
+    print("-" * 36)
+    for k in range(5):
+        raw_h = entropies['raw'][k]
+        cond_h = entropies['conditional'][k]
+        print(f"{k+1:<4} {raw_h:<14.4f} {cond_h:<18.4f}")
+    print("-" * 36)
+    print(f"{'Capacity util η:':<34} {CYAN}{cap_util:.4f}{RESET}")
+    print(f"{'Rényi util η₂:':<34} {CYAN}{renyi_util:.4f}{RESET}")
+
+# ---------------------------------------------------------------------------
+# IoS junk token analysis (on ~100M chars of train data, ours tokenizer only)
+# See: Picky BPE (arXiv 2409.04599) for IoS metric definition.
+# ---------------------------------------------------------------------------
+IOS_TARGET_CHARS = 100_000_000
+threshold=0.8
+
+print(f"\n\nIoS Junk Token Analysis (ours tokenizer, ~{IOS_TARGET_CHARS//1_000_000}M chars, threshold={threshold})")
+print("=" * 95)
+print(f"Tokens with IoS >= {threshold} almost always appear as part of one specific pair — likely junk.")
+# Collect ~10M characters from training shards for statistically robust IoS
+ours_tokenizer = get_tokenizer()
+ios_texts = []
+ios_char_count = 0
+for batch in parquets_iter_batched(split="train"):
+    for doc in batch:
+        ios_texts.append(doc)
+        ios_char_count += len(doc)
+    if ios_char_count >= IOS_TARGET_CHARS:
+        break
+ios_corpus = "\n".join(ios_texts)
+ios_token_ids = ours_tokenizer.encode(ios_corpus)
+print(f"Corpus: {ios_char_count:,} chars, {len(ios_token_ids):,} tokens")
+ios_results = compute_ios_stats(ios_token_ids, threshold=threshold)
+
+print(f"\nJunk tokens found: {BOLD}{len(ios_results)}{RESET} / {vocab_sizes['ours']:,} vocab")
+if ios_results:
+    print(f"\n{'Token ID':<10} {'IoS':<8} {'Token (hex)':<24} {'Token (text)':<20} {'Dominant Pair'}")
+    print("-" * 90)
+    for tok_id, ios_score, (pair_a, pair_b) in ios_results[:20]:
+        # Decode token bytes for display
+        try:
+            tok_bytes = ours_tokenizer.decode([tok_id]).encode('utf-8')
+            tok_hex = tok_bytes.hex()
+            tok_text = ours_tokenizer.decode([tok_id])
+            # Sanitize non-printable characters for display
+            tok_display = repr(tok_text)[1:-1]  # strip outer quotes from repr
+        except Exception:
+            tok_hex = "???"
+            tok_display = "???"
+        try:
+            pair_a_text = repr(ours_tokenizer.decode([pair_a]))[1:-1]
+            pair_b_text = repr(ours_tokenizer.decode([pair_b]))[1:-1]
+        except Exception:
+            pair_a_text = str(pair_a)
+            pair_b_text = str(pair_b)
+        print(f"{tok_id:<10} {ios_score:<8.4f} {tok_hex:<24} {tok_display:<20} "
+              f"[{pair_a_text}] + [{pair_b_text}]")
+    if len(ios_results) > 20:
+        print(f"  ... and {len(ios_results) - 20} more")
+
 # Log to report
 from nanochat.report import get_report
 lines = []
@@ -447,6 +673,51 @@ for tokenizer_name in ["gpt2", "gpt4", "ours"]:
     mean_vocab_util = sum(vocab_utils) / len(vocab_utils)
     lines.append("")
     lines.append(f"**Gini**: {gini:.4f} | **Mean fertility**: {mean_fertility:.2f} | **Mean vocab util**: {mean_vocab_util:.4f}")
+    lines.append("")
+
+# Information-theoretic metrics
+lines.append("### Information-Theoretic Metrics (fwe-train)")
+lines.append("")
+lines.append("H_k = joint k-gram entropy (bits). H_{k|k-1} = conditional entropy (bits).")
+lines.append("")
+for tokenizer_name in ["gpt2", "gpt4", "ours"]:
+    vocab_size = vocab_sizes[tokenizer_name]
+    fwe_ids = tokenizer_results[tokenizer_name]['fwe-train']['token_ids']
+    entropies = compute_kgram_entropies(fwe_ids, max_k=5)
+    cap_util = compute_capacity_utilization(fwe_ids, vocab_size)
+    renyi_util = compute_renyi_utilization(fwe_ids, vocab_size, alpha=2)
+    lines.append(f"#### {tokenizer_name.upper()} (vocab: {vocab_size:,})")
+    lines.append("")
+    lines.append("| k | H_k (raw) | H_{k|k-1} (cond) |")
+    lines.append("|---|-----------|-------------------|")
+    for k in range(5):
+        lines.append(f"| {k+1} | {entropies['raw'][k]:.4f} | {entropies['conditional'][k]:.4f} |")
+    lines.append("")
+    lines.append(f"**Capacity util η**: {cap_util:.4f} | **Rényi util η₂**: {renyi_util:.4f}")
+    lines.append("")
+
+# IoS analysis
+lines.append("### IoS Junk Token Analysis (ours, ~10M chars, threshold=0.9)")
+lines.append("")
+lines.append(f"Junk tokens found: **{len(ios_results)}** / {vocab_sizes['ours']:,} vocab")
+lines.append("")
+if ios_results:
+    lines.append("| Token ID | IoS | Token (text) | Dominant Pair |")
+    lines.append("|----------|-----|--------------|---------------|")
+    for tok_id, ios_score, (pair_a, pair_b) in ios_results[:20]:
+        try:
+            tok_display = repr(ours_tokenizer.decode([tok_id]))[1:-1]
+        except Exception:
+            tok_display = "???"
+        try:
+            pair_a_text = repr(ours_tokenizer.decode([pair_a]))[1:-1]
+            pair_b_text = repr(ours_tokenizer.decode([pair_b]))[1:-1]
+        except Exception:
+            pair_a_text = str(pair_a)
+            pair_b_text = str(pair_b)
+        lines.append(f"| {tok_id} | {ios_score:.4f} | {tok_display} | [{pair_a_text}] + [{pair_b_text}] |")
+    if len(ios_results) > 20:
+        lines.append(f"| ... | | | {len(ios_results) - 20} more |")
     lines.append("")
 
 report_markdown = "\n".join(lines)
