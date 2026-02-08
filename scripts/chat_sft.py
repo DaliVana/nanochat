@@ -18,7 +18,7 @@ import torch
 from contextlib import nullcontext
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint
+from nanochat.checkpoint_manager import save_checkpoint, save_checkpoint_to_wandb, load_checkpoint_from_wandb, cleanup_old_checkpoints
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.checkpoint_manager import load_model
 import torch.distributed as dist
@@ -35,6 +35,8 @@ from tasks.spellingbee import SimpleSpelling, SpellingBee
 parser = argparse.ArgumentParser(description="Supervised fine-tuning (SFT) the model")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--wandb-save-checkpoints", action="store_true", help="save checkpoints to wandb as artifacts")
+parser.add_argument("--wandb-resume-artifact", type=str, default=None, help="wandb artifact path to resume from")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 parser.add_argument("--dtype", type=str, default="bfloat16", help="float32|bfloat16")
@@ -57,6 +59,7 @@ parser.add_argument("--init-lr-frac", type=float, default=1.0, help="initial LR 
 parser.add_argument("--eval-every", type=int, default=150, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=20*524288, help="number of tokens to evaluate val loss on")
 # Output
+parser.add_argument("--keep-checkpoints", type=int, default=-1, help="number of recent checkpoints to keep, older ones are deleted (-1 = keep all)")
 parser.add_argument("--dry-run", action="store_true", help="log to wandb but skip checkpoints/report")
 args = parser.parse_args()
 user_config = vars(args).copy()
@@ -306,6 +309,16 @@ while True:
                 "user_config": user_config, # inputs to the training script
             }
         )
+        
+        # Upload checkpoint to wandb if enabled
+        if args.wandb_save_checkpoints:
+            save_checkpoint_to_wandb(
+                wandb_run,
+                checkpoint_dir,
+                step,
+                world_size=ddp_world_size,
+                artifact_name=f"sft-checkpoint-{output_dirname}"
+            )
 
     if last_step:
         break

@@ -9,6 +9,19 @@ torchrun --nproc_per_node=8 -m scripts.base_train
 
 If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
 python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
+
+WandB Checkpointing:
+To save checkpoints to wandb as artifacts:
+python -m scripts.base_train --run=my_run --wandb-save-checkpoints --save-every=1000
+
+To keep only the last checkpoint (saves disk space):
+python -m scripts.base_train --run=my_run --save-every=1000 --keep-checkpoints=1
+
+To resume from a wandb artifact:
+python -m scripts.base_train --run=my_run --wandb-resume-artifact=model-checkpoint-d12:latest
+
+Or from a specific version:
+python -m scripts.base_train --run=my_run --wandb-resume-artifact=entity/project/model-checkpoint-d12:v5000
 """
 
 import gc
@@ -25,7 +38,7 @@ from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
+from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, save_checkpoint_to_wandb, load_checkpoint_from_wandb, cleanup_old_checkpoints
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
@@ -37,6 +50,8 @@ print_banner()
 parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--wandb-save-checkpoints", action="store_true", help="save checkpoints to wandb as artifacts")
+parser.add_argument("--wandb-resume-artifact", type=str, default=None, help="wandb artifact path to resume from (e.g., 'entity/project/model-checkpoint:v123' or 'model-checkpoint:latest')")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # Model architecture
@@ -74,6 +89,7 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--keep-checkpoints", type=int, default=-1, help="number of recent checkpoints to keep, older ones are deleted (-1 = keep all)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -180,10 +196,22 @@ model.init_weights() # All tensors get initialized
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
-resuming = args.resume_from_step != -1
+resuming = args.resume_from_step != -1 or args.wandb_resume_artifact is not None
+
 if resuming:
-    print0(f"Resuming optimization from step {args.resume_from_step}")
-    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    if args.wandb_resume_artifact:
+        print0(f"Resuming from wandb artifact: {args.wandb_resume_artifact}")
+        model_data, optimizer_data, meta_data = load_checkpoint_from_wandb(
+            args.wandb_resume_artifact, device, load_optimizer=True, rank=ddp_rank
+        )
+    elif args.resume_from_step != -1:
+        print0(f"Resuming optimization from step {args.resume_from_step}")
+        model_data, optimizer_data, meta_data = load_checkpoint(
+            checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank
+        )
+    else:
+        raise ValueError("Invalid resume configuration")
+    
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
@@ -370,6 +398,25 @@ while True:
             },
             rank=ddp_rank,
         )
+        
+        # Upload checkpoint to wandb if enabled (only master process)
+        if args.wandb_save_checkpoints and master_process:
+            save_checkpoint_to_wandb(
+                wandb_run,
+                checkpoint_dir,
+                step,
+                world_size=ddp_world_size,
+                artifact_name=f"model-checkpoint-{output_dirname}"
+            )
+        
+        # Cleanup old checkpoints if requested
+        if args.keep_checkpoints > 0:
+            cleanup_old_checkpoints(
+                checkpoint_dir,
+                step,
+                keep_last_n=args.keep_checkpoints,
+                rank=ddp_rank
+            )
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
