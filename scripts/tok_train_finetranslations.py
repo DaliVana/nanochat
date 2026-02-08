@@ -14,7 +14,7 @@ from nanochat.common import get_base_dir
 
 # -----------------------------------------------------------------------------
 # Parse command line arguments
-
+# tok_train_finetranslations.py --data-dir dev/finetranslations_output --doc-cap 10000 --vocab-size 32768 --tokenizer-name tokenizer_finetranslations
 parser = argparse.ArgumentParser(description='Train a BPE tokenizer on finetranslations data')
 parser.add_argument('--data-dir', type=str, default='dev/finetranslations_output', 
                     help='Directory containing parquet files (default: dev/finetranslations_output)')
