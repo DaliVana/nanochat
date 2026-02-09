@@ -166,6 +166,8 @@ class Engine:
     def __init__(self, model, tokenizer):
         self.model = model
         self.tokenizer = tokenizer # needed for tool use
+        # Check if MoVE CPU offload is enabled for speculative prefetching
+        self._move_offload = getattr(model, 'move_offload_cpu', False)
 
     @torch.inference_mode()
     def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):

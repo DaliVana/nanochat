@@ -64,6 +64,10 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 parser.add_argument("--mod-capacity", type=float, default=1.0, help="MoD capacity ratio (1.0=disabled, 0.125=12.5%%)")
 parser.add_argument("--mod-protected-start", type=int, default=4, help="Number of protected start layers (always full capacity)")
 parser.add_argument("--mod-protected-end", type=int, default=2, help="Number of protected end layers (always full capacity)")
+# Mixture of Value Embeddings (MoVE) - replaces per-layer LaVE with a global shared bank
+parser.add_argument("--use-move", action="store_true", help="Use MoVE instead of per-layer LaVE for value embeddings")
+parser.add_argument("--move-slots", type=int, default=0, help="Number of MoVE memory slots M (0 = auto: n_layer)")
+parser.add_argument("--move-offload-cpu", action="store_true", help="Offload MoVE embeddings to CPU (reduces GPU memory)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -184,7 +188,12 @@ model_config_kwargs = dict(
     # MoD config (capacity=1.0 means disabled)
     mod_capacity=args.mod_capacity,
     mod_fixed_layers_start=args.mod_protected_start, mod_fixed_layers_end=args.mod_protected_end,
+    # MoVE config
+    use_move=args.use_move, move_slots=args.move_slots,
+    move_offload_cpu=args.move_offload_cpu,
 )
+if args.move_offload_cpu and not args.use_move:
+    print0("Warning: --move-offload-cpu has no effect without --use-move")
 with torch.device("meta"):
     # All tensors are created as meta tensors (they have shape/dtype but no data)
     model_config = GPTConfig(**model_config_kwargs)
@@ -252,7 +261,7 @@ print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 adam_betas = (args.adam_beta1, args.adam_beta2)
-optimizer = model.setup_optimizer(
+optimizer_result = model.setup_optimizer(
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
     matrix_lr=args.matrix_lr * batch_lr_scale,
@@ -261,8 +270,23 @@ optimizer = model.setup_optimizer(
     scalar_lr=args.scalar_lr * batch_lr_scale,
 )
 
+# Handle CPU optimizer for MoVE offload
+if args.use_move and args.move_offload_cpu:
+    optimizer, cpu_optimizer = optimizer_result
+    print0(f"MoVE CPU offload enabled: embedding optimizer runs on CPU")
+else:
+    optimizer = optimizer_result
+    cpu_optimizer = None
+
 if resuming:
     optimizer.load_state_dict(optimizer_data)
+    # Load CPU optimizer from separate file if MoVE offload is enabled
+    if cpu_optimizer is not None and meta_data.get("has_cpu_optimizer", False):
+        resume_step = meta_data["step"]
+        cpu_opt_path = os.path.join(checkpoint_dir, f"cpu_optimizer_{resume_step:06d}.pt")
+        if os.path.exists(cpu_opt_path):
+            cpu_optimizer.load_state_dict(torch.load(cpu_opt_path))
+            print0(f"Loaded CPU optimizer from: {cpu_opt_path}")
     del optimizer_data
 
 # -----------------------------------------------------------------------------
@@ -377,27 +401,38 @@ while True:
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+        # Build metadata dict (JSON serializable only)
+        checkpoint_metadata = {
+            "step": step,
+            "val_bpb": val_bpb, # loss at last step
+            "model_config": model_config_kwargs,
+            "user_config": user_config, # inputs to the training script
+            "device_batch_size": args.device_batch_size,
+            "max_seq_len": args.max_seq_len,
+            "dataloader_state_dict": dataloader_state_dict,
+            "loop_state": { # all loop state (other than step) so that we can resume training
+                "min_val_bpb": min_val_bpb,
+                "smooth_train_loss": smooth_train_loss,
+                "total_training_time": total_training_time,
+            },
+            "has_cpu_optimizer": cpu_optimizer is not None,
+        }
+        
         save_checkpoint(
             checkpoint_dir,
             step,
             orig_model.state_dict(), # model parameters
             optimizer.state_dict(), # optimizer state
-            { # metadata saved as json
-                "step": step,
-                "val_bpb": val_bpb, # loss at last step
-                "model_config": model_config_kwargs,
-                "user_config": user_config, # inputs to the training script
-                "device_batch_size": args.device_batch_size,
-                "max_seq_len": args.max_seq_len,
-                "dataloader_state_dict": dataloader_state_dict,
-                "loop_state": { # all loop state (other than step) so that we can resume training
-                    "min_val_bpb": min_val_bpb,
-                    "smooth_train_loss": smooth_train_loss,
-                    "total_training_time": total_training_time,
-                },
-            },
+            checkpoint_metadata,
             rank=ddp_rank,
         )
+        
+        # Save CPU optimizer separately if MoVE offload is enabled
+        if cpu_optimizer is not None and ddp_rank == 0:
+            import os as _os
+            cpu_opt_path = _os.path.join(checkpoint_dir, f"cpu_optimizer_{step:06d}.pt")
+            torch.save(cpu_optimizer.state_dict(), cpu_opt_path)
+            print0(f"Saved CPU optimizer to: {cpu_opt_path}")
         
         # Upload checkpoint to wandb if enabled (only master process)
         if args.wandb_save_checkpoints and master_process:
@@ -434,6 +469,9 @@ while True:
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        # Prefetch MoVE embeddings for next batch (overlaps with GPU backward)
+        if cpu_optimizer is not None:
+            orig_model.prefetch_value_embeds(x)
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -444,6 +482,14 @@ while True:
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
+    # Step CPU optimizer for MoVE embeddings (if enabled)
+    if cpu_optimizer is not None:
+        cpu_optimizer.set_lr(cpu_optimizer.lr * lrm / (cpu_optimizer.lr if hasattr(cpu_optimizer, '_initial_lr') else cpu_optimizer.lr))
+        # On first step, store initial LR for scheduling
+        if not hasattr(cpu_optimizer, '_initial_lr'):
+            cpu_optimizer._initial_lr = cpu_optimizer.lr
+        cpu_optimizer.set_lr(cpu_optimizer._initial_lr * lrm)
+        cpu_optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()

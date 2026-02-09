@@ -22,6 +22,7 @@ import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0
 from nanochat.optim import MuonAdamW, DistMuonAdamW
+from nanochat.move_offload import MoVEOffloadedEmbedding, MoVECPUAdamW
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
@@ -48,6 +49,13 @@ class GPTConfig:
     mla_d_c: int = 0                # KV compression dimension (0 = auto-scale: n_embd // 3)
     mla_d_c1: int = 0               # Q compression dimension (0 = same as mla_d_c)
     mla_d_rope: int = 0             # Decoupled RoPE dimension (0 = auto-scale: head_dim // 2)
+    # Mixture of Value Embeddings (MoVE) - replaces per-layer LaVE with a global shared bank
+    use_move: bool = False          # Enable MoVE (False = per-layer LaVE)
+    move_slots: int = 0             # Number of memory slots M (0 = auto: n_layer)
+    # MoVE CPU Offloading - keeps value embeddings on CPU, fetches per batch
+    move_offload_cpu: bool = False  # Enable CPU offloading for MoVE embeddings
+    move_prefetch: bool = True      # Async prefetch next batch (only with offload)
+    move_cache_size: int = 1024     # LRU cache size for inference (only with offload)
 
 
 def get_mla_dims(config):
@@ -136,8 +144,16 @@ class CausalSelfAttention(nn.Module):
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False)
+        # Value embedding gating
+        self.use_move = config.use_move
+        if config.use_move:
+            self.move_slots = config.move_slots if config.move_slots > 0 else config.n_layer
+            # MoVE: full hidden dim -> n_kv_head * (M+1) gates (one for standard V, M for memory slots)
+            self.ve_gate = nn.Linear(config.n_embd, self.n_kv_head * (self.move_slots + 1), bias=False)
+        else:
+            self.move_slots = 0
+            self.ve_gate_channels = 32
+            self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False)
 
     def forward(self, x, ve, cos, sin, window_size, kv_cache=None):
         """
@@ -156,11 +172,20 @@ class CausalSelfAttention(nn.Module):
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
 
-        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
+        # Value embedding mixing
         if ve is not None:
-            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
-            v = v + gate.unsqueeze(-1) * ve
+            if self.use_move:
+                # MoVE: multi-slot gating with gated standard V path
+                M = self.move_slots
+                ve = ve.view(B, T, M, self.n_kv_head, self.head_dim)  # (B, T, M, H, D)
+                gates = 2 * torch.sigmoid(self.ve_gate(x))  # (B, T, H*(M+1))
+                gates = gates.view(B, T, self.n_kv_head, M + 1)  # (B, T, H, M+1)
+                v = gates[..., 0:1] * v + torch.einsum('bthm,btmhd->bthd', gates[..., 1:], ve)
+            else:
+                # LaVE: single per-layer value embedding, additive
+                ve = ve.view(B, T, self.n_kv_head, self.head_dim)
+                gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
+                v = v + gate.unsqueeze(-1) * ve
 
         # Apply Rotary Embeddings
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
@@ -233,9 +258,16 @@ class MLACausalSelfAttention(nn.Module):
         # Output projection
         self.c_proj = nn.Linear(self.n_head * self.head_dim, config.n_embd, bias=False)
 
-        # Value embedding (keep for compatibility with existing architecture)
-        self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_head, bias=False)
+        # Value embedding gating
+        self.use_move = config.use_move
+        if config.use_move:
+            self.move_slots = config.move_slots if config.move_slots > 0 else config.n_layer
+            # MoVE: full hidden dim -> n_head * (M+1) gates
+            self.ve_gate = nn.Linear(config.n_embd, self.n_head * (self.move_slots + 1), bias=False)
+        else:
+            self.move_slots = 0
+            self.ve_gate_channels = 32
+            self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_head, bias=False)
 
     def forward(self, x, ve, cos, sin, window_size, kv_cache=None):
         """
@@ -257,10 +289,19 @@ class MLACausalSelfAttention(nn.Module):
         # 3. Apply RoPE to k_rope (single head, then broadcast)
         k_rope = apply_rotary_emb(k_rope_raw.view(B, T, 1, self.d_rope), cos, sin)
 
-        # 4. Value embedding
-        ve = ve.view(B, T, self.n_head, self.head_dim)
-        gate = 2 * torch.sigmoid(self.ve_gate(x.narrow(-1, 0, self.ve_gate_channels)))
-        v = v + gate.unsqueeze(-1) * ve
+        # 4. Value embedding mixing
+        if self.use_move:
+            # MoVE: multi-slot gating with gated standard V path
+            M = self.move_slots
+            ve = ve.view(B, T, M, self.n_head, self.head_dim)  # (B, T, M, H, D)
+            gates = 2 * torch.sigmoid(self.ve_gate(x))  # (B, T, H*(M+1))
+            gates = gates.view(B, T, self.n_head, M + 1)  # (B, T, H, M+1)
+            v = gates[..., 0:1] * v + torch.einsum('bthm,btmhd->bthd', gates[..., 1:], ve)
+        else:
+            # LaVE: single per-layer value embedding, additive
+            ve = ve.view(B, T, self.n_head, self.head_dim)
+            gate = 2 * torch.sigmoid(self.ve_gate(x.narrow(-1, 0, self.ve_gate_channels)))
+            v = v + gate.unsqueeze(-1) * ve
 
         # 5. Up-project Q: c_q -> Q, then split into nope/rope parts
         q = self.w_uq(c_q).view(B, T, self.n_head, self.head_dim)
@@ -342,7 +383,11 @@ class Block(nn.Module):
         # Gather selected tokens (more compile-friendly than advanced indexing)
         indices_x = top_indices.unsqueeze(-1).expand(-1, -1, C)  # (B, k, C)
         x_selected = torch.gather(x, 1, indices_x)  # (B, k, C)
-        ve_selected = torch.gather(ve, 1, indices_x) if ve is not None else None
+        if ve is not None:
+            indices_ve = top_indices.unsqueeze(-1).expand(-1, -1, ve.size(-1))  # (B, k, ve_dim)
+            ve_selected = torch.gather(ve, 1, indices_ve)
+        else:
+            ve_selected = None
 
         # Gather cos/sin for selected positions (cos/sin are already (B, T, rope_dim))
         rope_dim = cos.size(-1)
@@ -392,7 +437,7 @@ class GPT(nn.Module):
         # Separate parameters so they can have different optimizer treatment
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))   # fake init, real init in init_weights()
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
-        # Value embeddings (ResFormer-style): every layer
+        # Value embeddings
         head_dim = config.n_embd // config.n_head
         if config.use_mla:
             # MLA: value embeddings have full n_head (no GQA)
@@ -400,7 +445,21 @@ class GPT(nn.Module):
         else:
             # Standard: value embeddings use n_kv_head (GQA support)
             ve_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleList([nn.Embedding(padded_vocab_size, ve_dim) for _ in range(config.n_layer)])
+        self.ve_dim = ve_dim
+        self.move_offload_cpu = config.use_move and config.move_offload_cpu
+        if config.use_move:
+            # MoVE: single global bank shared across all layers
+            move_slots = config.move_slots if config.move_slots > 0 else config.n_layer
+            if config.move_offload_cpu:
+                # CPU offloaded MoVE: initialized later in init_weights()
+                # We create a placeholder that will be replaced
+                self.value_embeds = None
+                self._ve_offload_params = (padded_vocab_size, move_slots * ve_dim)
+            else:
+                self.value_embeds = nn.Embedding(padded_vocab_size, move_slots * ve_dim)
+        else:
+            # LaVE: per-layer value embeddings
+            self.value_embeds = nn.ModuleList([nn.Embedding(padded_vocab_size, ve_dim) for _ in range(config.n_layer)])
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -484,8 +543,24 @@ class GPT(nn.Module):
         self.x0_lambdas.fill_(0.1)      # 0.1 => small initial weight for skip connection to input embedding
 
         # Value embeddings (init like c_v: uniform with same std)
-        for ve in self.value_embeds:
-            torch.nn.init.uniform_(ve.weight, -s, s)
+        if self.config.use_move:
+            if self.move_offload_cpu:
+                # Create offloaded embedding now that we're out of meta device context
+                vocab_size, embedding_dim = self._ve_offload_params
+                device = self.transformer.wte.weight.device
+                self.value_embeds = MoVEOffloadedEmbedding(
+                    num_embeddings=vocab_size,
+                    embedding_dim=embedding_dim,
+                    device=str(device) if device.type != 'meta' else 'cuda',
+                    dtype=torch.bfloat16,
+                )
+                # Initialize weights (on CPU)
+                torch.nn.init.uniform_(self.value_embeds.weight, -s, s)
+            else:
+                torch.nn.init.uniform_(self.value_embeds.weight, -s, s)
+        else:
+            for ve in self.value_embeds:
+                torch.nn.init.uniform_(ve.weight, -s, s)
 
         # Gate weights init to zero so gates start at sigmoid(0) = 0.5, scaled by 2 -> 1.0 (neutral)
         for block in self.transformer.h:
@@ -504,8 +579,13 @@ class GPT(nn.Module):
         # Cast embeddings to bf16: optimizer can tolerate it and it saves memory
         if self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
-            for ve in self.value_embeds:
-                ve.to(dtype=torch.bfloat16)
+            if self.config.use_move:
+                if not self.move_offload_cpu:
+                    # Only cast if not offloaded (offloaded is already bf16)
+                    self.value_embeds.to(dtype=torch.bfloat16)
+            else:
+                for ve in self.value_embeds:
+                    ve.to(dtype=torch.bfloat16)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -570,7 +650,10 @@ class GPT(nn.Module):
         """
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
-        value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds)
+        if self.config.use_move:
+            value_embeds_numel = self.value_embeds.weight.numel()
+        else:
+            value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds)
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
@@ -597,12 +680,20 @@ class GPT(nn.Module):
         """
         # Count each group separately (mirrors the grouping in setup_optimizers)
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
-        value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
+        if self.config.use_move:
+            value_embeds = self.value_embeds.weight.numel()
+        else:
+            value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
-        assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
+        # When MoVE is offloaded, value_embeds is a buffer (not Parameter), so exclude from check
+        params_in_model = sum(p.numel() for p in self.parameters())
+        if self.move_offload_cpu:
+            assert total == params_in_model + value_embeds, "Parameter count mismatch"
+        else:
+            assert total == params_in_model, "Parameter count mismatch"
         return {
             'wte': wte,
             'value_embeds': value_embeds,
@@ -618,12 +709,23 @@ class GPT(nn.Module):
 
         # Separate out all parameters into groups
         matrix_params = list(self.transformer.h.parameters())
-        value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+
+        # Handle value embeddings based on offload setting
+        if self.move_offload_cpu:
+            # Offloaded: create separate CPU optimizer (returned separately)
+            value_embeds_params = []  # Don't include in GPU optimizer
+        else:
+            value_embeds_params = list(self.value_embeds.parameters())
+
+        # Verify parameter count (adjust for offloaded case)
+        expected_params = len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        actual_params = len(list(self.parameters()))
+        if not self.move_offload_cpu:
+            assert actual_params == expected_params, f"Parameter count mismatch: {actual_params} != {expected_params}"
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -634,10 +736,18 @@ class GPT(nn.Module):
             # AdamW groups (embeddings, lm_head, scalars)
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+        ]
+
+        # Only add value_embeds to GPU optimizer if not offloaded
+        if not self.move_offload_cpu:
+            param_groups.append(
+                dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0)
+            )
+
+        param_groups.extend([
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
-        ]
+        ])
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -650,7 +760,40 @@ class GPT(nn.Module):
         optimizer = Factory(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
+
+        # Create CPU optimizer for offloaded MoVE embeddings
+        if self.move_offload_cpu:
+            cpu_optimizer = MoVECPUAdamW(
+                self.value_embeds,
+                lr=embedding_lr * dmodel_lr_scale,
+                betas=adam_betas,
+                eps=1e-10,
+                weight_decay=0.0,
+            )
+            return optimizer, cpu_optimizer
+
         return optimizer
+
+    def prefetch_value_embeds(self, next_idx: torch.Tensor) -> None:
+        """
+        Prefetch value embeddings for next batch (only when MoVE CPU offload is enabled).
+        Call this during current forward pass to overlap transfer with compute.
+
+        Args:
+            next_idx: (B, T) tensor of next batch's token indices
+        """
+        if self.move_offload_cpu and self.config.move_prefetch:
+            self.value_embeds.prefetch(next_idx)
+
+    def accumulate_ve_grad(self) -> None:
+        """
+        Accumulate gradients for offloaded MoVE embeddings.
+        Call this after backward pass when using CPU offload.
+        """
+        if self.move_offload_cpu and hasattr(self, '_last_ve_global') and self._last_ve_global is not None:
+            if self._last_ve_global.grad is not None:
+                self.value_embeds.accumulate_grad(self._last_ve_global.grad)
+            self._last_ve_global = None
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
@@ -682,9 +825,19 @@ class GPT(nn.Module):
         else:
             capacity = T
 
+        # MoVE: lookup global bank once; LaVE: lookup per-layer in loop
+        if self.config.use_move:
+            ve_global = self.value_embeds(idx)  # (B, T, M * ve_dim) - shared across all layers
+            # Register backward hook for gradient accumulation if using CPU offload
+            if self.move_offload_cpu and self.training and ve_global.requires_grad:
+                def ve_grad_hook(grad):
+                    self.value_embeds.accumulate_grad(grad)
+                    return grad
+                ve_global.register_hook(ve_grad_hook)
+
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[i](idx)
+            ve = ve_global if self.config.use_move else self.value_embeds[i](idx)
 
             if mod_active and is_mod_layer(i, self.config.n_layer, self.config):
                 # MoD layer with norm-based routing
