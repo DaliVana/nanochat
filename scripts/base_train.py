@@ -225,7 +225,13 @@ if resuming:
     del model_data # free up this memory after the copy
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+if HAS_FA4:
+    # Blackwell (sm_103a): Triton's ptxas doesn't support this arch yet,
+    # so torch.compile/Inductor fails. Skip compilation until Triton adds support.
+    # FA4's CuTe-DSL kernels provide the attention speedup regardless.
+    print0("Skipping torch.compile (Blackwell GPU — Triton ptxas doesn't support sm_103a yet)")
+else:
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # Detailed parameter counts
 param_counts = orig_model.num_scaling_params()
