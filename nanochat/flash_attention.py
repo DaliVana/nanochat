@@ -31,11 +31,13 @@ def _load_flash_attention_4():
         return None
     try:
         major, _ = torch.cuda.get_device_capability()
-        if major != 10:
+        if major < 10:
             return None
         from flash_attn.cute.interface import flash_attn_func
         return flash_attn_func
-    except Exception:
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Blackwell GPU detected but FA4 failed to load: {e}")
         return None
 
 

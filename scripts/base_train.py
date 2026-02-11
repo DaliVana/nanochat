@@ -131,6 +131,9 @@ else:
     print0("!" * 80)
     print0("WARNING: Flash Attention 3/4 not available, using PyTorch SDPA fallback")
     print0("WARNING: Training will be less efficient without FA3/FA4")
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10:
+        print0("WARNING: Blackwell GPU detected but FA4 not installed!")
+        print0("WARNING: Install flash-attn with: pip install flash-attn --no-build-isolation")
     if args.window_pattern != "L":
         print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{args.window_pattern}'). Your GPU utilization will be terrible.")
         print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")
