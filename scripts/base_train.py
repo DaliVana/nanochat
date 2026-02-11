@@ -26,19 +26,20 @@ python -m scripts.base_train --run=my_run --wandb-resume-artifact=entity/project
 
 import gc
 import os
+import shutil
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+# Blackwell (sm_103a): Triton bundles an old ptxas that doesn't support sm_103a.
+# Point it to the system CUDA toolkit's ptxas which does.
+if "TRITON_PTXAS_PATH" not in os.environ:
+    _sys_ptxas = shutil.which("ptxas")
+    if _sys_ptxas:
+        os.environ["TRITON_PTXAS_PATH"] = _sys_ptxas
 import argparse
 import time
 from contextlib import nullcontext
 
 import wandb
 import torch
-
-# Blackwell (sm_103a): Triton's ptxas doesn't support this arch yet, so disable
-# torch.compile/Inductor entirely. Must happen before any @torch.compile decorators
-# in imported modules (e.g. optim.py) trigger compilation.
-if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10:
-    torch._dynamo.config.disable = True
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
@@ -231,13 +232,7 @@ if resuming:
     del model_data # free up this memory after the copy
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-if HAS_FA4:
-    # Blackwell (sm_103a): Triton's ptxas doesn't support this arch yet,
-    # so torch.compile/Inductor fails. Skip compilation until Triton adds support.
-    # FA4's CuTe-DSL kernels provide the attention speedup regardless.
-    print0("Skipping torch.compile (Blackwell GPU — Triton ptxas doesn't support sm_103a yet)")
-else:
-    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # Detailed parameter counts
 param_counts = orig_model.num_scaling_params()

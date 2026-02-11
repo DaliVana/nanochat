@@ -11,16 +11,17 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-s
 
 import argparse
 import os
+import shutil
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+# Blackwell (sm_103a): Triton bundles an old ptxas that doesn't support sm_103a.
+# Point it to the system CUDA toolkit's ptxas which does.
+if "TRITON_PTXAS_PATH" not in os.environ:
+    _sys_ptxas = shutil.which("ptxas")
+    if _sys_ptxas:
+        os.environ["TRITON_PTXAS_PATH"] = _sys_ptxas
 import time
 import wandb
 import torch
-
-# Blackwell (sm_103a): Triton's ptxas doesn't support this arch yet, so disable
-# torch.compile/Inductor entirely. Must happen before any @torch.compile decorators
-# in imported modules (e.g. optim.py) trigger compilation.
-if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10:
-    torch._dynamo.config.disable = True
 from contextlib import nullcontext
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_token_bytes
@@ -90,9 +91,7 @@ pretrain_batch_size = meta.get("device_batch_size", None)
 if pretrain_batch_size is not None and args.device_batch_size > pretrain_batch_size:
     print0(f"FOOTGUN WARNING: base model training used device_batch_size {pretrain_batch_size}, did you pass in a good --device-batch-size to this script?")
 orig_model = model
-from nanochat.flash_attention import HAS_FA4
-if not HAS_FA4:
-    model = torch.compile(model, dynamic=False)
+model = torch.compile(model, dynamic=False)
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
