@@ -9,7 +9,7 @@ Notable features:
 - no learnable params in rmsnorm
 - no bias in linear layers
 - Group-Query Attention (GQA) support for more efficient inference
-- Flash Attention 3 integration
+- Flash Attention 4/3 integration
 """
 
 import math
@@ -24,7 +24,7 @@ from nanochat.common import get_dist_info, print0
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 from nanochat.move_offload import MoVEOffloadedEmbedding, MoVECPUAdamW
 
-# Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
+# Our custom Flash Attention module that automatically uses FA4 on Blackwell, FA3 on Hopper, and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
 
 @dataclass
