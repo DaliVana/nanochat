@@ -15,6 +15,12 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import wandb
 import torch
+
+# Blackwell (sm_103a): Triton's ptxas doesn't support this arch yet, so disable
+# torch.compile/Inductor entirely. Must happen before any @torch.compile decorators
+# in imported modules (e.g. optim.py) trigger compilation.
+if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10:
+    torch._dynamo.config.disable = True
 from contextlib import nullcontext
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_token_bytes

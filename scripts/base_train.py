@@ -34,6 +34,12 @@ from contextlib import nullcontext
 import wandb
 import torch
 
+# Blackwell (sm_103a): Triton's ptxas doesn't support this arch yet, so disable
+# torch.compile/Inductor entirely. Must happen before any @torch.compile decorators
+# in imported modules (e.g. optim.py) trigger compilation.
+if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10:
+    torch._dynamo.config.disable = True
+
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
