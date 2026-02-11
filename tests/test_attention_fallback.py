@@ -1,38 +1,40 @@
 """
-Test Flash Attention unified interface - verify FA3 and SDPA produce identical results.
+Test Flash Attention unified interface - verify FA4, FA3 and SDPA produce identical results.
 
 Run: python -m pytest tests/test_attention_fallback.py -v -s
 
 Note on test structure:
-    Tests are split into two classes due to dtype/device constraints:
+    Tests are split into classes due to dtype/device constraints:
 
-    1. TestFA3VsSDPA: Comparison tests that run both FA3 and SDPA on the same inputs
-       and verify they produce identical results. These require a Hopper GPU (FA3 only
-       works on sm90+) and use bfloat16 (FA3 doesn't support float32).
+    1. TestFA4VsSDPA: Comparison tests that run both FA4 and SDPA on the same inputs
+       and verify they produce identical results. Requires a Blackwell GPU (sm100).
 
-    2. TestSDPAOnly: Tests that only exercise the SDPA fallback path. These can run
+    2. TestFA3VsSDPA: Comparison tests that run both FA3 and SDPA on the same inputs
+       and verify they produce identical results. Requires a Hopper GPU (sm90).
+
+    3. TestSDPAOnly: Tests that only exercise the SDPA fallback path. These can run
        on any device (CUDA, CPU, MPS) with the appropriate dtype for that device.
 """
 import torch
 import pytest
 import nanochat.flash_attention as fa_module
-from nanochat.flash_attention import flash_attn, HAS_FA3
+from nanochat.flash_attention import flash_attn, HAS_FA3, HAS_FA4
 from nanochat.engine import KVCache
 
 
 def set_impl(impl):
-    """Set the implementation override ('fa3', 'sdpa', or None for auto)."""
+    """Set the implementation override ('fa4', 'fa3', 'sdpa', or None for auto)."""
     fa_module._override_impl = impl
 
 
-def run_both_impls(fn):
-    """Run a function with both FA3 and SDPA, return both outputs."""
-    set_impl('fa3')
-    out_fa3 = fn()
-    set_impl('sdpa')
-    out_sdpa = fn()
+def run_both_impls(fn, impl_a, impl_b='sdpa'):
+    """Run a function with two implementations, return both outputs."""
+    set_impl(impl_a)
+    out_a = fn()
+    set_impl(impl_b)
+    out_b = fn()
     set_impl(None)  # reset
-    return out_fa3, out_sdpa
+    return out_a, out_b
 
 
 def assert_close(t1, t2, name, atol=1e-2, rtol=1e-2):
@@ -42,6 +44,112 @@ def assert_close(t1, t2, name, atol=1e-2, rtol=1e-2):
     assert torch.allclose(t1, t2, atol=atol, rtol=rtol), \
         f"{name}: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}"
     return max_diff, mean_diff
+
+
+# =============================================================================
+# FA4 vs SDPA comparison tests (require Blackwell GPU)
+# =============================================================================
+@pytest.mark.skipif(not HAS_FA4, reason="FA4 required to compare implementations")
+class TestFA4VsSDPA:
+    """Compare FA4 and SDPA produce identical results. Requires Blackwell GPU."""
+
+    DEVICE = "cuda"
+    DTYPE = torch.bfloat16
+
+    def test_basic_causal(self):
+        """Basic causal attention."""
+        B, T, H, D = 2, 64, 4, 32
+        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+
+        def run():
+            return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0))
+
+        y_fa4, y_sdpa = run_both_impls(run, 'fa4')
+        max_diff, mean_diff = assert_close(y_fa4, y_sdpa, "basic_causal")
+        print(f"basic_causal: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+
+    def test_full_context(self):
+        """Full context (window_size=-1)."""
+        B, T, H, D = 2, 128, 4, 32
+        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+
+        def run():
+            return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(-1, -1))
+
+        y_fa4, y_sdpa = run_both_impls(run, 'fa4')
+        max_diff, mean_diff = assert_close(y_fa4, y_sdpa, "full_context")
+        print(f"full_context: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+
+    def test_sliding_window(self):
+        """Sliding window attention."""
+        B, T, H, D = 2, 128, 4, 32
+        window = 32
+        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+
+        def run():
+            return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(window, 0))
+
+        y_fa4, y_sdpa = run_both_impls(run, 'fa4')
+        max_diff, mean_diff = assert_close(y_fa4, y_sdpa, "sliding_window")
+        print(f"sliding_window: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+
+    def test_gqa(self):
+        """Group Query Attention (fewer KV heads than Q heads)."""
+        B, T, D = 2, 64, 32
+        n_heads = 8
+        n_kv_heads = 2
+
+        q = torch.randn(B, T, n_heads, D, device=self.DEVICE, dtype=self.DTYPE)
+        k = torch.randn(B, T, n_kv_heads, D, device=self.DEVICE, dtype=self.DTYPE)
+        v = torch.randn(B, T, n_kv_heads, D, device=self.DEVICE, dtype=self.DTYPE)
+
+        def run():
+            return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0))
+
+        y_fa4, y_sdpa = run_both_impls(run, 'fa4')
+        max_diff, mean_diff = assert_close(y_fa4, y_sdpa, "gqa")
+        print(f"gqa: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+
+    def test_backward_gradients_match(self):
+        """Verify gradients are similar between FA4 and SDPA."""
+        B, T, H, D = 2, 32, 4, 16
+
+        q_data = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k_data = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        v_data = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+
+        def run():
+            q = q_data.clone().requires_grad_(True)
+            k = k_data.clone().requires_grad_(True)
+            v = v_data.clone().requires_grad_(True)
+            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0))
+            loss = y.sum()
+            loss.backward()
+            return y.detach(), q.grad.detach(), k.grad.detach(), v.grad.detach()
+
+        set_impl('fa4')
+        y_fa4, q_grad_fa4, k_grad_fa4, v_grad_fa4 = run()
+        set_impl('sdpa')
+        y_sdpa, q_grad_sdpa, k_grad_sdpa, v_grad_sdpa = run()
+        set_impl(None)
+
+        max_diff, mean_diff = assert_close(y_fa4, y_sdpa, "backward_output")
+        print(f"backward_output: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+
+        max_diff, mean_diff = assert_close(q_grad_fa4, q_grad_sdpa, "q_grad", atol=0.05, rtol=0.05)
+        print(f"q_grad: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+
+        max_diff, mean_diff = assert_close(k_grad_fa4, k_grad_sdpa, "k_grad", atol=0.05, rtol=0.05)
+        print(f"k_grad: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+
+        max_diff, mean_diff = assert_close(v_grad_fa4, v_grad_sdpa, "v_grad", atol=0.05, rtol=0.05)
+        print(f"v_grad: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
 
 
 # =============================================================================
@@ -64,7 +172,7 @@ class TestFA3VsSDPA:
         def run():
             return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0))
 
-        y_fa3, y_sdpa = run_both_impls(run)
+        y_fa3, y_sdpa = run_both_impls(run, 'fa3')
         max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "basic_causal")
         print(f"basic_causal: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
 
@@ -78,7 +186,7 @@ class TestFA3VsSDPA:
         def run():
             return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(-1, -1))
 
-        y_fa3, y_sdpa = run_both_impls(run)
+        y_fa3, y_sdpa = run_both_impls(run, 'fa3')
         max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "full_context")
         print(f"full_context: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
 
@@ -93,7 +201,7 @@ class TestFA3VsSDPA:
         def run():
             return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(window, 0))
 
-        y_fa3, y_sdpa = run_both_impls(run)
+        y_fa3, y_sdpa = run_both_impls(run, 'fa3')
         max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "sliding_window")
         print(f"sliding_window: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
 
@@ -110,7 +218,7 @@ class TestFA3VsSDPA:
         def run():
             return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0))
 
-        y_fa3, y_sdpa = run_both_impls(run)
+        y_fa3, y_sdpa = run_both_impls(run, 'fa3')
         max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "gqa")
         print(f"gqa: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
 
@@ -124,7 +232,7 @@ class TestFA3VsSDPA:
         def run():
             return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(-1, -1))
 
-        y_fa3, y_sdpa = run_both_impls(run)
+        y_fa3, y_sdpa = run_both_impls(run, 'fa3')
         max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "larger_model")
         print(f"larger_model: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
 
@@ -147,7 +255,7 @@ class TestFA3VsSDPA:
                 causal=True, window_size=(T_max, 0)
             )
 
-        y_fa3, y_sdpa = run_both_impls(run)
+        y_fa3, y_sdpa = run_both_impls(run, 'fa3')
         max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "prefill")
         print(f"prefill: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
 
@@ -174,7 +282,7 @@ class TestFA3VsSDPA:
                 causal=True, window_size=(T_max, 0)
             )
 
-        y_fa3, y_sdpa = run_both_impls(run)
+        y_fa3, y_sdpa = run_both_impls(run, 'fa3')
         max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "single_token")
         print(f"single_token: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
 
@@ -207,7 +315,7 @@ class TestFA3VsSDPA:
                 causal=True, window_size=(window, 0)  # window=8 < Tk=33
             )
 
-        y_fa3, y_sdpa = run_both_impls(run)
+        y_fa3, y_sdpa = run_both_impls(run, 'fa3')
         max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "single_token_sliding_window")
         print(f"single_token_sliding_window: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
 
@@ -339,23 +447,43 @@ class TestSDPAOnly:
 class TestOverrideMechanism:
     """Test that the override mechanism works correctly."""
 
+    @pytest.mark.skipif(not HAS_FA4, reason="FA4 required")
+    def test_override_fa4(self):
+        """Test that override='fa4' uses FA4."""
+        set_impl('fa4')
+        assert fa_module._active_impl() == 'fa4'
+        set_impl(None)
+
     @pytest.mark.skipif(not HAS_FA3, reason="FA3 required")
     def test_override_fa3(self):
         """Test that override='fa3' uses FA3."""
         set_impl('fa3')
-        assert fa_module._use_fa3() == True
+        assert fa_module._active_impl() == 'fa3'
         set_impl(None)
 
     def test_override_sdpa(self):
         """Test that override='sdpa' uses SDPA."""
         set_impl('sdpa')
-        assert fa_module._use_fa3() == False
+        assert fa_module._active_impl() == 'sdpa'
         set_impl(None)
 
     def test_override_auto(self):
         """Test that override=None uses auto-detection."""
         set_impl(None)
-        assert fa_module._use_fa3() == HAS_FA3
+        if HAS_FA4:
+            assert fa_module._active_impl() == 'fa4'
+        elif HAS_FA3:
+            assert fa_module._active_impl() == 'fa3'
+        else:
+            assert fa_module._active_impl() == 'sdpa'
+
+    def test_use_fa3_backward_compat(self):
+        """Test _use_fa3() still works for backward compatibility."""
+        set_impl('sdpa')
+        assert fa_module._use_fa3() == False
+        set_impl(None)
+        # _use_fa3() returns True only when FA3 is the active impl
+        assert fa_module._use_fa3() == (HAS_FA3 and not HAS_FA4)
 
 
 if __name__ == "__main__":
@@ -365,6 +493,7 @@ if __name__ == "__main__":
         print(f"CUDA device: {torch.cuda.get_device_name()}")
         major, minor = torch.cuda.get_device_capability()
         print(f"Compute capability: {major}.{minor}")
+    print(f"HAS_FA4: {HAS_FA4}")
     print(f"HAS_FA3: {HAS_FA3}")
     print()
 
