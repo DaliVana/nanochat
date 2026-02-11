@@ -11,14 +11,11 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-s
 
 import argparse
 import os
-import shutil
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 # Blackwell (sm_103a): Triton bundles an old ptxas that doesn't support sm_103a.
-# Point it to the system CUDA toolkit's ptxas which does.
-if "TRITON_PTXAS_PATH" not in os.environ:
-    _sys_ptxas = shutil.which("ptxas")
-    if _sys_ptxas:
-        os.environ["TRITON_PTXAS_PATH"] = _sys_ptxas
+# Point it to the CUDA 13.1+ system ptxas which does. Must be set before torch/triton import.
+if "TRITON_PTXAS_PATH" not in os.environ and os.path.isfile("/usr/local/cuda-13.1/bin/ptxas"):
+    os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda-13.1/bin/ptxas"
 import time
 import wandb
 import torch
