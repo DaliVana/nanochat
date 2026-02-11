@@ -140,6 +140,18 @@ def _fa4_window_size(window_size):
     return (None if left < 0 else left, None if right < 0 else right)
 
 
+@torch.compiler.disable
+def _fa4_call(q, k, v, causal, window_size):
+    """Call FA4 outside of torch.compile tracing.
+
+    FA4's CuTe-DSL kernels use their own JIT compilation which is incompatible
+    with torch._dynamo / torch._inductor. Wrapping with @torch.compiler.disable
+    makes Dynamo treat this as an opaque call.
+    """
+    return _fa4_func(q, k, v, causal=causal,
+                     window_size=_fa4_window_size(window_size))
+
+
 # =============================================================================
 # Public API: Same interface as FA3
 # =============================================================================
@@ -158,8 +170,7 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     impl = _active_impl()
 
     if impl == 'fa4':
-        return _fa4_func(q, k, v, causal=causal,
-                         window_size=_fa4_window_size(window_size))
+        return _fa4_call(q, k, v, causal, window_size)
 
     if impl == 'fa3':
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
