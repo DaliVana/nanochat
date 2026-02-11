@@ -140,21 +140,20 @@ def _fa4_window_size(window_size):
     return (None if left < 0 else left, None if right < 0 else right)
 
 
-@torch.compiler.disable
-def _fa4_call(q, k, v, causal, window_size):
-    """Call FA4 outside of torch.compile tracing.
-
-    FA4's CuTe-DSL kernels use their own JIT compilation which is incompatible
-    with torch._dynamo / torch._inductor. Wrapping with @torch.compiler.disable
-    makes Dynamo treat this as an opaque call.
-    """
-    return _fa4_func(q, k, v, causal=causal,
-                     window_size=_fa4_window_size(window_size))
+# =============================================================================
+# Determine if we need to disable torch.compiler for attention functions.
+# On Blackwell (sm_103a etc.), Triton's ptxas doesn't support the arch yet,
+# so Inductor can't compile SDPA into Triton kernels. We disable the compiler
+# for the entire attention dispatch so Dynamo treats it as opaque.
+# On Hopper and older GPUs, torch.compile works fine with both FA3 and SDPA.
+# =============================================================================
+_compiler_disable = torch.compiler.disable if HAS_FA4 else lambda fn: fn
 
 
 # =============================================================================
 # Public API: Same interface as FA3
 # =============================================================================
+@_compiler_disable
 def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     """
     Flash Attention for training (no KV cache).
@@ -170,7 +169,8 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     impl = _active_impl()
 
     if impl == 'fa4':
-        return _fa4_call(q, k, v, causal, window_size)
+        return _fa4_func(q, k, v, causal=causal,
+                         window_size=_fa4_window_size(window_size))
 
     if impl == 'fa3':
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
@@ -184,6 +184,7 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     return y.transpose(1, 2)  # back to (B, T, H, D)
 
 
+@_compiler_disable
 def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=None,
                             causal=False, window_size=(-1, -1)):
     """
