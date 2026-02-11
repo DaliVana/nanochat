@@ -302,7 +302,6 @@ while True:
                     "vocab_size": tokenizer.get_vocab_size(),
                     "n_layer": depth,
                     "n_head": model.config.n_head,
-                    "n_kv_head": model.config.n_kv_head,
                     "n_embd": model.config.n_embd,
                     "window_pattern": model.config.window_pattern,
                 },

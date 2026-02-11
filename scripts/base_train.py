@@ -57,7 +57,7 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
-parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
+parser.add_argument("--head-dim", type=int, default=256, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Mixture of Depths (MoD) - set mod_capacity < 1.0 to enable (e.g. 0.125 = 12.5%%)
@@ -71,7 +71,7 @@ parser.add_argument("--move-offload-cpu", action="store_true", help="Offload MoV
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
-parser.add_argument("--target-param-data-ratio", type=float, default=10.5, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
+parser.add_argument("--target-param-data-ratio", type=float, default=8, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # Optimization
 parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size")
 parser.add_argument("--total-batch-size", type=int, default=524288, help="total batch size in tokens")
@@ -144,13 +144,11 @@ num_layers = args.depth
 base_dim = args.depth * args.aspect_ratio
 model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
 num_heads = model_dim // args.head_dim
-num_kv_heads = num_heads # default is 1:1 GQA (Group Query Attention) ratio (i.e. GQA is disabled)
 head_dim = model_dim // num_heads
 print0(f"num_layers: {num_layers}")
 print0(f"model_dim: {model_dim} (base: {base_dim}, nudge: {model_dim - base_dim:+d})")
 print0(f"num_heads: {num_heads}")
 print0(f"head_dim: {head_dim}")
-print0(f"num_kv_heads: {num_kv_heads}")
 
 # Optimizer / data / training length related hyperparameters
 # figure out the needed gradient accumulation to reach the desired total batch size
@@ -184,7 +182,7 @@ if args.depth != 12:
 # Create a new model with random weights
 model_config_kwargs = dict(
     sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers,
-    n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, window_pattern=args.window_pattern,
+    n_head=num_heads, n_embd=model_dim, window_pattern=args.window_pattern,
     # MoD config (capacity=1.0 means disabled)
     mod_capacity=args.mod_capacity,
     mod_fixed_layers_start=args.mod_protected_start, mod_fixed_layers_end=args.mod_protected_end,

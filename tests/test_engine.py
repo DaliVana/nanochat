@@ -15,7 +15,6 @@ from dataclasses import dataclass
 @dataclass
 class MockConfig:
     """Minimal config for Engine tests."""
-    n_kv_head: int = 4
     n_head: int = 4
     n_embd: int = 64
     n_layer: int = 2

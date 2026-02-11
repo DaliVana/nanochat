@@ -32,8 +32,7 @@ class GPTConfig:
     sequence_len: int = 2048
     vocab_size: int = 32768
     n_layer: int = 12
-    n_head: int = 6 # number of query heads
-    n_kv_head: int = 6 # number of key/value heads (GQA) - ignored when use_mla=True
+    n_head: int = 6 # number of attention heads
     n_embd: int = 768
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (half context)
@@ -45,8 +44,7 @@ class GPTConfig:
     mod_fixed_layers_start: int = 5          # First N layers always full capacity
     mod_fixed_layers_end: int = 1            # Last N layers always full capacity
     # Multi-Head Latent Attention (MLA) parameters
-    use_mla: bool = True           # Enable MLA (False = standard attention)
-    mla_d_c: int = 0                # KV compression dimension (0 = auto-scale: n_embd // 3)
+    mla_d_c: int = 0                # KV compression dimension (0 = auto-scale: n_embd // 4)
     mla_d_c1: int = 0               # Q compression dimension (0 = same as mla_d_c)
     mla_d_rope: int = 0             # Decoupled RoPE dimension (0 = auto-scale: head_dim // 2)
     # Mixture of Value Embeddings (MoVE) - replaces per-layer LaVE with a global shared bank
@@ -65,8 +63,8 @@ def get_mla_dims(config):
     if config.mla_d_c > 0:
         d_c = config.mla_d_c
     else:
-        # Auto-scale: d_c = n_embd // 3 (moderate ~3x compression)
-        d_c = config.n_embd // 3
+        # Auto-scale: d_c = n_embd // 4 (moderate ~4x compression)
+        d_c = config.n_embd // 4
 
     if config.mla_d_c1 > 0:
         d_c1 = config.mla_d_c1
@@ -131,90 +129,6 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], dim=-1)
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
-        super().__init__()
-        self.layer_idx = layer_idx
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
-        self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        assert self.n_embd % self.n_head == 0
-        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        # Value embedding gating
-        self.use_move = config.use_move
-        if config.use_move:
-            self.move_slots = config.move_slots if config.move_slots > 0 else config.n_layer
-            # MoVE: full hidden dim -> n_kv_head * (M+1) gates (one for standard V, M for memory slots)
-            self.ve_gate = nn.Linear(config.n_embd, self.n_kv_head * (self.move_slots + 1), bias=False)
-        else:
-            self.move_slots = 0
-            self.ve_gate_channels = 32
-            self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False)
-
-    def forward(self, x, ve, cos, sin, window_size, kv_cache=None):
-        """
-        Args:
-            x: (B, T, C) input
-            ve: value embeddings or None
-            cos, sin: RoPE tensors, already sliced to correct positions
-            window_size: sliding window tuple
-            kv_cache: KV cache for inference (None for training)
-        """
-        B, T, C = x.size()
-
-        # Project the input to get queries, keys, and values
-        # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-
-        # Value embedding mixing
-        if ve is not None:
-            if self.use_move:
-                # MoVE: multi-slot gating with gated standard V path
-                M = self.move_slots
-                ve = ve.view(B, T, M, self.n_kv_head, self.head_dim)  # (B, T, M, H, D)
-                gates = 2 * torch.sigmoid(self.ve_gate(x))  # (B, T, H*(M+1))
-                gates = gates.view(B, T, self.n_kv_head, M + 1)  # (B, T, H, M+1)
-                v = gates[..., 0:1] * v + torch.einsum('bthm,btmhd->bthd', gates[..., 1:], ve)
-            else:
-                # LaVE: single per-layer value embedding, additive
-                ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-                gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
-                v = v + gate.unsqueeze(-1) * ve
-
-        # Apply Rotary Embeddings
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k)  # QK norm
-
-        # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
-        if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        else:
-            # Inference: use flash_attn_with_kvcache which handles cache management
-            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
-            y = flash_attn.flash_attn_with_kvcache(
-                q, k_cache, v_cache,
-                k=k, v=v,
-                cache_seqlens=kv_cache.cache_seqlens,
-                causal=True,
-                window_size=window_size,
-            )
-            # Advance position after last layer processes
-            if self.layer_idx == kv_cache.n_layers - 1:
-                kv_cache.advance(T)
-
-        # Re-assemble the heads and project back to residual stream
-        y = y.contiguous().view(B, T, -1)
-        return self.c_proj(y)
-
-
-class MLACausalSelfAttention(nn.Module):
     """
     Multi-Head Latent Attention (MLA) from DeepSeek-V2/V3.
 
@@ -355,10 +269,7 @@ class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.layer_idx = layer_idx
-        if config.use_mla:
-            self.attn = MLACausalSelfAttention(config, layer_idx)
-        else:
-            self.attn = CausalSelfAttention(config, layer_idx)
+        self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos, sin, window_size, kv_cache):
@@ -439,12 +350,7 @@ class GPT(nn.Module):
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
         # Value embeddings
         head_dim = config.n_embd // config.n_head
-        if config.use_mla:
-            # MLA: value embeddings have full n_head (no GQA)
-            ve_dim = config.n_head * head_dim
-        else:
-            # Standard: value embeddings use n_kv_head (GQA support)
-            ve_dim = config.n_kv_head * head_dim
+        ve_dim = config.n_head * head_dim
         self.ve_dim = ve_dim
         self.move_offload_cpu = config.use_move and config.move_offload_cpu
         if config.use_move:
@@ -466,13 +372,9 @@ class GPT(nn.Module):
         # In the future we can dynamically grow the cache, for now it's fine.
         self.rotary_seq_len = config.sequence_len * 10 # 10X over-compute should be enough, TODO make nicer?
         head_dim = config.n_embd // config.n_head
-        if config.use_mla:
-            # MLA: RoPE is applied only to the d_rope portion of each head
-            _, _, d_rope = get_mla_dims(config)
-            rope_dim = d_rope
-        else:
-            # Standard: RoPE is applied to full head_dim
-            rope_dim = head_dim
+        # MLA: RoPE is applied only to the d_rope portion of each head
+        _, _, d_rope = get_mla_dims(config)
+        rope_dim = d_rope
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, rope_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
@@ -511,32 +413,22 @@ class GPT(nn.Module):
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
 
-        if self.config.use_mla:
-            # MLA attention initialization
-            d_c, d_c1, _ = get_mla_dims(self.config)
-            s_dc = 3**0.5 * d_c**-0.5
-            q_intermediate = d_c1 if d_c1 > 0 else d_c
-            s_q_int = 3**0.5 * q_intermediate**-0.5
-            for block in self.transformer.h:
-                # Fused down-projection (all from n_embd)
-                torch.nn.init.uniform_(block.attn.w_down.weight, -s, s)
-                # Up-projections
-                torch.nn.init.uniform_(block.attn.w_ukv.weight, -s_dc, s_dc)  # from d_c
-                torch.nn.init.uniform_(block.attn.w_uq.weight, -s_q_int, s_q_int)  # from q_intermediate
-                # Output projection
-                torch.nn.init.zeros_(block.attn.c_proj.weight)
-                # MLP
-                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-                torch.nn.init.zeros_(block.mlp.c_proj.weight)
-        else:
-            # Standard attention initialization
-            for block in self.transformer.h:
-                torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
-                torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-                torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-                torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-                torch.nn.init.zeros_(block.mlp.c_proj.weight)
+        # MLA attention initialization
+        d_c, d_c1, _ = get_mla_dims(self.config)
+        s_dc = 3**0.5 * d_c**-0.5
+        q_intermediate = d_c1 if d_c1 > 0 else d_c
+        s_q_int = 3**0.5 * q_intermediate**-0.5
+        for block in self.transformer.h:
+            # Fused down-projection (all from n_embd)
+            torch.nn.init.uniform_(block.attn.w_down.weight, -s, s)
+            # Up-projections
+            torch.nn.init.uniform_(block.attn.w_ukv.weight, -s_dc, s_dc)  # from d_c
+            torch.nn.init.uniform_(block.attn.w_uq.weight, -s_q_int, s_q_int)  # from q_intermediate
+            # Output projection
+            torch.nn.init.zeros_(block.attn.c_proj.weight)
+            # MLP
+            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)   # 1.0 => typical residual connections at init
@@ -568,11 +460,8 @@ class GPT(nn.Module):
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
-        if self.config.use_mla:
-            _, _, d_rope = get_mla_dims(self.config)
-            rope_dim = d_rope
-        else:
-            rope_dim = head_dim
+        _, _, d_rope = get_mla_dims(self.config)
+        rope_dim = d_rope
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, rope_dim)
         self.cos, self.sin = cos, sin
 

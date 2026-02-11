@@ -195,8 +195,8 @@ class Engine:
 
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
-        # MLA uses full n_head (no GQA), standard attention uses n_kv_head
-        num_heads = m.n_head if m.use_mla else m.n_kv_head
+        # MLA uses full n_head for KV cache
+        num_heads = m.n_head
         kv_model_kwargs = {"num_heads": num_heads, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
         kv_cache_prefill = KVCache(
             batch_size=1,

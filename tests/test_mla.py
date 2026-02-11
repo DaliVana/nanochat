@@ -5,7 +5,7 @@ Run: python -m pytest tests/test_mla.py -v -s
 """
 import torch
 import pytest
-from nanochat.gpt import GPTConfig, GPT, MLACausalSelfAttention, CausalSelfAttention, get_mla_dims
+from nanochat.gpt import GPTConfig, GPT, CausalSelfAttention, get_mla_dims
 
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -17,7 +17,7 @@ class TestMLAConfig:
 
     def test_default_mla_dims(self):
         """Test auto-scaling of MLA dimensions."""
-        config = GPTConfig(n_embd=768, n_head=6, use_mla=True)
+        config = GPTConfig(n_embd=768, n_head=6)
         d_c, d_c1, d_rope = get_mla_dims(config)
 
         # d_c should be n_embd // 3
@@ -30,7 +30,7 @@ class TestMLAConfig:
 
     def test_custom_mla_dims(self):
         """Test custom MLA dimensions."""
-        config = GPTConfig(n_embd=768, use_mla=True, mla_d_c=128, mla_d_c1=96, mla_d_rope=32)
+        config = GPTConfig(n_embd=768, mla_d_c=128, mla_d_c1=96, mla_d_rope=32)
         d_c, d_c1, d_rope = get_mla_dims(config)
 
         assert d_c == 128
@@ -41,7 +41,7 @@ class TestMLAConfig:
         """Test that MLA dimensions scale with model size."""
         for n_embd in [384, 768, 1536, 2048]:
             n_head = n_embd // 128  # keeps head_dim = 128
-            config = GPTConfig(n_embd=n_embd, n_head=n_head, use_mla=True)
+            config = GPTConfig(n_embd=n_embd, n_head=n_head)
             d_c, d_c1, d_rope = get_mla_dims(config)
             assert d_c == n_embd // 3, f"d_c should be {n_embd // 3} for n_embd={n_embd}"
             head_dim = n_embd // n_head
@@ -53,27 +53,30 @@ class TestMLAAttention:
 
     def test_mla_output_shape(self):
         """Test MLA produces correct output shape."""
-        config = GPTConfig(n_embd=384, n_head=6, n_layer=4, use_mla=True)
-        mla = MLACausalSelfAttention(config, layer_idx=0).to(DEVICE)
+        config = GPTConfig(n_embd=384, n_head=6, n_layer=4)
+        mla = CausalSelfAttention(config, layer_idx=0).to(DEVICE)
 
         B, T, C = 2, 32, config.n_embd
         x = torch.randn(B, T, C, device=DEVICE, dtype=DTYPE)
 
         # Create dummy cos/sin for RoPE (d_rope dimensions)
         _, _, d_rope = get_mla_dims(config)
-        cos = torch.randn(1, T, 1, d_rope // 2, device=DEVICE, dtype=DTYPE)
-        sin = torch.randn(1, T, 1, d_rope // 2, device=DEVICE, dtype=DTYPE)
+        cos = torch.randn(B, T, d_rope // 2, device=DEVICE, dtype=DTYPE)
+        sin = torch.randn(B, T, d_rope // 2, device=DEVICE, dtype=DTYPE)
 
-        y = mla(x, ve=None, cos_sin=(cos, sin), window_size=(T, 0), kv_cache=None)
+        # Value embedding has shape (B, T, n_head * head_dim)
+        head_dim = config.n_embd // config.n_head
+        ve = torch.randn(B, T, config.n_head * head_dim, device=DEVICE, dtype=DTYPE)
+
+        y = mla(x, ve=ve, cos=cos, sin=sin, window_size=(T, 0), kv_cache=None)
 
         assert y.shape == (B, T, C), f"Expected shape {(B, T, C)}, got {y.shape}"
         assert not torch.isnan(y).any(), "Output contains NaN"
 
     def test_mla_with_value_embedding(self):
         """Test MLA with value embedding."""
-        config = GPTConfig(n_embd=384, n_head=6, n_layer=4, use_mla=True)
-        # Layer 3 should have VE (alternating, last layer included)
-        mla = MLACausalSelfAttention(config, layer_idx=3).to(DEVICE)
+        config = GPTConfig(n_embd=384, n_head=6, n_layer=4)
+        mla = CausalSelfAttention(config, layer_idx=3).to(DEVICE)
 
         B, T, C = 2, 32, config.n_embd
         x = torch.randn(B, T, C, device=DEVICE, dtype=DTYPE)
@@ -83,27 +86,31 @@ class TestMLAAttention:
         ve = torch.randn(B, T, config.n_head * head_dim, device=DEVICE, dtype=DTYPE)
 
         _, _, d_rope = get_mla_dims(config)
-        cos = torch.randn(1, T, 1, d_rope // 2, device=DEVICE, dtype=DTYPE)
-        sin = torch.randn(1, T, 1, d_rope // 2, device=DEVICE, dtype=DTYPE)
+        cos = torch.randn(B, T, d_rope // 2, device=DEVICE, dtype=DTYPE)
+        sin = torch.randn(B, T, d_rope // 2, device=DEVICE, dtype=DTYPE)
 
-        y = mla(x, ve=ve, cos_sin=(cos, sin), window_size=(T, 0), kv_cache=None)
+        y = mla(x, ve=ve, cos=cos, sin=sin, window_size=(T, 0), kv_cache=None)
 
         assert y.shape == (B, T, C)
         assert not torch.isnan(y).any()
 
     def test_mla_gradients_flow(self):
         """Test gradients flow through MLA."""
-        config = GPTConfig(n_embd=384, n_head=6, n_layer=4, use_mla=True)
-        mla = MLACausalSelfAttention(config, layer_idx=0).to(DEVICE)
+        config = GPTConfig(n_embd=384, n_head=6, n_layer=4)
+        mla = CausalSelfAttention(config, layer_idx=0).to(DEVICE)
 
         B, T, C = 2, 16, config.n_embd
         x = torch.randn(B, T, C, device=DEVICE, dtype=DTYPE, requires_grad=True)
 
         _, _, d_rope = get_mla_dims(config)
-        cos = torch.randn(1, T, 1, d_rope // 2, device=DEVICE, dtype=DTYPE)
-        sin = torch.randn(1, T, 1, d_rope // 2, device=DEVICE, dtype=DTYPE)
+        cos = torch.randn(B, T, d_rope // 2, device=DEVICE, dtype=DTYPE)
+        sin = torch.randn(B, T, d_rope // 2, device=DEVICE, dtype=DTYPE)
 
-        y = mla(x, ve=None, cos_sin=(cos, sin), window_size=(T, 0), kv_cache=None)
+        # Value embedding
+        head_dim = config.n_embd // config.n_head
+        ve = torch.randn(B, T, config.n_head * head_dim, device=DEVICE, dtype=DTYPE)
+
+        y = mla(x, ve=ve, cos=cos, sin=sin, window_size=(T, 0), kv_cache=None)
         loss = y.sum()
         loss.backward()
 
@@ -111,9 +118,9 @@ class TestMLAAttention:
         assert not torch.isnan(x.grad).any(), "NaN in input gradient"
 
         # Check key parameters have gradients
-        assert mla.w_dkv.weight.grad is not None, "No gradient for w_dkv"
-        assert mla.w_uk.weight.grad is not None, "No gradient for w_uk"
-        assert mla.w_uv.weight.grad is not None, "No gradient for w_uv"
+        assert mla.w_down.weight.grad is not None, "No gradient for w_down"
+        assert mla.w_ukv.weight.grad is not None, "No gradient for w_ukv"
+        assert mla.w_uq.weight.grad is not None, "No gradient for w_uq"
 
 
 class TestMLAModel:
@@ -122,31 +129,14 @@ class TestMLAModel:
     def test_mla_model_creation(self):
         """Test GPT model with MLA can be created."""
         config = GPTConfig(
-            n_embd=384, n_head=6, n_layer=4, n_kv_head=6,
+            n_embd=384, n_head=6, n_layer=4,
             vocab_size=1024, sequence_len=128,
-            use_mla=True
         )
 
         with torch.device('meta'):
             model = GPT(config)
 
-        # Verify attention modules are MLA
-        for i, block in enumerate(model.transformer.h):
-            assert isinstance(block.attn, MLACausalSelfAttention), \
-                f"Block {i} should use MLACausalSelfAttention"
-
-    def test_standard_model_creation(self):
-        """Test GPT model without MLA uses standard attention."""
-        config = GPTConfig(
-            n_embd=384, n_head=6, n_layer=4, n_kv_head=6,
-            vocab_size=1024, sequence_len=128,
-            use_mla=False
-        )
-
-        with torch.device('meta'):
-            model = GPT(config)
-
-        # Verify attention modules are standard
+        # Verify attention modules are MLA (CausalSelfAttention is now MLA)
         for i, block in enumerate(model.transformer.h):
             assert isinstance(block.attn, CausalSelfAttention), \
                 f"Block {i} should use CausalSelfAttention"
@@ -155,9 +145,8 @@ class TestMLAModel:
     def test_mla_model_forward(self):
         """Test MLA model forward pass."""
         config = GPTConfig(
-            n_embd=384, n_head=6, n_layer=4, n_kv_head=6,
+            n_embd=384, n_head=6, n_layer=4,
             vocab_size=1024, sequence_len=128,
-            use_mla=True
         )
 
         model = GPT(config).to(DEVICE)
@@ -177,9 +166,8 @@ class TestMLAModel:
     def test_mla_model_backward(self):
         """Test MLA model backward pass."""
         config = GPTConfig(
-            n_embd=384, n_head=6, n_layer=4, n_kv_head=6,
+            n_embd=384, n_head=6, n_layer=4,
             vocab_size=1024, sequence_len=128,
-            use_mla=True
         )
 
         model = GPT(config).to(DEVICE)
@@ -193,31 +181,30 @@ class TestMLAModel:
         loss.backward()
 
         # Check some parameters have gradients
-        assert model.transformer.h[0].attn.w_dkv.weight.grad is not None
+        assert model.transformer.h[0].attn.w_down.weight.grad is not None
         assert model.lm_head.weight.grad is not None
 
 
-class TestMLAVsStandard:
-    """Compare MLA and standard attention properties."""
+class TestMLAKVCompression:
+    """Test MLA's KV compression properties."""
 
-    def test_mla_has_fewer_kv_params_per_token(self):
+    def test_mla_has_smaller_cache(self):
         """Test that MLA compresses KV representation."""
-        config_std = GPTConfig(n_embd=768, n_head=6, n_kv_head=6, n_layer=1, use_mla=False)
-        config_mla = GPTConfig(n_embd=768, n_head=6, n_kv_head=6, n_layer=1, use_mla=True)
+        config = GPTConfig(n_embd=768, n_head=6, n_layer=1)
 
-        # Standard: K and V each have n_kv_head * head_dim dimensions
-        head_dim = config_std.n_embd // config_std.n_head
-        std_kv_dim = 2 * config_std.n_kv_head * head_dim  # K + V
+        # Standard would have: K and V each have n_head * head_dim dimensions
+        head_dim = config.n_embd // config.n_head
+        std_kv_dim = 2 * config.n_head * head_dim  # K + V
 
         # MLA: compressed to d_c + d_rope
-        d_c, _, d_rope = get_mla_dims(config_mla)
+        d_c, _, d_rope = get_mla_dims(config)
         mla_cache_dim = d_c + d_rope  # for inference cache (compressed)
 
         print(f"Standard KV dim per token: {std_kv_dim}")
         print(f"MLA cache dim per token: {mla_cache_dim}")
         print(f"Compression ratio: {std_kv_dim / mla_cache_dim:.2f}x")
 
-        # MLA should use less storage (though we use compatibility mode for inference)
+        # MLA should use less storage
         assert mla_cache_dim < std_kv_dim, "MLA should have smaller cache footprint"
 
 
@@ -226,8 +213,8 @@ class TestMLARoPE:
 
     def test_rope_dimension_split(self):
         """Test that head_dim is correctly split between nope and rope."""
-        config = GPTConfig(n_embd=768, n_head=6, use_mla=True)
-        mla = MLACausalSelfAttention(config, layer_idx=0)
+        config = GPTConfig(n_embd=768, n_head=6)
+        mla = CausalSelfAttention(config, layer_idx=0)
 
         head_dim = config.n_embd // config.n_head  # 128
         _, _, d_rope = get_mla_dims(config)  # auto-scaled
@@ -237,19 +224,23 @@ class TestMLARoPE:
         assert mla.d_nope == d_nope
         assert mla.d_rope + mla.d_nope == head_dim
 
-    def test_rope_applied_only_to_rope_part(self):
-        """Test that RoPE is only applied to the d_rope dimensions."""
-        config = GPTConfig(n_embd=384, n_head=6, use_mla=True)
-        mla = MLACausalSelfAttention(config, layer_idx=0).to(DEVICE)
+    def test_rope_dimensions_in_projections(self):
+        """Test that RoPE-related projections have correct shapes."""
+        config = GPTConfig(n_embd=384, n_head=6)
+        mla = CausalSelfAttention(config, layer_idx=0).to(DEVICE)
 
-        _, _, d_rope = get_mla_dims(config)
-
-        # The w_kr projection outputs d_rope dimensions for the key RoPE part
-        assert mla.w_kr.weight.shape == (d_rope, config.n_embd)
-
-        # The w_uk projection outputs n_head * d_nope (non-positional part)
+        d_c, d_c1, d_rope = get_mla_dims(config)
         d_nope = (config.n_embd // config.n_head) - d_rope
-        assert mla.w_uk.weight.shape == (config.n_head * d_nope, mla.d_c)
+
+        # w_down projects to [d_c, q_intermediate, d_rope]
+        q_intermediate = d_c1 if d_c1 > 0 else d_c
+        expected_w_down_out = d_c + q_intermediate + d_rope
+        assert mla.w_down.weight.shape == (expected_w_down_out, config.n_embd)
+
+        # w_ukv: d_c -> n_head * (d_nope + head_dim)
+        head_dim = config.n_embd // config.n_head
+        expected_ukv_out = config.n_head * (d_nope + head_dim)
+        assert mla.w_ukv.weight.shape == (expected_ukv_out, d_c)
 
 
 if __name__ == "__main__":
