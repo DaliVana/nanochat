@@ -176,8 +176,12 @@ class CausalSelfAttention(nn.Module):
         self.use_move = config.use_move
         if config.use_move:
             self.move_slots = config.move_slots if config.move_slots > 0 else config.n_layer
-            # MoVE: full hidden dim -> n_head * (M+1) gates
+            # MoVE in MLA: gate operates on c_kv partitioned into n_head chunks
+            # W_G: n_embd -> n_head * (M+1) gate logits
             self.ve_gate = nn.Linear(config.n_embd, self.n_head * (self.move_slots + 1), bias=False)
+            # d_c_per_head: dimension of each head's chunk of the compressed latent
+            assert self.d_c % self.n_head == 0, f"d_c ({self.d_c}) must be divisible by n_head ({self.n_head}) for MoVE head-wise partitioning"
+            self.d_c_per_head = self.d_c // self.n_head
         else:
             self.move_slots = 0
             self.ve_gate_channels = 32
@@ -196,40 +200,50 @@ class CausalSelfAttention(nn.Module):
         down = self.w_down(x)  # (B, T, d_c + q_intermediate + d_rope)
         c_kv, c_q, k_rope_raw = down.split([self.d_c, self.q_intermediate, self.d_rope], dim=-1)
 
-        # 2. Up-project KV: c_kv -> [K_nope, V]
+        # 2. MoVE: inject memory into compressed latent c_kv BEFORE up-projection
+        #    Per the paper (Eq. 7): partition c_kv into H chunks and apply per-head gating
+        #    This avoids materializing full-rank V and preserves MLA's efficiency
+        if self.use_move:
+            M = self.move_slots
+            dh = self.d_c_per_head  # d_c // n_head
+            # Partition c_kv into per-head chunks: (B, T, d_c) -> (B, T, H, dh)
+            c_kv_heads = c_kv.view(B, T, self.n_head, dh)
+            # Reshape VE bank: (B, T, M * d_c) -> (B, T, M, H, dh)
+            ve = ve.view(B, T, M, self.n_head, dh)
+            # Compute gates: (B, T, H*(M+1)) -> (B, T, H, M+1)
+            gates = 2 * torch.sigmoid(self.ve_gate(x))
+            gates = gates.view(B, T, self.n_head, M + 1)
+            # Mix: gated standard path + weighted sum of memory slots
+            c_kv_heads = gates[..., 0:1] * c_kv_heads + torch.einsum('bthm,btmhd->bthd', gates[..., 1:], ve)
+            # Reassemble: (B, T, H, dh) -> (B, T, d_c)
+            c_kv = c_kv_heads.view(B, T, self.d_c)
+
+        # 3. Up-project KV: c_kv -> [K_nope, V]
         kv = self.w_ukv(c_kv).view(B, T, self.n_head, self.d_nope + self.head_dim)
         k_nope, v = kv.split([self.d_nope, self.head_dim], dim=-1)
 
-        # 3. Apply RoPE to k_rope (single head, then broadcast)
+        # 4. Apply RoPE to k_rope (single head, then broadcast)
         k_rope = apply_rotary_emb(k_rope_raw.view(B, T, 1, self.d_rope), cos, sin)
 
-        # 4. Value embedding mixing
-        if self.use_move:
-            # MoVE: multi-slot gating with gated standard V path
-            M = self.move_slots
-            ve = ve.view(B, T, M, self.n_head, self.head_dim)  # (B, T, M, H, D)
-            gates = 2 * torch.sigmoid(self.ve_gate(x))  # (B, T, H*(M+1))
-            gates = gates.view(B, T, self.n_head, M + 1)  # (B, T, H, M+1)
-            v = gates[..., 0:1] * v + torch.einsum('bthm,btmhd->bthd', gates[..., 1:], ve)
-        else:
-            # LaVE: single per-layer value embedding, additive
+        # 5. LaVE: value embedding mixing (post up-projection, per-layer)
+        if not self.use_move:
             ve = ve.view(B, T, self.n_head, self.head_dim)
             gate = 2 * torch.sigmoid(self.ve_gate(x.narrow(-1, 0, self.ve_gate_channels)))
             v = v + gate.unsqueeze(-1) * ve
 
-        # 5. Up-project Q: c_q -> Q, then split into nope/rope parts
+        # 6. Up-project Q: c_q -> Q, then split into nope/rope parts
         q = self.w_uq(c_q).view(B, T, self.n_head, self.head_dim)
         q_nope, q_rope = q.split([self.d_nope, self.d_rope], dim=-1)
         q_rope = apply_rotary_emb(q_rope, cos, sin)
 
-        # 6. Assemble final Q and K
+        # 7. Assemble final Q and K
         k = torch.cat([k_nope, k_rope.expand(-1, -1, self.n_head, -1)], dim=-1)
         q = torch.cat([q_nope, q_rope], dim=-1)
 
-        # 7. QK norm
+        # 8. QK norm
         q, k = norm(q), norm(k)
 
-        # 8. Attention
+        # 9. Attention
         if kv_cache is None:
             # Training: causal attention with optional sliding window
             y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
@@ -246,7 +260,7 @@ class CausalSelfAttention(nn.Module):
             if self.layer_idx == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
 
-        # 11. Re-assemble and project
+        # 10. Re-assemble and project
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -350,22 +364,23 @@ class GPT(nn.Module):
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
         # Value embeddings
         head_dim = config.n_embd // config.n_head
-        ve_dim = config.n_head * head_dim
-        self.ve_dim = ve_dim
         self.move_offload_cpu = config.use_move and config.move_offload_cpu
         if config.use_move:
-            # MoVE: single global bank shared across all layers
+            # MoVE: inject into compressed latent space c_kv (dim d_c), per the paper.
+            # This avoids materializing full-rank V and keeps the embedding bank 4x smaller.
+            d_c, _, _ = get_mla_dims(config)
+            ve_dim = d_c
             move_slots = config.move_slots if config.move_slots > 0 else config.n_layer
             if config.move_offload_cpu:
-                # CPU offloaded MoVE: initialized later in init_weights()
-                # We create a placeholder that will be replaced
                 self.value_embeds = None
                 self._ve_offload_params = (padded_vocab_size, move_slots * ve_dim)
             else:
                 self.value_embeds = nn.Embedding(padded_vocab_size, move_slots * ve_dim)
         else:
-            # LaVE: per-layer value embeddings
+            # LaVE: per-layer value embeddings in full head space
+            ve_dim = config.n_head * head_dim
             self.value_embeds = nn.ModuleList([nn.Embedding(padded_vocab_size, ve_dim) for _ in range(config.n_layer)])
+        self.ve_dim = ve_dim
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
