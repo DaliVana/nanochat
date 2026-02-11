@@ -71,6 +71,7 @@ generates a different graph. Numerics are bitwise identical in eager mode.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as nnFunctional
 
 # Avoid division by zero when computing scale from an all-zeros tensor
 EPS = 1e-12
@@ -99,7 +100,7 @@ def _to_fp8(x, fp8_dtype):
     x_scaled = x.float() * scale
     x_clamped = x_scaled.clamp(-fp8_max, fp8_max)
     x_fp8 = x_clamped.to(fp8_dtype)
-    # _scaled_mm expects the *inverse* of our scale (it multiplies by this to
+    # scaled_mm expects the *inverse* of our scale (it multiplies by this to
     # convert FP8 values back to the original range during the matmul)
     inv_scale = scale.reciprocal()
     return x_fp8, inv_scale
@@ -108,7 +109,7 @@ def _to_fp8(x, fp8_dtype):
 def _to_col_major(x):
     """Rearrange a 2D tensor's memory to column-major layout.
 
-    torch._scaled_mm requires its second operand in column-major layout.
+    nnFunctional.scaled_mm requires its second operand in column-major layout.
     The trick: transpose -> contiguous (forces a copy in transposed order)
     -> transpose back. The result has the same logical shape but column-major
     strides, e.g. a [M, N] tensor gets strides (1, M) instead of (N, 1).
@@ -141,7 +142,7 @@ class _Float8Matmul(torch.autograd.Function):
         # input_fp8 is [B, K] contiguous = row-major (good for first arg)
         # weight_fp8 is [N, K] contiguous, so weight_fp8.t() is [K, N] with
         # strides (1, K) = column-major (good for second arg, no copy needed!)
-        output = torch._scaled_mm(
+        output = nnFunctional.scaled_mm(
             input_fp8,
             weight_fp8.t(),
             scale_a=input_inv,
@@ -166,7 +167,7 @@ class _Float8Matmul(torch.autograd.Function):
         # go_fp8 is [B, N] contiguous = row-major, good for first arg
         # w_fp8 is [N, K] contiguous = row-major, need column-major for second arg
         w_col = _to_col_major(w_fp8)
-        grad_input = torch._scaled_mm(
+        grad_input = nnFunctional.scaled_mm(
             go_fp8,
             w_col,
             scale_a=go_inv,
@@ -184,7 +185,7 @@ class _Float8Matmul(torch.autograd.Function):
         # so we must call .contiguous() to physically rearrange the memory.
         go_T = go_fp8_2.t().contiguous()  # [N, B] row-major
         in_col = _to_col_major(in_fp8)    # [B, K] column-major
-        grad_weight = torch._scaled_mm(
+        grad_weight = nnFunctional.scaled_mm(
             go_T,
             in_col,
             scale_a=go_inv_2,
@@ -209,7 +210,7 @@ class Float8Linear(nn.Linear):
         # since we bypass F.linear's built-in autocast handling.
         if torch.is_autocast_enabled():
             input = input.to(torch.get_autocast_gpu_dtype())
-        # _scaled_mm only works on 2D tensors, so flatten batch dimensions
+        # nnFunctional.scaled_mm only works on 2D tensors, so flatten batch dimensions
         orig_shape = input.shape
         input_2d = input.reshape(-1, orig_shape[-1])
         output = _Float8Matmul.apply(input_2d, self.weight)
