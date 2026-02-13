@@ -31,6 +31,7 @@ class GPTConfigMoE:
     moe_num_experts: int = 4  # Number of expert FFNs per layer
     moe_experts_per_tok: int = 2  # Number of active experts per token
     moe_expert_hidden_ratio: float = 1.0  # Expert hidden dim = ratio * (4 * n_embd). Set to 0.25 for param parity with baseline
+    protect_first_layer: bool = False  # If True, first layer uses standard MLP (no expert routing)
 
 
 def norm(x):
@@ -101,6 +102,20 @@ class CausalSelfAttention(nn.Module):
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
+
+
+class MLP(nn.Module):
+    """Standard FFN (used for protected first layer)."""
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = F.relu(x).square()
+        x = self.c_proj(x)
+        return x
 
 
 class Expert(nn.Module):
@@ -216,6 +231,7 @@ class MoELayer(nn.Module):
         permuted_output = permuted_output * sorted_weights_valid.unsqueeze(-1)
 
         # Unpermute: scatter back to original token positions
+        permuted_output = permuted_output.to(x.dtype)
         output = torch.zeros(N, C, device=x.device, dtype=x.dtype)
         output.scatter_add_(0, sorted_token_ids_valid.unsqueeze(-1).expand_as(permuted_output), permuted_output)
         output = output.view(B, T, C)
@@ -227,6 +243,19 @@ class MoELayer(nn.Module):
             }
 
         return output, routing_weights
+
+
+class Block(nn.Module):
+    """Standard block with MLP (used for protected first layer)."""
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.attn = CausalSelfAttention(config, layer_idx)
+        self.mlp = MLP(config)
+
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+        x = x + self.mlp(norm(x))
+        return x, None  # None routing_weights for interface compatibility
 
 
 class BlockMoE(nn.Module):
@@ -263,9 +292,14 @@ class GPTMoE(nn.Module):
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
 
+        def make_block(layer_idx):
+            if config.protect_first_layer and layer_idx == 0:
+                return Block(config, layer_idx)
+            return BlockMoE(config, layer_idx)
+
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "h": nn.ModuleList([BlockMoE(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            "h": nn.ModuleList([make_block(layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
@@ -300,13 +334,17 @@ class GPTMoE(nn.Module):
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
 
-            # Experts (init all identically)
-            for expert in block.moe.experts:
-                torch.nn.init.uniform_(expert.c_fc.weight, -s, s)
-                torch.nn.init.zeros_(expert.c_proj.weight)
-
-            # Router (near-zero init for uniform routing at start)
-            torch.nn.init.normal_(block.moe.router.router.weight, mean=0.0, std=0.01)
+            # MLP or MoE experts
+            if hasattr(block, 'moe'):
+                for expert in block.moe.experts:
+                    torch.nn.init.uniform_(expert.c_fc.weight, -s, s)
+                    torch.nn.init.zeros_(expert.c_proj.weight)
+                # Router (near-zero init for uniform routing at start)
+                torch.nn.init.normal_(block.moe.router.router.weight, mean=0.0, std=0.01)
+            else:
+                # Standard MLP (protected first layer)
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
@@ -369,16 +407,21 @@ class GPTMoE(nn.Module):
         for block in self.transformer.h:
             attn_params += sum(p.numel() for n, p in block.attn.named_parameters() if 've_gate' not in n)
 
-        # Expert params (multiply by active ratio)
-        expert_params_per_layer = sum(p.numel() for p in self.transformer.h[0].moe.experts.parameters())
-        expert_params = expert_params_per_layer * self.config.n_layer
+        # Expert params (multiply by active ratio) + protected layer MLP params
         active_expert_ratio = self.config.moe_experts_per_tok / self.config.moe_num_experts
-        effective_expert_params = expert_params * active_expert_ratio
+        effective_expert_params = 0
+        router_numel = 0
+        for block in self.transformer.h:
+            if hasattr(block, 'moe'):
+                layer_expert_params = sum(p.numel() for p in block.moe.experts.parameters())
+                effective_expert_params += layer_expert_params * active_expert_ratio
+                router_numel += sum(p.numel() for p in block.moe.router.parameters())
+            else:
+                # Protected layer: standard MLP, always fully active
+                effective_expert_params += sum(p.numel() for p in block.mlp.parameters())
 
-        # Router params (small, ignore for FLOP estimate)
         # Embedding params (exclude from matmul FLOPs)
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        router_numel = sum(sum(p.numel() for p in block.moe.router.parameters()) for block in self.transformer.h)
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() + router_numel)
 
@@ -407,8 +450,11 @@ class GPTMoE(nn.Module):
         router_params = 0
         for block in self.transformer.h:
             attn_params += sum(p.numel() for p in block.attn.parameters())
-            expert_params += sum(p.numel() for p in block.moe.experts.parameters())
-            router_params += sum(p.numel() for p in block.moe.router.parameters())
+            if hasattr(block, 'moe'):
+                expert_params += sum(p.numel() for p in block.moe.experts.parameters())
+                router_params += sum(p.numel() for p in block.moe.router.parameters())
+            else:
+                expert_params += sum(p.numel() for p in block.mlp.parameters())
 
         # Combine attention and expert params for consistency with other models
         transformer_matrices = attn_params + expert_params
@@ -440,11 +486,13 @@ class GPTMoE(nn.Module):
             matrix_params.extend([block.attn.c_q.weight, block.attn.c_k.weight, block.attn.c_v.weight, block.attn.c_proj.weight])
             if block.attn.ve_gate is not None:
                 matrix_params.append(block.attn.ve_gate.weight)
-            # Expert matrices (Muon, same as baseline MLP)
-            for expert in block.moe.experts:
-                matrix_params.extend([expert.c_fc.weight, expert.c_proj.weight])
-            # Router
-            router_params.extend(block.moe.router.parameters())
+            # Expert matrices or standard MLP (protected first layer)
+            if hasattr(block, 'moe'):
+                for expert in block.moe.experts:
+                    matrix_params.extend([expert.c_fc.weight, expert.c_proj.weight])
+                router_params.extend(block.moe.router.parameters())
+            else:
+                matrix_params.extend([block.mlp.c_fc.weight, block.mlp.c_proj.weight])
 
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
@@ -512,7 +560,7 @@ class GPTMoE(nn.Module):
 
         # Compute expert statistics (aggregate across layers)
         if self.training:
-            all_expert_utils = [block.moe.expert_stats['mean_utilization'] for block in self.transformer.h if block.moe.expert_stats]
+            all_expert_utils = [block.moe.expert_stats['mean_utilization'] for block in self.transformer.h if hasattr(block, 'moe') and block.moe.expert_stats]
             if all_expert_utils:
                 mean_util = sum(all_expert_utils) / len(all_expert_utils)
                 self.routing_stats = {
@@ -523,11 +571,13 @@ class GPTMoE(nn.Module):
             # Training: compute loss + load balancing loss
             ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
 
-            # Load balancing loss: encourage even expert utilization
+            # Load balancing loss: encourage even expert utilization (skip protected layers)
             balance_loss = 0
-            for routing_weights in routing_weights_list:
+            active_routing = [rw for rw in routing_weights_list if rw is not None]
+            for routing_weights in active_routing:
                 balance_loss += compute_load_balance_loss(routing_weights, num_options=self.config.moe_num_experts, weight=0.01)
-            balance_loss = balance_loss / len(routing_weights_list)
+            if active_routing:
+                balance_loss = balance_loss / len(active_routing)
 
             total_loss = ce_loss + balance_loss
 

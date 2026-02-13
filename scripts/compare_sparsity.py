@@ -233,18 +233,36 @@ def main():
         ("MoD (25%)", "scripts.mod_train", "mod_25", ["--mod-top-k-ratio=0.25"]),
         ("MoD (12.5%)", "scripts.mod_train", "mod_12.5", ["--mod-top-k-ratio=0.125"]),
 
-        # 5-7. MoH with different sparsity levels
+        # 5-7. MoD with protected first layer
+        ("MoD (50%) +P", "scripts.mod_train", "mod_50_pfl", ["--mod-top-k-ratio=0.5", "--protect-first-layer"]),
+        ("MoD (25%) +P", "scripts.mod_train", "mod_25_pfl", ["--mod-top-k-ratio=0.25", "--protect-first-layer"]),
+        ("MoD (12.5%) +P", "scripts.mod_train", "mod_12.5_pfl", ["--mod-top-k-ratio=0.125", "--protect-first-layer"]),
+
+        # 8-10. MoH with different sparsity levels
         ("MoH (50%)", "scripts.moh_train", "moh_50", ["--moh-active-heads-ratio=0.5"]),
         ("MoH (25%)", "scripts.moh_train", "moh_25", ["--moh-active-heads-ratio=0.25"]),
         ("MoH (12.5%)", "scripts.moh_train", "moh_12.5", ["--moh-active-heads-ratio=0.125"]),
 
-        # 8-10. MoE with different expert configurations
+        # 11-13. MoH with protected first layer
+        ("MoH (50%) +P", "scripts.moh_train", "moh_50_pfl", ["--moh-active-heads-ratio=0.5", "--protect-first-layer"]),
+        ("MoH (25%) +P", "scripts.moh_train", "moh_25_pfl", ["--moh-active-heads-ratio=0.25", "--protect-first-layer"]),
+        ("MoH (12.5%) +P", "scripts.moh_train", "moh_12.5_pfl", ["--moh-active-heads-ratio=0.125", "--protect-first-layer"]),
+
+        # 14-16. MoE with different expert configurations
         ("MoE (4x2)", "scripts.moe_train", "moe_4x2",
          ["--moe-num-experts=4", "--moe-experts-per-tok=2"]),
         ("MoE (8x2)", "scripts.moe_train", "moe_8x2",
          ["--moe-num-experts=8", "--moe-experts-per-tok=2", "--moe-expert-hidden-ratio=0.125"]),
         ("MoE (8x1)", "scripts.moe_train", "moe_8x1",
          ["--moe-num-experts=8", "--moe-experts-per-tok=1", "--moe-expert-hidden-ratio=0.125"]),
+
+        # 17-19. MoE with protected first layer
+        ("MoE (4x2) +P", "scripts.moe_train", "moe_4x2_pfl",
+         ["--moe-num-experts=4", "--moe-experts-per-tok=2", "--protect-first-layer"]),
+        ("MoE (8x2) +P", "scripts.moe_train", "moe_8x2_pfl",
+         ["--moe-num-experts=8", "--moe-experts-per-tok=2", "--moe-expert-hidden-ratio=0.125", "--protect-first-layer"]),
+        ("MoE (8x1) +P", "scripts.moe_train", "moe_8x1_pfl",
+         ["--moe-num-experts=8", "--moe-experts-per-tok=1", "--moe-expert-hidden-ratio=0.125", "--protect-first-layer"]),
     ]
 
     # Run all configurations

@@ -29,6 +29,7 @@ class GPTConfigMoH:
     window_pattern: str = "SSSL"
     # MoH-specific parameters
     moh_active_heads_ratio: float = 0.5  # Fraction of heads to activate per layer
+    protect_first_layer: bool = False  # If True, first layer uses all heads (no routing)
 
 
 def norm(x):
@@ -71,6 +72,7 @@ class CausalSelfAttentionMoH(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         self.moh_active_heads_ratio = config.moh_active_heads_ratio
+        self.protected = config.protect_first_layer and layer_idx == 0
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
 
@@ -90,11 +92,14 @@ class CausalSelfAttentionMoH(nn.Module):
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
 
-        # MoH: Compute head routing scores
-        routing_scores = self.head_router(x)  # (B, T, n_head)
-
-        # Select top-k heads per token
-        head_mask = top_k_routing(routing_scores, k=self.moh_active_heads_ratio, return_mask=True)  # (B, T, n_head)
+        # Protected layer: skip routing, use all heads
+        if self.protected:
+            head_mask = None
+        else:
+            # MoH: Compute head routing scores
+            routing_scores = self.head_router(x)  # (B, T, n_head)
+            # Select top-k heads per token
+            head_mask = top_k_routing(routing_scores, k=self.moh_active_heads_ratio, return_mask=True)  # (B, T, n_head)
 
         # Project to Q, K, V for all heads
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
@@ -127,10 +132,11 @@ class CausalSelfAttentionMoH(nn.Module):
             if self.layer_idx == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
 
-        # Apply head mask to zero out non-selected heads
+        # Apply head mask to zero out non-selected heads (skip if protected)
         # This is applied AFTER attention computation (faster than pre-masking)
-        head_mask_expanded = head_mask.unsqueeze(-1)  # (B, T, n_head, 1)
-        y = y * head_mask_expanded
+        if head_mask is not None:
+            head_mask_expanded = head_mask.unsqueeze(-1)  # (B, T, n_head, 1)
+            y = y * head_mask_expanded
 
         # Re-assemble and project
         y = y.contiguous().view(B, T, -1)
@@ -423,9 +429,11 @@ class GPTMoH(nn.Module):
             balance_weight = 0.001
             if balance_weight > 0:
                 balance_loss = 0
-                for head_mask in head_masks:
+                active_masks = [m for m in head_masks if m is not None]
+                for head_mask in active_masks:
                     balance_loss += compute_load_balance_loss(head_mask, num_options=self.config.n_head, weight=balance_weight)
-                balance_loss = balance_loss / len(head_masks)  # Average over layers
+                if active_masks:
+                    balance_loss = balance_loss / len(active_masks)  # Average over routed layers
                 total_loss = ce_loss + balance_loss
             else:
                 balance_loss = torch.tensor(0.0, device=ce_loss.device)

@@ -55,6 +55,7 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 parser.add_argument("--moe-num-experts", type=int, default=4, help="Number of expert FFNs per layer (default: 4)")
 parser.add_argument("--moe-experts-per-tok", type=int, default=2, help="Number of active experts per token (default: 2)")
 parser.add_argument("--moe-expert-hidden-ratio", type=float, default=0.25, help="Expert hidden dim ratio (0.25 = param parity with baseline, 1.0 = full size experts)")
+parser.add_argument("--protect-first-layer", action="store_true", help="First layer uses standard MLP (no expert routing)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -140,6 +141,7 @@ def build_model_meta(depth):
         moe_num_experts=args.moe_num_experts,
         moe_experts_per_tok=args.moe_experts_per_tok,
         moe_expert_hidden_ratio=args.moe_expert_hidden_ratio,
+        protect_first_layer=args.protect_first_layer,
     )
     with torch.device("meta"):
         model_meta = GPTMoE(config)

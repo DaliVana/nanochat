@@ -53,6 +53,7 @@ parser.add_argument("--max-seq-len", type=int, default=2048, help="max context l
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Mixture of Depths (MoD) - layer skipping routing
 parser.add_argument("--mod-top-k-ratio", type=float, default=0.5, help="Fraction of layers to activate per token (default: 0.5 = 50%%)")
+parser.add_argument("--protect-first-layer", action="store_true", help="First layer always executes (no routing)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -136,6 +137,7 @@ def build_model_meta(depth):
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
         mod_top_k_ratio=args.mod_top_k_ratio,
+        protect_first_layer=args.protect_first_layer,
     )
     with torch.device("meta"):
         model_meta = GPTMoD(config)

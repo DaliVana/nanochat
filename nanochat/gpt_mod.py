@@ -29,6 +29,7 @@ class GPTConfigMoD:
     window_pattern: str = "SSSL"
     # MoD-specific parameters
     mod_top_k_ratio: float = 0.5  # Fraction of layers to activate per token
+    protect_first_layer: bool = False  # If True, first layer always executes (no routing)
 
 
 def norm(x):
@@ -357,15 +358,20 @@ class GPTMoD(nn.Module):
             # Apply scaling
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
 
+            # Get value embeddings
+            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+
+            # Protected first layer: always execute, skip routing
+            if i == 0 and self.config.protect_first_layer:
+                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+                continue
+
             # Get layer mask for this layer (convert to bool for torch.where)
             mask_i = layer_mask[:, :, i].bool()  # (B, T)
 
             # Skip layer entirely if no tokens use it (rare but possible)
             if not mask_i.any():
                 continue
-
-            # Get value embeddings
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
 
             # Check if all tokens use this layer (common case - fast path)
             if mask_i.all():
