@@ -140,6 +140,40 @@ def compute_routing_stats(routing_decisions):
     return stats
 
 
+def threshold_routing(scores, threshold=0.5, target_ratio=None, target_weight=0.01):
+    """
+    Threshold-based routing: each option independently decides whether to activate.
+
+    Each option gets a sigmoid probability. During forward pass, hard threshold at `threshold`.
+    Gradients flow through sigmoid via straight-through estimator.
+
+    Args:
+        scores: Routing scores (B, T, N) where N is number of options
+        threshold: Activation threshold (default 0.5)
+        target_ratio: If set, adds a regularization loss to push average activation
+                      toward this ratio. Returns (mask, sparsity_loss) tuple.
+        target_weight: Weight for the sparsity regularization loss
+
+    Returns:
+        If target_ratio is None: binary mask (B, T, N)
+        If target_ratio is set: (binary mask, sparsity_loss) tuple
+    """
+    # Sigmoid gives independent per-option probabilities
+    probs = torch.sigmoid(scores)  # (B, T, N)
+
+    # Hard threshold in forward, sigmoid gradients in backward (straight-through)
+    hard_mask = (probs >= threshold).float()
+    mask = hard_mask + probs - probs.detach()  # STE
+
+    if target_ratio is not None:
+        # Encourage average activation to match target_ratio
+        mean_activation = probs.mean()
+        sparsity_loss = target_weight * (mean_activation - target_ratio) ** 2
+        return mask, sparsity_loss
+
+    return mask
+
+
 class StraightThroughTopK(torch.autograd.Function):
     """
     Top-k selection with straight-through estimator for gradients.

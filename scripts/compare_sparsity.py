@@ -24,9 +24,35 @@ And generate a comparison report at dev/sparsity_comparison.md
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
+
+from nanochat.common import get_base_dir
+
+
+def cleanup_checkpoints(script_name, model_tag):
+    """Remove checkpoint directory for a variant after its run completes."""
+    # Map script name to checkpoint subdirectory prefix
+    ckpt_prefixes = {
+        "scripts.base_train": "base_checkpoints",
+        "scripts.mod_train": "mod_checkpoints",
+        "scripts.moh_train": "moh_checkpoints",
+        "scripts.moe_train": "moe_checkpoints",
+        "scripts.movae_train": "movae_checkpoints",
+    }
+    prefix = ckpt_prefixes.get(script_name)
+    if not prefix:
+        return
+
+    base_dir = get_base_dir()
+    ckpt_dir = os.path.join(base_dir, prefix, model_tag)
+    if os.path.isdir(ckpt_dir):
+        size_mb = sum(f.stat().st_size for f in Path(ckpt_dir).rglob("*") if f.is_file()) / (1024 * 1024)
+        shutil.rmtree(ckpt_dir)
+        print(f"Cleaned up checkpoints: {ckpt_dir} ({size_mb:.1f} MiB freed)")
+
 
 def run_variant(variant_name, script_name, args_dict, run_name, sparsity_args=None):
     """
@@ -46,9 +72,13 @@ def run_variant(variant_name, script_name, args_dict, run_name, sparsity_args=No
     print(f"Training {variant_name}")
     print(f"{'='*80}\n")
 
+    # Use run_name as model-tag so checkpoint dirs are predictable for cleanup
+    model_tag = run_name
+
     # Build command
     cmd = ["python", "-m", script_name]
     cmd.append(f"--run={run_name}")
+    cmd.append(f"--model-tag={model_tag}")
 
     for key, value in args_dict.items():
         if isinstance(value, bool):
@@ -229,14 +259,14 @@ def main():
         ("Baseline", "scripts.base_train", "baseline", None),
 
         # 2-4. MoD with different sparsity levels
-        ("MoD (50%)", "scripts.mod_train", "mod_50", ["--mod-top-k-ratio=0.5"]),
-        ("MoD (25%)", "scripts.mod_train", "mod_25", ["--mod-top-k-ratio=0.25"]),
-        ("MoD (12.5%)", "scripts.mod_train", "mod_12.5", ["--mod-top-k-ratio=0.125"]),
+        ("MoD (50%)", "scripts.mod_train", "mod_50", ["--mod-target-ratio=0.5"]),
+        ("MoD (25%)", "scripts.mod_train", "mod_25", ["--mod-target-ratio=0.25"]),
+        ("MoD (12.5%)", "scripts.mod_train", "mod_12.5", ["--mod-target-ratio=0.125"]),
 
         # 5-7. MoD with protected first layer
-        ("MoD (50%) +P", "scripts.mod_train", "mod_50_pfl", ["--mod-top-k-ratio=0.5", "--protect-first-layer"]),
-        ("MoD (25%) +P", "scripts.mod_train", "mod_25_pfl", ["--mod-top-k-ratio=0.25", "--protect-first-layer"]),
-        ("MoD (12.5%) +P", "scripts.mod_train", "mod_12.5_pfl", ["--mod-top-k-ratio=0.125", "--protect-first-layer"]),
+        ("MoD (50%) +P", "scripts.mod_train", "mod_50_pfl", ["--mod-target-ratio=0.5", "--protect-first-layer"]),
+        ("MoD (25%) +P", "scripts.mod_train", "mod_25_pfl", ["--mod-target-ratio=0.25", "--protect-first-layer"]),
+        ("MoD (12.5%) +P", "scripts.mod_train", "mod_12.5_pfl", ["--mod-target-ratio=0.125", "--protect-first-layer"]),
 
         # 8-10. MoH with different sparsity levels
         ("MoH (50%)", "scripts.moh_train", "moh_50", ["--moh-active-heads-ratio=0.5"]),
@@ -256,13 +286,13 @@ def main():
         ("MoE (8x1)", "scripts.moe_train", "moe_8x1",
          ["--moe-num-experts=8", "--moe-experts-per-tok=1", "--moe-expert-hidden-ratio=0.125"]),
 
-        # 17-19. MoE with protected first layer
-        ("MoE (4x2) +P", "scripts.moe_train", "moe_4x2_pfl",
-         ["--moe-num-experts=4", "--moe-experts-per-tok=2", "--protect-first-layer"]),
-        ("MoE (8x2) +P", "scripts.moe_train", "moe_8x2_pfl",
-         ["--moe-num-experts=8", "--moe-experts-per-tok=2", "--moe-expert-hidden-ratio=0.125", "--protect-first-layer"]),
-        ("MoE (8x1) +P", "scripts.moe_train", "moe_8x1_pfl",
-         ["--moe-num-experts=8", "--moe-experts-per-tok=1", "--moe-expert-hidden-ratio=0.125", "--protect-first-layer"]),
+        # # 17-19. MoVaE with different expert configurations
+        ("MoVaE (4x2)", "scripts.movae_train", "movae_4x2",
+         ["--moe-num-experts=4", "--moe-experts-per-tok=4"]),
+        ("MoVaE (8x2)", "scripts.movae_train", "movae_8x2",
+         ["--moe-num-experts=8", "--moe-experts-per-tok=4", "--moe-expert-hidden-ratio=0.125"]),
+        ("MoVaE (8x1)", "scripts.movae_train", "movae_8x1",
+         ["--moe-num-experts=8", "--moe-experts-per-tok=2", "--moe-expert-hidden-ratio=0.125"]),
     ]
 
     # Run all configurations
@@ -274,6 +304,9 @@ def main():
         metrics = run_variant(variant_name, script_name, common_args, run_name, sparsity_args)
         if metrics:
             results.append(metrics)
+
+        # Clean up checkpoints after each run to avoid disk bloat
+        cleanup_checkpoints(script_name, run_name)
 
     # Generate report
     if results:

@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from nanochat.common import get_dist_info, print0
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 from nanochat.flash_attention import flash_attn
-from nanochat.routing import TopKRouter, top_k_routing, compute_load_balance_loss, compute_routing_stats
+from nanochat.routing import TopKRouter, threshold_routing, compute_load_balance_loss, compute_routing_stats
 
 
 @dataclass
@@ -28,7 +28,8 @@ class GPTConfigMoD:
     n_embd: int = 768
     window_pattern: str = "SSSL"
     # MoD-specific parameters
-    mod_top_k_ratio: float = 0.5  # Fraction of layers to activate per token
+    mod_target_ratio: float = 0.5  # Target fraction of layers to activate per token
+    mod_threshold: float = 0.5  # Sigmoid threshold for layer activation
     protect_first_layer: bool = False  # If True, first layer always executes (no routing)
 
 
@@ -135,7 +136,7 @@ class GPTMoD(nn.Module):
 
     Key additions:
     - layer_router: predicts which layers are important for each token
-    - Executes only top-k layers per token (k = mod_top_k_ratio * n_layer)
+    - Executes only top-k layers per token (k = mod_target_ratio * n_layer)
     - Load balancing loss encourages even layer utilization
 
     Performance optimizations:
@@ -206,7 +207,7 @@ class GPTMoD(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
 
-        # Initialize layer router to near-zero (start with uniform routing)
+        # Initialize layer router to near-zero: sigmoid(0) = 0.5, so ~50% activation at start
         torch.nn.init.normal_(self.layer_router.router.weight, mean=0.0, std=0.01)
 
         head_dim = self.config.n_embd // self.config.n_head
@@ -269,8 +270,8 @@ class GPTMoD(nn.Module):
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
 
-        # Scale by mod_top_k_ratio (only k layers execute per token)
-        active_ratio = self.config.mod_top_k_ratio
+        # Scale by mod_target_ratio (only k layers execute per token)
+        active_ratio = self.config.mod_target_ratio
         num_flops_per_token = 6 * (nparams - nparams_exclude) * active_ratio + attn_flops * active_ratio
 
         return num_flops_per_token
@@ -347,11 +348,14 @@ class GPTMoD(nn.Module):
         x = norm(x)
         x0 = x  # Save initial embedding for x0 residual
 
-        # MoD: Compute layer routing scores
+        # MoD: Compute layer routing scores and threshold-based selection
         routing_scores = self.layer_router(x)  # (B, T, n_layer)
-
-        # Select top-k layers per token
-        layer_mask = top_k_routing(routing_scores, k=self.config.mod_top_k_ratio, return_mask=True)  # (B, T, n_layer)
+        layer_mask, sparsity_loss = threshold_routing(
+            routing_scores,
+            threshold=self.config.mod_threshold,
+            target_ratio=self.config.mod_target_ratio,
+            target_weight=0.1,
+        )  # layer_mask: (B, T, n_layer)
 
         # Execute transformer blocks with token-level skipping
         for i, block in enumerate(self.transformer.h):
@@ -402,14 +406,16 @@ class GPTMoD(nn.Module):
             # Training: compute loss + load balancing loss
             ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
 
-            # Load balancing loss: encourage even layer utilization
+            # Sparsity loss: push average activation toward target ratio
+            # Balance loss: encourage even layer utilization
             balance_loss = compute_load_balance_loss(layer_mask, num_options=self.config.n_layer, weight=0.01)
 
-            total_loss = ce_loss + balance_loss
+            total_loss = ce_loss + sparsity_loss + balance_loss
 
             # Store individual losses for logging (only if scalar)
             if loss_reduction == 'mean':
                 self.routing_stats['ce_loss'] = ce_loss.item()
+                self.routing_stats['sparsity_loss'] = sparsity_loss.item()
                 self.routing_stats['balance_loss'] = balance_loss.item()
 
             return total_loss
