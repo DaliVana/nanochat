@@ -56,7 +56,6 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 parser.add_argument("--moe-num-experts", type=int, default=4, help="Number of MLP expert FFNs per layer (default: 4)")
 parser.add_argument("--moe-experts-per-tok", type=int, default=2, help="Number of active experts per token from combined pool (default: 2)")
 parser.add_argument("--moe-expert-hidden-ratio", type=float, default=0.25, help="Expert hidden dim ratio (0.25 = param parity with baseline, 1.0 = full size experts)")
-parser.add_argument("--protect-first-layer", action="store_true", help="First layer uses standard MLP (no expert routing)")
 # MoVaE-specific - Value Embedding experts
 parser.add_argument("--movae-num-ve-experts", type=int, default=-1, help="Number of shared VE experts (-1 = n_layer // 2)")
 # Training horizon (only one used, in order of precedence)
@@ -142,7 +141,6 @@ def build_model_meta(depth):
         moe_num_experts=args.moe_num_experts,
         moe_experts_per_tok=args.moe_experts_per_tok,
         moe_expert_hidden_ratio=args.moe_expert_hidden_ratio,
-        protect_first_layer=args.protect_first_layer,
         movae_num_ve_experts=args.movae_num_ve_experts,
     )
     with torch.device("meta"):
@@ -461,6 +459,10 @@ while True:
         loss = loss / grad_accum_steps
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader)
+    # Collect MoE stats before bias update (which resets counters)
+    moe_stats = model.get_moe_stats()
+    # Update expert routing bias for load balancing (auxiliary-loss-free, DeepSeekV3)
+    model.update_moe_balancing(coeff=1e-3)
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -473,7 +475,6 @@ while True:
     optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item()
-    routing_stats = model.routing_stats if hasattr(model, 'routing_stats') else {}
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -511,8 +512,8 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
-        if routing_stats:
-            log_data.update({f"routing/{k}": v for k, v in routing_stats.items()})
+        if moe_stats:
+            log_data.update(moe_stats)
         wandb_run.log(log_data)
 
     # state update

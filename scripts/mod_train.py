@@ -54,7 +54,8 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 # Mixture of Depths (MoD) - layer skipping routing
 parser.add_argument("--mod-target-ratio", type=float, default=0.5, help="Target fraction of layers to activate per token (default: 0.5 = 50%%)")
 parser.add_argument("--mod-threshold", type=float, default=0.5, help="Sigmoid threshold for layer activation (default: 0.5)")
-parser.add_argument("--protect-first-layer", action="store_true", help="First layer always executes (no routing)")
+parser.add_argument("--n-protected-start", type=int, default=0, help="Number of layers at the start that always execute (no routing)")
+parser.add_argument("--n-protected-end", type=int, default=0, help="Number of layers at the end that always execute (no routing)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -139,7 +140,8 @@ def build_model_meta(depth):
         window_pattern=args.window_pattern,
         mod_target_ratio=args.mod_target_ratio,
         mod_threshold=args.mod_threshold,
-        protect_first_layer=args.protect_first_layer,
+        n_protected_start=args.n_protected_start,
+        n_protected_end=args.n_protected_end,
     )
     with torch.device("meta"):
         model_meta = GPTMoD(config)
@@ -311,7 +313,7 @@ optimizer = model.setup_optimizer(
     embedding_lr=args.embedding_lr * batch_lr_scale,
     scalar_lr=args.scalar_lr * batch_lr_scale,
     adam_betas=(args.adam_beta1, args.adam_beta2),
-    # Muon hyperparameters
+    # Muon hyperparameters (router weights are included in matrix params)
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
 )
@@ -514,7 +516,7 @@ while True:
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     # Get MoD routing statistics from model
-    routing_stats = model.routing_stats if hasattr(model, 'routing_stats') else {}
+    routing_stats = model.get_mod_stats()
     synchronize()
     t1 = time.time()
     dt = t1 - t0

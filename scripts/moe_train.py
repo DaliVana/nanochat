@@ -24,7 +24,7 @@ from contextlib import nullcontext, contextmanager
 import wandb
 import torch
 
-from nanochat.gpt_moe import GPTMoE, GPTConfigMoE
+from nanochat.gpt_moe import GPT as GPTMoE, GPTConfig as GPTConfigMoE
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -52,10 +52,9 @@ parser.add_argument("--head-dim", type=int, default=128, help="target head dimen
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Mixture of Experts (MoE) - expert FFN routing
-parser.add_argument("--moe-num-experts", type=int, default=4, help="Number of expert FFNs per layer (default: 4)")
-parser.add_argument("--moe-experts-per-tok", type=int, default=2, help="Number of active experts per token (default: 2)")
-parser.add_argument("--moe-expert-hidden-ratio", type=float, default=0.25, help="Expert hidden dim ratio (0.25 = param parity with baseline, 1.0 = full size experts)")
-parser.add_argument("--protect-first-layer", action="store_true", help="First layer uses standard MLP (no expert routing)")
+parser.add_argument("--num-experts", type=int, default=8, help="Number of routed expert MLPs per layer (default: 8)")
+parser.add_argument("--top-k", type=int, default=2, help="Number of active routed experts per token (default: 2)")
+parser.add_argument("--num-shared-experts", type=int, default=1, help="Number of shared (always-active) expert MLPs (default: 1)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -138,10 +137,9 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
-        moe_num_experts=args.moe_num_experts,
-        moe_experts_per_tok=args.moe_experts_per_tok,
-        moe_expert_hidden_ratio=args.moe_expert_hidden_ratio,
-        protect_first_layer=args.protect_first_layer,
+        num_experts=args.num_experts,
+        top_k=args.top_k,
+        num_shared_experts=args.num_shared_experts,
     )
     with torch.device("meta"):
         model_meta = GPTMoE(config)
@@ -245,6 +243,8 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
+# MoE: grouped_mm uses dynamic token counts via cumsum offsets, needs scalar capture
+torch._dynamo.config.capture_scalar_outputs = True
 model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
@@ -265,7 +265,7 @@ print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 def get_scaling_params(m):
     # As for which params to use exactly, transformer matrices + lm_head gives cleanest scaling laws (see dev/LOG.md Jan 27, 2026)
     params_counts = m.num_scaling_params()
-    scaling_params = params_counts['transformer_matrices'] + params_counts['lm_head']
+    scaling_params = params_counts['active_transformer_matrices'] + params_counts['lm_head']
     return scaling_params
 num_scaling_params = get_scaling_params(model)
 target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
@@ -503,6 +503,10 @@ while True:
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+    # Collect MoE stats before bias update (which resets counters)
+    moe_stats = model.get_moe_stats()
+    # Update expert routing bias for load balancing (auxiliary-loss-free, DeepSeekV3)
+    model.update_moe_balancing(coeff=1e-3)
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -515,8 +519,6 @@ while True:
     optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
-    # Get MoE routing statistics from model
-    routing_stats = model.routing_stats if hasattr(model, 'routing_stats') else {}
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -556,8 +558,8 @@ while True:
             "train/epoch": epoch,
         }
         # Add MoE routing statistics
-        if routing_stats:
-            log_data.update({f"routing/{k}": v for k, v in routing_stats.items()})
+        if moe_stats:
+            log_data.update(moe_stats)
         wandb_run.log(log_data)
 
     # state update

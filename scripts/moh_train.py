@@ -53,7 +53,6 @@ parser.add_argument("--max-seq-len", type=int, default=2048, help="max context l
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Mixture of Heads (MoH) - head-selective attention
 parser.add_argument("--moh-active-heads-ratio", type=float, default=0.5, help="Fraction of heads to activate per layer (default: 0.5 = 50%%)")
-parser.add_argument("--protect-first-layer", action="store_true", help="First layer uses all heads (no routing)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -137,7 +136,6 @@ def build_model_meta(depth):
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
         moh_active_heads_ratio=args.moh_active_heads_ratio,
-        protect_first_layer=args.protect_first_layer,
     )
     with torch.device("meta"):
         model_meta = GPTMoH(config)
@@ -309,7 +307,7 @@ optimizer = model.setup_optimizer(
     embedding_lr=args.embedding_lr * batch_lr_scale,
     scalar_lr=args.scalar_lr * batch_lr_scale,
     adam_betas=(args.adam_beta1, args.adam_beta2),
-    # Muon hyperparameters
+    # Muon hyperparameters (router gate weights are included in matrix params)
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
 )
@@ -499,6 +497,10 @@ while True:
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+    # Collect MoH stats before bias update (which resets counters)
+    moh_stats = model.get_moh_stats()
+    # Update head routing bias for load balancing (auxiliary-loss-free, DeepSeekV3)
+    model.update_moh_balancing(coeff=1e-3)
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -511,8 +513,6 @@ while True:
     optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
-    # Get MoH routing statistics from model
-    routing_stats = model.routing_stats if hasattr(model, 'routing_stats') else {}
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -552,8 +552,8 @@ while True:
             "train/epoch": epoch,
         }
         # Add MoH routing statistics
-        if routing_stats:
-            log_data.update({f"routing/{k}": v for k, v in routing_stats.items()})
+        if moh_stats:
+            log_data.update(moh_stats)
         wandb_run.log(log_data)
 
     # state update

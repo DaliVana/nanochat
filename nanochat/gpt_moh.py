@@ -2,7 +2,12 @@
 GPT model with Mixture of Heads (MoH) - Head-selective attention.
 
 Based on nanochat/gpt.py with modifications for dynamic head selection.
-Tokens are routed to use only top-k most relevant attention heads per layer.
+Tokens are routed to use only top-k most relevant attention heads per layer,
+using DeepSeekV3-style sigmoid routing with auxiliary-loss-free bias balancing.
+
+Soft sigmoid gating (rather than binary masking) allows partial head suppression
+with richer gradients — validated by Qwen Gated Attention (NeurIPS 2025 Best Paper)
+and SwitchHead (NeurIPS 2024).
 """
 
 from functools import partial
@@ -15,7 +20,7 @@ import torch.nn.functional as F
 from nanochat.common import get_dist_info, print0
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 from nanochat.flash_attention import flash_attn
-from nanochat.routing import TopKRouter, top_k_routing, compute_load_balance_loss, compute_routing_stats
+from nanochat.routing import SigmoidRouter
 
 
 @dataclass
@@ -29,7 +34,6 @@ class GPTConfigMoH:
     window_pattern: str = "SSSL"
     # MoH-specific parameters
     moh_active_heads_ratio: float = 0.5  # Fraction of heads to activate per layer
-    protect_first_layer: bool = False  # If True, first layer uses all heads (no routing)
 
 
 def norm(x):
@@ -54,15 +58,11 @@ class CausalSelfAttentionMoH(nn.Module):
     """
     Attention with Mixture of Heads: tokens route to a subset of attention heads.
 
-    Key changes from base:
-    - Adds head_router to select which heads to use per token
-    - Uses Flash Attention (or SDPA fallback) for all heads, then masks output
-    - Load balancing loss encourages even head utilization
-
-    Performance notes:
-    - Uses flash_attn for fast computation (with SDPA fallback on Mac/CPU)
-    - Masking applied AFTER attention (yes, computes unused heads, but FA is fast)
-    - Much faster than pre-masking Q,K,V due to optimized kernels
+    Key design:
+    - SigmoidRouter selects top-k heads per token with sigmoid-weighted scores
+    - Soft gating: selected heads are weighted by their sigmoid score (not binary)
+    - Bias-based load balancing (DeepSeekV3-style, no auxiliary loss)
+    - Flash Attention computes all heads, masking applied AFTER (faster than pre-masking)
     """
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -71,8 +71,6 @@ class CausalSelfAttentionMoH(nn.Module):
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
-        self.moh_active_heads_ratio = config.moh_active_heads_ratio
-        self.protected = config.protect_first_layer and layer_idx == 0
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
 
@@ -83,23 +81,20 @@ class CausalSelfAttentionMoH(nn.Module):
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-        # MoH-specific: Head router
-        self.head_router = TopKRouter(self.n_embd, self.n_head)
-
-        # Store head statistics for logging
-        self.head_stats = {}
+        # MoH-specific: Sigmoid router for head selection
+        active_heads = max(1, round(config.moh_active_heads_ratio * config.n_head))
+        self.head_router = SigmoidRouter(self.n_embd, self.n_head, active_heads)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
 
-        # Protected layer: skip routing, use all heads
-        if self.protected:
-            head_mask = None
-        else:
-            # MoH: Compute head routing scores
-            routing_scores = self.head_router(x)  # (B, T, n_head)
-            # Select top-k heads per token
-            head_mask = top_k_routing(routing_scores, k=self.moh_active_heads_ratio, return_mask=True)  # (B, T, n_head)
+        # MoH: Compute sigmoid-weighted head mask
+        x_flat = x.view(-1, C)  # (B*T, C)
+        top_scores, selected_heads, _ = self.head_router(x_flat)
+        # Build weighted mask: scatter sigmoid scores into (B*T, n_head)
+        head_mask = torch.zeros(B * T, self.n_head, device=x.device, dtype=top_scores.dtype)
+        head_mask.scatter_(-1, selected_heads, top_scores)
+        head_mask = head_mask.view(B, T, self.n_head)  # (B, T, n_head)
 
         # Project to Q, K, V for all heads
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
@@ -132,16 +127,14 @@ class CausalSelfAttentionMoH(nn.Module):
             if self.layer_idx == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
 
-        # Apply head mask to zero out non-selected heads (skip if protected)
-        # This is applied AFTER attention computation (faster than pre-masking)
-        if head_mask is not None:
-            head_mask_expanded = head_mask.unsqueeze(-1)  # (B, T, n_head, 1)
-            y = y * head_mask_expanded
+        # Apply sigmoid-weighted head mask
+        y = y * head_mask.unsqueeze(-1)  # (B, T, n_head, 1)
 
         # Re-assemble and project
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
-        return y, head_mask  # Return mask for load balancing
+        return y
+
 
 class MLP(nn.Module):
     """Same as base GPT - no changes for MoH."""
@@ -158,27 +151,26 @@ class MLP(nn.Module):
 
 
 class BlockMoH(nn.Module):
-    """Block with MoH attention that returns head masks."""
+    """Block with MoH attention."""
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttentionMoH(config, layer_idx)
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        attn_out, head_mask = self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + attn_out
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
         x = x + self.mlp(norm(x))
-        return x, head_mask
+        return x
 
 
 class GPTMoH(nn.Module):
     """
     GPT with Mixture of Heads: tokens route to a subset of attention heads.
 
-    Key additions:
-    - head_router in each attention layer: predicts which heads are relevant for each token
-    - Executes all heads but masks outputs (top-k heads contribute, others are zeroed)
-    - Load balancing loss encourages even head utilization across layers
+    Key additions over base GPT:
+    - SigmoidRouter in each attention layer: sigmoid-weighted head selection
+    - Auxiliary-loss-free bias balancing (DeepSeekV3-style)
+    - Pure CE loss in forward (no balance loss contaminating the LM signal)
     """
     def __init__(self, config, pad_vocab_size_to=64):
         super().__init__()
@@ -209,9 +201,6 @@ class GPTMoH(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
-        # Track routing statistics
-        self.routing_stats = {}
-
     @torch.no_grad()
     def init_weights(self):
         """Initialize model weights (same as base GPT + head routers)."""
@@ -227,8 +216,10 @@ class GPTMoH(nn.Module):
             torch.nn.init.zeros_(block.attn.c_proj.weight)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
-            # Initialize head router to near-zero (start with uniform routing)
-            torch.nn.init.normal_(block.attn.head_router.router.weight, mean=0.0, std=0.01)
+            # Head router init
+            torch.nn.init.uniform_(block.attn.head_router.gate.weight, -s, s)
+            block.attn.head_router.expert_bias.zero_()
+            block.attn.head_router.tokens_per_expert_counter.zero_()
 
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
@@ -289,9 +280,8 @@ class GPTMoH(nn.Module):
         # Base FLOPs calculation (similar to base GPT)
         nparams = sum(p.numel() for p in self.parameters())
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        router_numel = sum(sum(p.numel() for p in block.attn.head_router.parameters()) for block in self.transformer.h)
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel() + router_numel)
+                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
 
         # Attention FLOPs (scale by active heads ratio)
@@ -312,44 +302,33 @@ class GPTMoH(nn.Module):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters() if p.requires_grad)
-        router = sum(sum(p.numel() for p in block.attn.head_router.parameters()) for block in self.transformer.h)
+        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
-            'transformer_matrices': transformer_matrices - router,  # Exclude router from matrices
-            'router': router,
+            'transformer_matrices': transformer_matrices,
             'scalars': scalars,
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5, router_lr=0.001):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
-        # Group parameters
-        # Collect all non-router params from transformer blocks
-        matrix_params = []
-        router_params = []
-        for block in self.transformer.h:
-            # Attention matrices (excluding router)
-            matrix_params.extend([block.attn.c_q.weight, block.attn.c_k.weight, block.attn.c_v.weight, block.attn.c_proj.weight])
-            if block.attn.ve_gate is not None:
-                matrix_params.append(block.attn.ve_gate.weight)
-            # MLP matrices
-            matrix_params.extend([block.mlp.c_fc.weight, block.mlp.c_proj.weight])
-            # Head router
-            router_params.extend(block.attn.head_router.parameters())
-
+        # Separate out all parameters into groups
+        matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
 
+        # Scale the LR for the AdamW parameters by ∝1/√dmodel
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
 
@@ -359,10 +338,8 @@ class GPTMoH(nn.Module):
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=router_params, lr=router_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),  # MoH routers
         ]
-
-        # Muon groups
+        # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(
@@ -376,6 +353,31 @@ class GPTMoH(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
+    def update_moh_balancing(self, coeff=1e-3):
+        """Update head routing bias for load balancing. Call before optimizer.step()."""
+        for block in self.transformer.h:
+            block.attn.head_router.update_expert_bias(coeff)
+
+    def get_moh_stats(self):
+        """Collect MoH routing statistics for logging. Call BEFORE update_moh_balancing (which resets counters)."""
+        all_counts = []
+        all_biases = []
+        for block in self.transformer.h:
+            router = block.attn.head_router
+            all_counts.append(router.tokens_per_expert_counter)
+            all_biases.append(router.expert_bias)
+        counts = torch.stack(all_counts).float()    # (n_layer, n_head)
+        biases = torch.stack(all_biases).float()    # (n_layer, n_head)
+        # Load imbalance: coefficient of variation (std/mean) per layer, averaged
+        counts_mean = counts.mean(dim=-1).clamp(min=1)
+        counts_std = counts.std(dim=-1)
+        load_imbalance = (counts_std / counts_mean).mean().item()
+        return {
+            "moh/load_imbalance": load_imbalance,
+            "moh/head_bias_std": biases.std().item(),
+            "moh/head_bias_max": biases.abs().max().item(),
+        }
+
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
 
@@ -384,67 +386,26 @@ class GPTMoH(nn.Module):
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
 
-        # Embed tokens
+        # Forward the trunk of the Transformer
         x = self.transformer.wte(idx)
         x = norm(x)
         x0 = x
-
-        # Collect head masks for load balancing
-        head_masks = []
-
-        # Execute transformer blocks
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x, head_mask = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
-            head_masks.append(head_mask)
-
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
 
-        # LM head
+        # Forward the lm_head
         softcap = 15
         logits = self.lm_head(x)
         logits = logits[..., :self.config.vocab_size]
         logits = logits.float()
         logits = softcap * torch.tanh(logits / softcap)
 
-        # Compute routing statistics (aggregate across layers) - disabled for speed
-        # if self.training and head_masks:
-        #     # Stack all head masks and compute aggregate stats
-        #     all_head_masks = torch.stack(head_masks, dim=0)  # (n_layer, B, T, n_head)
-        #     avg_head_mask = all_head_masks.mean(dim=[0, 1, 2])  # Average over layers, batch, time
-        #     self.routing_stats = {
-        #         'mean_head_usage': avg_head_mask.mean().item(),
-        #         'std_head_usage': avg_head_mask.std().item(),
-        #         'min_head_usage': avg_head_mask.min().item(),
-        #         'max_head_usage': avg_head_mask.max().item(),
-        #     }
-
         if targets is not None:
-            # Training: compute loss + load balancing loss
-            ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-
-            # Load balancing loss: encourage even head utilization across all layers
-            # Reduced weight from 0.01 to 0.001 for speed (or set to 0.0 to disable)
-            balance_weight = 0.001
-            if balance_weight > 0:
-                balance_loss = 0
-                active_masks = [m for m in head_masks if m is not None]
-                for head_mask in active_masks:
-                    balance_loss += compute_load_balance_loss(head_mask, num_options=self.config.n_head, weight=balance_weight)
-                if active_masks:
-                    balance_loss = balance_loss / len(active_masks)  # Average over routed layers
-                total_loss = ce_loss + balance_loss
-            else:
-                balance_loss = torch.tensor(0.0, device=ce_loss.device)
-                total_loss = ce_loss
-
-            # Store individual losses for logging (only if scalar)
-            if loss_reduction == 'mean':
-                self.routing_stats['ce_loss'] = ce_loss.item()
-                self.routing_stats['balance_loss'] = balance_loss.item() if isinstance(balance_loss, torch.Tensor) else 0.0
-
-            return total_loss
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            return loss
         else:
             return logits
 

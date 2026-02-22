@@ -2,14 +2,76 @@
 Routing utilities for sparse model variants (MoD, MoH, MoE).
 
 Provides:
-- TopKRouter: Learned routing with top-k selection
+- TopKRouter: Learned routing with top-k selection (used by MoH, MoD)
+- SigmoidRouter: Sigmoid-gated top-K router with aux-loss-free bias balancing (used by MoE, MoVaE)
 - Load balancing losses for even distribution
 - Routing statistics for monitoring
 """
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+class SigmoidRouter(nn.Module):
+    """Sigmoid-gated top-K router with auxiliary-loss-free load balancing (DeepSeekV3).
+
+    Each token independently picks K experts via sigmoid scoring. Expert selection
+    is biased to encourage balanced load, but the bias does NOT affect gating weights
+    (only selection), so the training loss remains pure language modeling.
+
+    Args:
+        dim: Input feature dimension
+        num_experts: Total number of routable experts
+        top_k: Number of experts selected per token
+    """
+
+    def __init__(self, dim, num_experts, top_k):
+        super().__init__()
+        self.gate = nn.Linear(dim, num_experts, bias=False)
+        self.num_experts = num_experts
+        self.top_k = top_k
+        # Auxiliary-loss-free load balancing (DeepSeekV3)
+        self.register_buffer('expert_bias', torch.zeros(num_experts))
+        self.register_buffer('tokens_per_expert_counter', torch.zeros(num_experts))
+
+    def forward(self, x):
+        """
+        Args:
+            x: (T, dim) flattened token representations
+        Returns:
+            top_scores:             (T, top_k)    routing weights for selected experts
+            selected_experts:       (T, top_k)    which experts each token chose
+            num_tokens_per_expert:  (num_experts,) how many tokens each expert received
+        """
+        scores = self.gate(x)                       # (T, num_experts)
+        scores = torch.sigmoid(scores.float())      # values in (0, 1)
+        # Bias affects expert SELECTION but not gating weights (DeepSeekV3)
+        biased_scores = scores + self.expert_bias
+        _, selected_experts = torch.topk(biased_scores, k=self.top_k, dim=-1, sorted=False)
+        top_scores = scores.gather(dim=-1, index=selected_experts)
+        num_tokens_per_expert = torch.histc(
+            selected_experts.float().view(-1),
+            bins=self.num_experts, min=0, max=self.num_experts,
+        )
+        # Accumulate token counts for load balancing updates
+        self.tokens_per_expert_counter += num_tokens_per_expert
+        return top_scores, selected_experts, num_tokens_per_expert
+
+    def update_expert_bias(self, coeff=1e-3):
+        """Auxiliary-loss-free bias update (DeepSeekV3). Call before optimizer.step()."""
+        counts = self.tokens_per_expert_counter
+        # Sync token counts across GPUs if distributed
+        if dist.is_initialized():
+            dist.all_reduce(counts)
+        if counts.sum() == 0:
+            return
+        mean_count = counts.mean()
+        # Nudge underloaded experts up, overloaded experts down
+        self.expert_bias += coeff * torch.sign(mean_count - counts)
+        self.expert_bias -= self.expert_bias.mean()  # center to prevent drift
+        self.tokens_per_expert_counter.zero_()
 
 
 class TopKRouter(nn.Module):

@@ -3,6 +3,7 @@ GPT model with Mixture of Depth (MoD) - Layer-skipping routing.
 
 Based on nanochat/gpt.py with modifications for dynamic layer execution.
 Tokens are routed to execute only top-k most important layers, skipping others.
+Uses threshold-based sigmoid routing with sparsity and balance losses.
 """
 
 from functools import partial
@@ -30,7 +31,8 @@ class GPTConfigMoD:
     # MoD-specific parameters
     mod_target_ratio: float = 0.5  # Target fraction of layers to activate per token
     mod_threshold: float = 0.5  # Sigmoid threshold for layer activation
-    protect_first_layer: bool = False  # If True, first layer always executes (no routing)
+    n_protected_start: int = 0  # Number of layers at the start that always execute (no routing)
+    n_protected_end: int = 0  # Number of layers at the end that always execute (no routing)
 
 
 def norm(x):
@@ -141,15 +143,12 @@ class GPTMoD(nn.Module):
 
     Performance optimizations:
     - Token-level skipping: Uses torch.where to conditionally apply layer outputs
-    - torch.compile: Optional compilation for ~1.2-1.4x speedup (set compile_model=True)
     - Fast path: When all tokens use a layer, skips masking overhead
     """
-    def __init__(self, config, pad_vocab_size_to=64, compile_model=True):
+    def __init__(self, config, pad_vocab_size_to=64):
         super().__init__()
         self.config = config
         self.window_sizes = self._compute_window_sizes(config)
-        self.compile_model = compile_model
-        self._compiled_forward = None  # Lazy compilation
 
         # Pad vocab for efficiency
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
@@ -285,6 +284,7 @@ class GPTMoD(nn.Module):
         router = sum(p.numel() for p in self.layer_router.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + router + scalars
+        assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
             'value_embeds': value_embeds,
@@ -295,19 +295,20 @@ class GPTMoD(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5, router_lr=0.001):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
-        # Group parameters
-        matrix_params = list(self.transformer.h.parameters())
+        # Separate out all parameters into groups
+        matrix_params = list(self.transformer.h.parameters()) + list(self.layer_router.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        router_params = list(self.layer_router.parameters())  # MoD-specific
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
 
+        # Scale the LR for the AdamW parameters by ∝1/√dmodel
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
 
@@ -317,7 +318,6 @@ class GPTMoD(nn.Module):
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=router_params, lr=router_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),  # MoD router
         ]
 
         # Muon groups
@@ -334,12 +334,17 @@ class GPTMoD(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def _forward_impl(self, idx, targets, kv_cache, loss_reduction):
-        """Core forward implementation (can be compiled)."""
+    def get_mod_stats(self):
+        """Collect routing statistics for logging."""
+        return self.routing_stats
+
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
 
         # Rotary embeddings
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+        assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
+        assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
 
@@ -365,8 +370,8 @@ class GPTMoD(nn.Module):
             # Get value embeddings
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
 
-            # Protected first layer: always execute, skip routing
-            if i == 0 and self.config.protect_first_layer:
+            # Protected layers at start/end: always execute, skip routing
+            if i < self.config.n_protected_start or i >= self.config.n_layer - self.config.n_protected_end:
                 x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
                 continue
 
@@ -421,28 +426,6 @@ class GPTMoD(nn.Module):
             return total_loss
         else:
             return logits
-
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
-        """
-        Forward pass with optional torch.compile acceleration.
-
-        On first call with compile_model=True, compiles the forward implementation
-        for faster subsequent calls.
-        """
-        # Use compiled version if enabled and available
-        if self.compile_model and self.training and kv_cache is None:
-            # Only compile during training without kv_cache (generation uses cache)
-            if self._compiled_forward is None:
-                print0("Compiling forward pass with torch.compile (this may take a minute)...")
-                self._compiled_forward = torch.compile(
-                    self._forward_impl,
-                    mode='reduce-overhead',  # Best for training loops
-                    fullgraph=False,  # Allow graph breaks for flexibility
-                )
-            return self._compiled_forward(idx, targets, kv_cache, loss_reduction)
-        else:
-            # Use uncompiled version for generation or if compilation disabled
-            return self._forward_impl(idx, targets, kv_cache, loss_reduction)
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):

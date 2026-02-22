@@ -258,41 +258,43 @@ def main():
         # 1. Baseline
         ("Baseline", "scripts.base_train", "baseline", None),
 
-        # 2-4. MoD with different sparsity levels
-        ("MoD (50%)", "scripts.mod_train", "mod_50", ["--mod-target-ratio=0.5"]),
-        ("MoD (25%)", "scripts.mod_train", "mod_25", ["--mod-target-ratio=0.25"]),
-        ("MoD (12.5%)", "scripts.mod_train", "mod_12.5", ["--mod-target-ratio=0.125"]),
-
-        # 5-7. MoD with protected first layer
-        ("MoD (50%) +P", "scripts.mod_train", "mod_50_pfl", ["--mod-target-ratio=0.5", "--protect-first-layer"]),
-        ("MoD (25%) +P", "scripts.mod_train", "mod_25_pfl", ["--mod-target-ratio=0.25", "--protect-first-layer"]),
-        ("MoD (12.5%) +P", "scripts.mod_train", "mod_12.5_pfl", ["--mod-target-ratio=0.125", "--protect-first-layer"]),
-
-        # 8-10. MoH with different sparsity levels
-        ("MoH (50%)", "scripts.moh_train", "moh_50", ["--moh-active-heads-ratio=0.5"]),
-        ("MoH (25%)", "scripts.moh_train", "moh_25", ["--moh-active-heads-ratio=0.25"]),
-        ("MoH (12.5%)", "scripts.moh_train", "moh_12.5", ["--moh-active-heads-ratio=0.125"]),
-
-        # 11-13. MoH with protected first layer
-        ("MoH (50%) +P", "scripts.moh_train", "moh_50_pfl", ["--moh-active-heads-ratio=0.5", "--protect-first-layer"]),
-        ("MoH (25%) +P", "scripts.moh_train", "moh_25_pfl", ["--moh-active-heads-ratio=0.25", "--protect-first-layer"]),
-        ("MoH (12.5%) +P", "scripts.moh_train", "moh_12.5_pfl", ["--moh-active-heads-ratio=0.125", "--protect-first-layer"]),
+        # # 11-13. MoH with different sparsity levels
+        # ("MoH (50%)", "scripts.moh_train", "moh_50", ["--moh-active-heads-ratio=0.5"]),
+        # ("MoH (25%)", "scripts.moh_train", "moh_25", ["--moh-active-heads-ratio=0.25"]),
+        # ("MoH (12.5%)", "scripts.moh_train", "moh_12.5", ["--moh-active-heads-ratio=0.125"]),
 
         # 14-16. MoE with different expert configurations
         ("MoE (4x2)", "scripts.moe_train", "moe_4x2",
-         ["--moe-num-experts=4", "--moe-experts-per-tok=2"]),
+         ["--num-experts=4", "--top-k=2", "--num-shared-experts=1"]),
         ("MoE (8x2)", "scripts.moe_train", "moe_8x2",
-         ["--moe-num-experts=8", "--moe-experts-per-tok=2", "--moe-expert-hidden-ratio=0.125"]),
+         ["--num-experts=8", "--top-k=2", "--num-shared-experts=1"]),
         ("MoE (8x1)", "scripts.moe_train", "moe_8x1",
-         ["--moe-num-experts=8", "--moe-experts-per-tok=1", "--moe-expert-hidden-ratio=0.125"]),
+         ["--num-experts=8", "--top-k=1", "--num-shared-experts=0"]),
 
-        # # 17-19. MoVaE with different expert configurations
-        ("MoVaE (4x2)", "scripts.movae_train", "movae_4x2",
-         ["--moe-num-experts=4", "--moe-experts-per-tok=4"]),
-        ("MoVaE (8x2)", "scripts.movae_train", "movae_8x2",
-         ["--moe-num-experts=8", "--moe-experts-per-tok=4", "--moe-expert-hidden-ratio=0.125"]),
-        ("MoVaE (8x1)", "scripts.movae_train", "movae_8x1",
-         ["--moe-num-experts=8", "--moe-experts-per-tok=2", "--moe-expert-hidden-ratio=0.125"]),
+        # # # 17-19. MoVaE with different expert configurations
+        # ("MoVaE (4x2)", "scripts.movae_train", "movae_4x2",
+        #  ["--moe-num-experts=4", "--moe-experts-per-tok=4"]),
+        # ("MoVaE (8x2)", "scripts.movae_train", "movae_8x2",
+        #  ["--moe-num-experts=8", "--moe-experts-per-tok=4", "--moe-expert-hidden-ratio=0.125"]),
+        # ("MoVaE (8x1)", "scripts.movae_train", "movae_8x1",
+        #  ["--moe-num-experts=8", "--moe-experts-per-tok=2", "--moe-expert-hidden-ratio=0.125"]),
+
+        # # 8-10. MoD with protected layers (3 start + 1 end)
+        # ("MoD (50%) 3/1 ", "scripts.mod_train", "mod_50_3_1", ["--mod-target-ratio=0.5", "--n-protected-start=3", "--n-protected-end=1"]),
+        # ("MoD (25%) 3/1 ", "scripts.mod_train", "mod_25_3_1", ["--mod-target-ratio=0.25", "--n-protected-start=3", "--n-protected-end=1"]),
+        # ("MoD (12.5%) 3/1 ", "scripts.mod_train", "mod_12.5_3_1", ["--mod-target-ratio=0.125", "--n-protected-start=3", "--n-protected-end=1"]),
+
+        # # 5-7. MoD with protected layers (1 start)
+        # ("MoD (50%) 1/0 ", "scripts.mod_train", "mod_50_1_0", ["--mod-target-ratio=0.5", "--n-protected-start=1", "--n-protected-end=0"]),
+        # ("MoD (25%) 1/0 ", "scripts.mod_train", "mod_25_1_0", ["--mod-target-ratio=0.25", "--n-protected-start=1", "--n-protected-end=0"]),
+        # ("MoD (12.5%) 1/0 ", "scripts.mod_train", "mod_12.5_1_0", ["--mod-target-ratio=0.125", "--n-protected-start=1", "--n-protected-end=0"]),
+
+        # # 2-4. MoD with different sparsity levels
+        # ("MoD (50%) 0/0", "scripts.mod_train", "mod_50_0_0", ["--mod-target-ratio=0.5", "--n-protected-start=0", "--n-protected-end=0"]),
+        # ("MoD (25%) 0/0", "scripts.mod_train", "mod_25_0_0", ["--mod-target-ratio=0.25", "--n-protected-start=0", "--n-protected-end=0"]),
+        # ("MoD (12.5%) 0/0", "scripts.mod_train", "mod_12.5_0_0", ["--mod-target-ratio=0.125", "--n-protected-start=0", "--n-protected-end=0"]),
+
+
     ]
 
     # Run all configurations
