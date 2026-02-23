@@ -99,7 +99,7 @@ def test_ssd_backward_correctness():
 
 def test_ssd_backward_end_to_end():
     """Test that a full forward+backward through _SSDTritonFn works without errors."""
-    from nanochat.mamba2 import _SSDTritonFn
+    from nanochat.mamba2 import _ssd_fwd_op
 
     device = "cuda"
     dtype = torch.bfloat16
@@ -113,9 +113,7 @@ def test_ssd_backward_end_to_end():
     B = (torch.randn(batch, seqlen, ngroups, dstate, device=device, dtype=dtype) * 0.1).requires_grad_(True)
     C = (torch.randn(batch, seqlen, ngroups, dstate, device=device, dtype=dtype) * 0.1).requires_grad_(True)
     dt = (torch.rand(batch, seqlen, nheads, device=device, dtype=dtype) * 0.5 + 0.1).requires_grad_(True)
-    causal_mask = torch.tril(torch.ones(chunk_size, chunk_size, device=device, dtype=dtype))
-
-    y = _SSDTritonFn.apply(x, A, B, C, dt, causal_mask, ngroups, nheads, scale, chunk_size)
+    y = _ssd_fwd_op(x, A, B, C, dt, chunk_size, scale)
     loss = y.sum()
     loss.backward()
 
@@ -124,7 +122,7 @@ def test_ssd_backward_end_to_end():
         assert not param.grad.isnan().any(), f"NaN in gradient for {name}"
         assert not param.grad.isinf().any(), f"Inf in gradient for {name}"
 
-    print("\nEnd-to-end _SSDTritonFn forward+backward: PASS")
+    print("\nEnd-to-end _ssd_fwd_op forward+backward: PASS")
 
 
 if __name__ == "__main__":

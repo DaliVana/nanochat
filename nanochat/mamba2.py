@@ -111,27 +111,34 @@ def _ssd_chunked_pytorch(x, A, B, C, dt, causal_mask, ngroups, scale, chunk_size
     return y.contiguous().view(B_batch, T, n_heads, head_dim)
 
 
-@torch._dynamo.allow_in_graph
-class _SSDTritonFn(torch.autograd.Function):
-    """Triton forward (L never materialized) + Triton backward (L tile-by-tile)."""
+# ---- Custom op for torch.compile compatibility ----
+# torch.library.custom_op properly handles FakeTensors (no .data_ptr() calls during tracing)
 
-    @staticmethod
-    def forward(ctx, x, A, B, C, dt, causal_mask, ngroups, n_heads, scale, chunk_size):
-        ctx.save_for_backward(x, A, B, C, dt, causal_mask)
-        ctx.ngroups = ngroups
-        ctx.scale = scale
-        ctx.chunk_size = chunk_size
-        with torch.no_grad():
-            return ssd_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, scale)
+@torch.library.custom_op("nanochat::ssd_fwd", mutates_args=())
+def _ssd_fwd_op(x: torch.Tensor, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
+                dt: torch.Tensor, chunk_size: int, scale: float) -> torch.Tensor:
+    return ssd_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, scale)
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        x, A, B, C, dt, causal_mask = ctx.saved_tensors
-        dx, dA, dB, dC, ddt = ssd_chunk_scan_combined_bwd(
-            grad_output, x, dt, A, B, C, ctx.chunk_size, ctx.scale
-        )
-        # Grads for: x, A, B, C, dt, causal_mask, ngroups, n_heads, scale, chunk_size
-        return dx, dA, dB, dC, ddt, None, None, None, None, None
+@_ssd_fwd_op.register_fake
+def _ssd_fwd_fake(x, A, B, C, dt, chunk_size, scale):
+    return x.new_empty(x.shape)
+
+def _ssd_bwd(ctx, grad_output):
+    x, A, B, C, dt = ctx.saved_tensors
+    chunk_size = ctx.chunk_size
+    scale = ctx.scale
+    dx, dA, dB, dC, ddt = ssd_chunk_scan_combined_bwd(
+        grad_output, x, dt, A, B, C, chunk_size, scale
+    )
+    return dx, dA, dB, dC, ddt, None, None
+
+def _ssd_setup_context(ctx, inputs, output):
+    x, A, B, C, dt, chunk_size, scale = inputs
+    ctx.save_for_backward(x, A, B, C, dt)
+    ctx.chunk_size = chunk_size
+    ctx.scale = scale
+
+_ssd_fwd_op.register_autograd(_ssd_bwd, setup_context=_ssd_setup_context)
 
 
 class Mamba2Layer(nn.Module):
@@ -417,8 +424,7 @@ class Mamba2Layer(nn.Module):
             C = F.pad(C, (0, 0, 0, 0, 0, pad_len))
             dt = F.pad(dt, (0, 0, 0, pad_len))
 
-        y = _SSDTritonFn.apply(x, A, B, C, dt, self._causal_mask, self.ngroups,
-                                self.n_heads, self._ssd_scale, chunk_size)
+        y = _ssd_fwd_op(x, A, B, C, dt, chunk_size, self._ssd_scale)
 
         if pad_len > 0:
             y = y[:, :T, :, :]
