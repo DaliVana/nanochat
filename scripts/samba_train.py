@@ -244,11 +244,11 @@ def disable_fp8(model):
 
 orig_model = model
 torch._dynamo.config.capture_scalar_outputs = True
-# Compile each block as a whole unit. _SSDTritonFn is marked @allow_in_graph so
-# torch.compile treats SSD as an opaque node and fuses surrounding ops (conv1d,
-# silu, rms_norm, gating). dynamic=False because shapes never change during training.
+# Compile each block as a whole unit. SSD forward/backward are custom ops so
+# torch.compile treats them as opaque nodes and fuses surrounding ops (conv1d,
+# silu, rms_norm, gating). dynamic=True needed because generation uses varying seq_len.
 for i, block in enumerate(orig_model.transformer.h):
-    orig_model.transformer.h[i] = torch.compile(block, dynamic=False)
+    orig_model.transformer.h[i] = torch.compile(block, dynamic=True)
 model = orig_model
 
 # -----------------------------------------------------------------------------
