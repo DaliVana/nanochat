@@ -244,11 +244,14 @@ def disable_fp8(model):
 
 orig_model = model
 torch._dynamo.config.capture_scalar_outputs = True
+# Save uncompiled blocks for generation (where seq_len varies per step).
+_raw_blocks = list(orig_model.transformer.h)
 # Compile each block as a whole unit. SSD forward/backward are custom ops so
 # torch.compile treats them as opaque nodes and fuses surrounding ops (conv1d,
-# silu, rms_norm, gating). dynamic=True needed because generation uses varying seq_len.
-for i, block in enumerate(orig_model.transformer.h):
-    orig_model.transformer.h[i] = torch.compile(block, dynamic=True)
+# silu, rms_norm, gating). dynamic=False because training shapes are fixed.
+_compiled_blocks = [torch.compile(block, dynamic=False) for block in _raw_blocks]
+for i in range(len(orig_model.transformer.h)):
+    orig_model.transformer.h[i] = _compiled_blocks[i]
 model = orig_model
 
 # -----------------------------------------------------------------------------
@@ -404,8 +407,14 @@ while True:
     results = {}
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
+        # Swap in uncompiled blocks for eval (variable seq_len)
+        for i in range(len(_raw_blocks)):
+            orig_model.transformer.h[i] = _raw_blocks[i]
         with disable_fp8(orig_model), autocast_ctx:
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
+        # Restore compiled blocks
+        for i in range(len(_compiled_blocks)):
+            orig_model.transformer.h[i] = _compiled_blocks[i]
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
             "step": step,
@@ -427,12 +436,18 @@ while True:
             "My favorite color is",
             "If 5*x + 3 = 13, then x is",
         ]
+        # Swap in uncompiled blocks for generation (varying seq_len)
+        for i in range(len(_raw_blocks)):
+            orig_model.transformer.h[i] = _raw_blocks[i]
         engine = Engine(orig_model, tokenizer)
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
             with disable_fp8(orig_model), autocast_ctx:
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
+        # Restore compiled blocks for training
+        for i in range(len(_compiled_blocks)):
+            orig_model.transformer.h[i] = _compiled_blocks[i]
         model.train()
 
     # save checkpoint
