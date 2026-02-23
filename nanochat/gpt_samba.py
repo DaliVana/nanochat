@@ -368,11 +368,24 @@ class GPTSamba(nn.Module):
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
+
+        # Per-layer-type breakdown
+        mamba_params = 0
+        attn_params = 0
+        for i, block in enumerate(self.transformer.h):
+            block_params = sum(p.numel() for p in block.parameters())
+            if self.layer_types[i] == 'M':
+                mamba_params += block_params
+            else:
+                attn_params += block_params
+
         return {
             'wte': wte,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
+            'attn_blocks': attn_params,
+            'mamba_blocks': mamba_params,
             'scalars': scalars,
             'total': total,
         }
