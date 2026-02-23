@@ -73,6 +73,16 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 
+@torch.compiler.disable
+def _flash_attn_kvcache_eager(q, k_cache, v_cache, k=None, v=None,
+                               cache_seqlens=None, window_size=(-1, -1)):
+    """Wrapper to prevent torch.compile from tracing into FA3's KV cache op."""
+    return flash_attn.flash_attn_with_kvcache(
+        q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,
+        causal=True, window_size=window_size,
+    )
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -116,11 +126,10 @@ class CausalSelfAttention(nn.Module):
             q, k = norm(q), norm(k)
 
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
-            y = flash_attn.flash_attn_with_kvcache(
+            y = _flash_attn_kvcache_eager(
                 q, k_cache, v_cache,
                 k=k, v=v,
                 cache_seqlens=kv_cache.cache_seqlens,
-                causal=True,
                 window_size=(self.sliding_window, 0),
             )
             if self.layer_idx == kv_cache.n_layers - 1:

@@ -1,8 +1,7 @@
 """
 Mamba-2 (SSD) layer for nanochat.
 
-Pure PyTorch implementation of the Structured State Space Duality (SSD) algorithm.
-No external mamba-ssm dependency.
+Structured State Space Duality (SSD) algorithm with Triton-accelerated CUDA path.
 
 Key ideas:
 - The selective state space model with diagonal A can be computed equivalently as
@@ -14,8 +13,9 @@ Key ideas:
 Memory optimization (following official Mamba-2 implementation):
 - ngroups: B/C projections are shared across heads (like GQA), reducing parameters
   and activation memory. Default ngroups=1 matches the official implementation.
-- For long sequences that OOM, use model-level gradient checkpointing to limit
-  peak memory to one block's SSD intermediates at a time.
+- CUDA: Triton kernels compute the L (decay) matrix tile-by-tile in registers,
+  never materializing the full (B, n_chunks, L, L, n_heads) tensor.
+- CPU/MPS: PyTorch fallback materializes the decay matrix (slower but portable).
 
 References:
 - Mamba-2: https://arxiv.org/abs/2405.21060
@@ -28,6 +28,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+
+# Triton kernels for CUDA (optional — falls back to PyTorch on CPU/MPS)
+_HAS_TRITON = False
+try:
+    from nanochat.ssd_triton import ssd_chunk_scan_combined_fwd
+    _HAS_TRITON = True
+except ImportError:
+    pass
 
 
 class Mamba2Layer(nn.Module):
@@ -140,8 +148,11 @@ class Mamba2Layer(nn.Module):
 
         # 4. SSD computation
         if ssm_state is None:
-            # Training: vectorized chunked SSD (all chunks in parallel)
-            y_heads = self._ssd_chunked(x_heads, A, B_mat, C_mat, dt)
+            # Training: Triton kernels on CUDA (L never materialized), PyTorch fallback otherwise
+            if _HAS_TRITON and x.device.type == 'cuda':
+                y_heads = self._ssd_triton(x_heads, A, B_mat, C_mat, dt)
+            else:
+                y_heads = self._ssd_chunked(x_heads, A, B_mat, C_mat, dt)
         else:
             # Inference: sequential recurrent scan
             y_heads, ssm_state = self._ssd_recurrent(x_heads, A, B_mat, C_mat, dt, ssm_state)
@@ -284,6 +295,41 @@ class Mamba2Layer(nn.Module):
         if pad_len > 0:
             y = y[:, :T, :, :]
 
+        return y
+
+    def _ssd_triton(self, x, A, B, C, dt):
+        """
+        Triton-accelerated chunked SSD for CUDA training.
+        The L (decay) matrix is never materialized — computed tile-by-tile in registers.
+
+        Args:
+            x:  (B, T, n_heads, head_dim) - input after conv+silu
+            A:  (n_heads,) - diagonal state decay (negative)
+            B:  (B, T, ngroups, d_state) - input-to-state matrix
+            C:  (B, T, ngroups, d_state) - state-to-output matrix
+            dt: (B, T, n_heads) - discretization timestep
+        Returns:
+            y:  (B, T, n_heads, head_dim) - output
+        """
+        B_batch, T, n_heads, head_dim = x.shape
+        chunk_size = min(self.chunk_size, T)
+
+        # Pad T to multiple of chunk_size if needed
+        pad_len = 0
+        if T % chunk_size != 0:
+            pad_len = chunk_size - (T % chunk_size)
+            x = F.pad(x, (0, 0, 0, 0, 0, pad_len))
+            B = F.pad(B, (0, 0, 0, 0, 0, pad_len))
+            C = F.pad(C, (0, 0, 0, 0, 0, pad_len))
+            dt = F.pad(dt, (0, 0, 0, pad_len))
+            T_padded = T + pad_len
+        else:
+            T_padded = T
+
+        y = ssd_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, self._ssd_scale)
+
+        if pad_len > 0:
+            y = y[:, :T, :, :]
         return y
 
     def _ssd_chunk_compute(self, x_c, B_c, C_c, dt_c, states, A, cum_log_dA_c):

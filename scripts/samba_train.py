@@ -245,12 +245,12 @@ def disable_fp8(model):
 orig_model = model
 torch._dynamo.config.capture_scalar_outputs = True
 # Compile each block individually.
-# On MPS, Mamba blocks at large model dims exceed Metal shader buffer limits
-# (max 31 buffers per kernel), so we compile sub-components instead.
-is_mps = next(orig_model.parameters()).device.type == 'mps'
+# Mamba blocks use sub-component compilation: the SSD computation uses Triton
+# kernels (CUDA) or has complex control flow (CPU/MPS) that causes graph breaks.
+# On MPS, full-block compilation also hits Metal shader buffer limits.
 for i, block in enumerate(orig_model.transformer.h):
-    if orig_model.layer_types[i] == 'M' and is_mps:
-        # MPS: compile linear layers individually — SSD computation stays eager
+    if orig_model.layer_types[i] == 'M':
+        # Compile linear layers individually — SSD computation stays eager/Triton
         block.mamba.in_proj = torch.compile(block.mamba.in_proj, dynamic=False)
         block.mamba.out_proj = torch.compile(block.mamba.out_proj, dynamic=False)
         block.mlp = torch.compile(block.mlp, dynamic=False)
