@@ -250,8 +250,9 @@ class Mamba2Layer(nn.Module):
 
         # 4. SSD computation
         if ssm_state is None:
-            # Training: Triton kernels on CUDA (L never materialized), PyTorch fallback otherwise
-            if _HAS_TRITON and x.device.type == 'cuda':
+            # Triton on CUDA for long sequences (L never materialized); PyTorch fallback otherwise.
+            # Triton requires chunk_size >= 16 for tl.dot, so short sequences use PyTorch.
+            if _HAS_TRITON and x.device.type == 'cuda' and T >= self.chunk_size:
                 y_heads = self._ssd_triton(x_heads, A, B_mat, C_mat, dt)
             else:
                 y_heads = self._ssd_chunked(x_heads, A, B_mat, C_mat, dt)
