@@ -111,8 +111,9 @@ def _ssd_chunked_pytorch(x, A, B, C, dt, causal_mask, ngroups, scale, chunk_size
     return y.contiguous().view(B_batch, T, n_heads, head_dim)
 
 
+@torch._dynamo.allow_in_graph
 class _SSDTritonFn(torch.autograd.Function):
-    """Triton forward (L never materialized) + PyTorch backward (recomputation)."""
+    """Triton forward (L never materialized) + Triton backward (L tile-by-tile)."""
 
     @staticmethod
     def forward(ctx, x, A, B, C, dt, causal_mask, ngroups, n_heads, scale, chunk_size):

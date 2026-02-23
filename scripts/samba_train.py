@@ -244,18 +244,11 @@ def disable_fp8(model):
 
 orig_model = model
 torch._dynamo.config.capture_scalar_outputs = True
-# Compile each block individually.
-# Mamba blocks use sub-component compilation: the SSD computation uses Triton
-# kernels (CUDA) or has complex control flow (CPU/MPS) that causes graph breaks.
-# On MPS, full-block compilation also hits Metal shader buffer limits.
+# Compile each block as a whole unit. _SSDTritonFn is marked @allow_in_graph so
+# torch.compile treats SSD as an opaque node and fuses surrounding ops (conv1d,
+# silu, rms_norm, gating). dynamic=False because shapes never change during training.
 for i, block in enumerate(orig_model.transformer.h):
-    if orig_model.layer_types[i] == 'M':
-        # Compile linear layers individually — SSD computation stays eager/Triton
-        block.mamba.in_proj = torch.compile(block.mamba.in_proj, dynamic=True)
-        block.mamba.out_proj = torch.compile(block.mamba.out_proj, dynamic=True)
-        block.mlp = torch.compile(block.mlp, dynamic=True)
-    else:
-        orig_model.transformer.h[i] = torch.compile(block, dynamic=True)
+    orig_model.transformer.h[i] = torch.compile(block, dynamic=False)
 model = orig_model
 
 # -----------------------------------------------------------------------------
