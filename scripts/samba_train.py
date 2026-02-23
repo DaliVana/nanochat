@@ -84,10 +84,30 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+# Progressive schedule
+parser.add_argument("--seq-len-schedule", type=str, default=None, help="comma-separated seq lengths for progressive training (e.g. '1024,2048,4096,8192,16384,32768')")
+parser.add_argument("--batch-size-schedule", type=str, default=None, help="comma-separated batch sizes for progressive training (e.g. '32,16,8,4,2,1')")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
+
+# Parse progressive schedule
+schedule_phases = None
+if args.seq_len_schedule is not None or args.batch_size_schedule is not None:
+    assert args.seq_len_schedule is not None and args.batch_size_schedule is not None, \
+        "--seq-len-schedule and --batch-size-schedule must both be provided"
+    _seq_lens = [int(x) for x in args.seq_len_schedule.split(",")]
+    _batch_sizes = [int(x) for x in args.batch_size_schedule.split(",")]
+    assert len(_seq_lens) == len(_batch_sizes), \
+        f"Schedule length mismatch: {len(_seq_lens)} seq_lens vs {len(_batch_sizes)} batch_sizes"
+    _products = [b * t for b, t in zip(_batch_sizes, _seq_lens)]
+    assert len(set(_products)) == 1, \
+        f"B*T product must be constant across all phases, got: {_products}"
+    schedule_phases = list(zip(_batch_sizes, _seq_lens))
+    # Override to max seq len so model config handles all lengths
+    args.max_seq_len = max(_seq_lens)
+    args.device_batch_size = _batch_sizes[0]
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -248,7 +268,7 @@ torch._dynamo.config.capture_scalar_outputs = True
 _raw_blocks = list(orig_model.transformer.h)
 # Compile each block as a whole unit. SSD forward/backward are custom ops so
 # torch.compile treats them as opaque nodes and fuses surrounding ops (conv1d,
-# silu, rms_norm, gating). dynamic=False because training shapes are fixed.
+# silu, rms_norm, gating). dynamic=False because training shapes are fixed within each phase.
 _compiled_blocks = [torch.compile(block, dynamic=False) for block in _raw_blocks]
 for i in range(len(orig_model.transformer.h)):
     orig_model.transformer.h[i] = _compiled_blocks[i]
@@ -310,10 +330,23 @@ if resuming:
 
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders
-dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
-x, y, dataloader_state_dict = next(train_loader)
+
+def create_train_loader(batch_size, seq_len, resume_state=None):
+    return tokenizing_distributed_data_loader_with_state_bos_bestfit(
+        tokenizer, batch_size, seq_len, split="train", device=device, resume_state_dict=resume_state)
+
+def create_val_loader(batch_size, seq_len):
+    return tokenizing_distributed_data_loader_bos_bestfit(
+        tokenizer, batch_size, seq_len, split="val", device=device)
+
+def get_phase(step):
+    """Return (phase_idx, device_batch_size, max_seq_len) for the given step."""
+    if schedule_phases is None:
+        return 0, args.device_batch_size, args.max_seq_len
+    for i in range(len(phase_start_steps) - 1, -1, -1):
+        if step >= phase_start_steps[i]:
+            return i, schedule_phases[i][0], schedule_phases[i][1]
+    return 0, schedule_phases[0][0], schedule_phases[0][1]
 
 # -----------------------------------------------------------------------------
 # Calculate training iterations and set up schedulers
@@ -334,6 +367,17 @@ total_tokens = total_batch_size * num_iterations
 print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}")
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
+
+# Compute phase boundary steps (needs num_iterations)
+if schedule_phases is not None:
+    num_phases = len(schedule_phases)
+    phase_start_steps = [round(i * num_iterations / num_phases) for i in range(num_phases)]
+    print0(f"Progressive schedule: {num_phases} phases over {num_iterations} iterations")
+    for i, (b, t) in enumerate(schedule_phases):
+        end = phase_start_steps[i + 1] if i + 1 < num_phases else num_iterations
+        print0(f"  Phase {i}: steps {phase_start_steps[i]}-{end}, B={b}, T={t}")
+else:
+    phase_start_steps = [0]
 
 def get_lr_multiplier(it):
     warmup_iters = round(args.warmup_ratio * num_iterations)
@@ -371,16 +415,43 @@ else:
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
 
-tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len
+# Initialize current phase and dataloader
+current_phase_idx, current_batch_size, current_seq_len = get_phase(step)
+dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
+train_loader = create_train_loader(current_batch_size, current_seq_len, dataloader_resume_state_dict)
+build_val_loader = lambda b=current_batch_size, t=current_seq_len: create_val_loader(b, t)
+x, y, dataloader_state_dict = next(train_loader)
+
+# B*T is constant across all phases (or just the single fixed config)
+tokens_per_fwdbwd = current_batch_size * current_seq_len
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size
 assert total_batch_size % world_tokens_per_fwdbwd == 0
 grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
-print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
+print0(f"Tokens / micro-batch / rank: {current_batch_size} x {current_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
 # Go!
 while True:
+    # Check for phase transition
+    new_phase_idx, new_batch_size, new_seq_len = get_phase(step)
+    if new_phase_idx != current_phase_idx:
+        print0(f"{'=' * 80}")
+        print0(f"PHASE TRANSITION: Phase {current_phase_idx} -> {new_phase_idx} | B: {current_batch_size} -> {new_batch_size}, T: {current_seq_len} -> {new_seq_len}")
+        print0(f"{'=' * 80}")
+        current_phase_idx = new_phase_idx
+        current_batch_size = new_batch_size
+        current_seq_len = new_seq_len
+        # Recreate dataloader with new B, T (pass state for data continuity)
+        del train_loader
+        gc.collect()
+        if device_type == "cuda":
+            torch.cuda.empty_cache()
+        train_loader = create_train_loader(current_batch_size, current_seq_len, dataloader_state_dict)
+        build_val_loader = lambda b=current_batch_size, t=current_seq_len: create_val_loader(b, t)
+        x, y, dataloader_state_dict = next(train_loader)
+        wandb_run.log({"step": step, "schedule/phase": current_phase_idx, "schedule/batch_size": current_batch_size, "schedule/seq_len": current_seq_len})
+
     last_step = step == num_iterations
 
     flops_so_far = num_flops_per_token * total_batch_size * step
@@ -389,7 +460,7 @@ while True:
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         model.eval()
         val_loader = build_val_loader()
-        eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
+        eval_steps = args.eval_tokens // (current_batch_size * current_seq_len * ddp_world_size)
         with disable_fp8(model), autocast_ctx:
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
@@ -462,8 +533,8 @@ while True:
                 "val_bpb": val_bpb,
                 "model_config": model_config_kwargs,
                 "user_config": user_config,
-                "device_batch_size": args.device_batch_size,
-                "max_seq_len": args.max_seq_len,
+                "device_batch_size": current_batch_size,
+                "max_seq_len": current_seq_len,
                 "dataloader_state_dict": dataloader_state_dict,
                 "loop_state": {
                     "min_val_bpb": min_val_bpb,
@@ -525,7 +596,8 @@ while True:
     else:
         eta_str = ""
     epoch = dataloader_state_dict["epoch"]
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    phase_str = f" | phase: {current_phase_idx} (B={current_batch_size},T={current_seq_len})" if schedule_phases is not None else ""
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch}{phase_str} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -538,6 +610,10 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        if schedule_phases is not None:
+            log_data["schedule/phase"] = current_phase_idx
+            log_data["schedule/batch_size"] = current_batch_size
+            log_data["schedule/seq_len"] = current_seq_len
         wandb_run.log(log_data)
 
     # state update
