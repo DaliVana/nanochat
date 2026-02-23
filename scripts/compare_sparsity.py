@@ -41,6 +41,7 @@ def cleanup_checkpoints(script_name, model_tag):
         "scripts.moh_train": "moh_checkpoints",
         "scripts.moe_train": "moe_checkpoints",
         "scripts.movae_train": "movae_checkpoints",
+        "scripts.samba_train": "samba_checkpoints",
     }
     prefix = ckpt_prefixes.get(script_name)
     if not prefix:
@@ -264,12 +265,16 @@ def main():
         # ("MoH (12.5%)", "scripts.moh_train", "moh_12.5", ["--moh-active-heads-ratio=0.125"]),
 
         # 14-16. MoE with different expert configurations
-        ("MoE (4x2)", "scripts.moe_train", "moe_4x2",
-         ["--num-experts=4", "--top-k=2", "--num-shared-experts=1"]),
-        ("MoE (8x2)", "scripts.moe_train", "moe_8x2",
-         ["--num-experts=8", "--top-k=2", "--num-shared-experts=1"]),
-        ("MoE (8x1)", "scripts.moe_train", "moe_8x1",
-         ["--num-experts=8", "--top-k=1", "--num-shared-experts=0"]),
+        # ("MoE (4x2)", "scripts.moe_train", "moe_4x2",
+        #  ["--num-experts=4", "--top-k=2", "--num-shared-experts=1"]),
+        # ("MoE (8x2)", "scripts.moe_train", "moe_8x2",
+        #  ["--num-experts=8", "--top-k=2", "--num-shared-experts=1"]),
+        # ("MoE (8x1)", "scripts.moe_train", "moe_8x1",
+        #  ["--num-experts=8", "--top-k=1", "--num-shared-experts=0"]),
+
+        # Samba (Mamba-2 + Sliding Window Attention)
+        ("Samba (MA)", "scripts.samba_train", "samba_ma", ["--layer-pattern=MA"]),
+        ("Samba (MMMA)", "scripts.samba_train", "samba_mmma", ["--layer-pattern=MMMA"]),
 
         # # # 17-19. MoVaE with different expert configurations
         # ("MoVaE (4x2)", "scripts.movae_train", "movae_4x2",

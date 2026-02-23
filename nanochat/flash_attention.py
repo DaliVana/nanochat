@@ -58,6 +58,73 @@ def _use_fa3():
 # =============================================================================
 # SDPA helpers
 # =============================================================================
+def _sdpa_sliding_window_chunked(q, k, v, window, enable_gqa):
+    """
+    Efficient O(T*W) sliding window attention for SDPA using overlapping chunks.
+    Avoids materializing a full T×T attention mask.
+
+    q: (B, H_q, T, D), k: (B, H_kv, T, D), v: (B, H_kv, T, D)
+    window: number of tokens to the left each token can attend to (window_size[0])
+    """
+    B, H_q, T, D = q.shape
+    H_kv = k.size(1)
+    W = window  # chunk size = window size
+
+    # Pad T to next multiple of W
+    pad_len = (W - T % W) % W
+    if pad_len > 0:
+        q = F.pad(q, (0, 0, 0, pad_len))
+        k = F.pad(k, (0, 0, 0, pad_len))
+        v = F.pad(v, (0, 0, 0, pad_len))
+    T_pad = T + pad_len
+    n_chunks = T_pad // W
+
+    y = q.new_empty(B, H_q, T_pad, D)
+
+    # Chunk 0: standard causal (no previous context to attend to)
+    y[:, :, :W] = F.scaled_dot_product_attention(
+        q[:, :, :W], k[:, :, :W], v[:, :, :W],
+        is_causal=True, enable_gqa=enable_gqa
+    )
+
+    if n_chunks > 1:
+        nc = n_chunks - 1
+        # Queries: split remaining sequence into nc chunks of W
+        q_rest = (q[:, :, W:]
+                  .reshape(B, H_q, nc, W, D)
+                  .transpose(1, 2)
+                  .reshape(B * nc, H_q, W, D))
+
+        # Keys/values: overlapping windows of 2W with stride W via unfold
+        # chunk i (1-indexed) gets k[(i-1)*W : (i+1)*W]
+        k_rest = (k.unfold(2, 2 * W, W)          # (B, H_kv, nc, D, 2W)
+                  .permute(0, 2, 1, 4, 3)         # (B, nc, H_kv, 2W, D)
+                  .reshape(B * nc, H_kv, 2 * W, D))
+        v_rest = (v.unfold(2, 2 * W, W)
+                  .permute(0, 2, 1, 4, 3)
+                  .reshape(B * nc, H_kv, 2 * W, D))
+
+        # Sliding window mask: (W, 2W), same for all chunks
+        # q at local pos i, k at local pos j (offset by W from q's chunk start)
+        # Causal: j <= i + W, Window: j >= i
+        qi = torch.arange(W, device=q.device).unsqueeze(1)
+        kj = torch.arange(2 * W, device=q.device).unsqueeze(0)
+        mask = (kj >= qi) & (kj <= qi + W)
+
+        y_rest = F.scaled_dot_product_attention(
+            q_rest, k_rest, v_rest,
+            attn_mask=mask, enable_gqa=enable_gqa
+        )
+        y[:, :, W:] = (y_rest
+                       .reshape(B, nc, H_q, W, D)
+                       .permute(0, 2, 1, 3, 4)
+                       .reshape(B, H_q, nc * W, D))
+
+    if pad_len > 0:
+        y = y[:, :, :T]
+    return y
+
+
 def _sdpa_attention(q, k, v, window_size, enable_gqa):
     """
     SDPA attention with sliding window support.
@@ -80,9 +147,12 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
             v = v[:, :, start:, :]
         return F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
 
-    # Need explicit mask for sliding window/chunk inference
+    # Training with sliding window: use efficient chunked approach O(T*W)
+    if Tq == Tk and window >= 0 and window < Tk:
+        return _sdpa_sliding_window_chunked(q, k, v, window, enable_gqa)
+
+    # Fallback: explicit mask for chunk inference (Tq != Tk)
     device = q.device
-    # For chunk inference (Tq != Tk), is_causal is not aligned to cache position => build an explicit bool mask
     row_idx = (Tk - Tq) + torch.arange(Tq, device=device).unsqueeze(1)
     col_idx = torch.arange(Tk, device=device).unsqueeze(0)
     mask = col_idx <= row_idx
@@ -90,7 +160,7 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
     # sliding window (left)
     if window >= 0 and window < Tk:
         mask = mask & ((row_idx - col_idx) <= window)
-    
+
     return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
 
 # =============================================================================
