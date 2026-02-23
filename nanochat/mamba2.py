@@ -32,7 +32,7 @@ from torch.utils.checkpoint import checkpoint
 # Triton kernels for CUDA (optional — falls back to PyTorch on CPU/MPS)
 _HAS_TRITON = False
 try:
-    from nanochat.ssd_triton import ssd_chunk_scan_combined_fwd
+    from nanochat.ssd_triton import ssd_chunk_scan_combined_fwd, ssd_chunk_scan_combined_bwd
     _HAS_TRITON = True
 except ImportError:
     pass
@@ -127,18 +127,11 @@ class _SSDTritonFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         x, A, B, C, dt, causal_mask = ctx.saved_tensors
-        # Recompute with PyTorch ops to get autograd gradients
-        with torch.enable_grad():
-            x2 = x.detach().requires_grad_(True)
-            A2 = A.detach().requires_grad_(True)
-            B2 = B.detach().requires_grad_(True)
-            C2 = C.detach().requires_grad_(True)
-            dt2 = dt.detach().requires_grad_(True)
-            y = _ssd_chunked_pytorch(x2, A2, B2, C2, dt2, causal_mask,
-                                      ctx.ngroups, ctx.scale, ctx.chunk_size)
-            y.backward(grad_output)
+        dx, dA, dB, dC, ddt = ssd_chunk_scan_combined_bwd(
+            grad_output, x, dt, A, B, C, ctx.chunk_size, ctx.scale
+        )
         # Grads for: x, A, B, C, dt, causal_mask, ngroups, n_heads, scale, chunk_size
-        return x2.grad, A2.grad, B2.grad, C2.grad, dt2.grad, None, None, None, None, None
+        return dx, dA, dB, dC, ddt, None, None, None, None, None
 
 
 class Mamba2Layer(nn.Module):
