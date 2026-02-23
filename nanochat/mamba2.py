@@ -14,8 +14,8 @@ Key ideas:
 Memory optimization (following official Mamba-2 implementation):
 - ngroups: B/C projections are shared across heads (like GQA), reducing parameters
   and activation memory. Default ngroups=1 matches the official implementation.
-- Chunk-sequential SSD (CUDA): processes one chunk at a time with per-chunk
-  gradient checkpointing, reducing peak quadratic memory by O(n_chunks).
+- For long sequences that OOM, use model-level gradient checkpointing to limit
+  peak memory to one block's SSD intermediates at a time.
 
 References:
 - Mamba-2: https://arxiv.org/abs/2405.21060
@@ -140,11 +140,8 @@ class Mamba2Layer(nn.Module):
 
         # 4. SSD computation
         if ssm_state is None:
-            # Training: CUDA uses chunk-sequential (memory-efficient), CPU/MPS uses vectorized
-            if x.device.type == 'cuda':
-                y_heads = self._ssd_chunked_sequential(x_heads, A, B_mat, C_mat, dt)
-            else:
-                y_heads = self._ssd_chunked(x_heads, A, B_mat, C_mat, dt)
+            # Training: vectorized chunked SSD (all chunks in parallel)
+            y_heads = self._ssd_chunked(x_heads, A, B_mat, C_mat, dt)
         else:
             # Inference: sequential recurrent scan
             y_heads, ssm_state = self._ssd_recurrent(x_heads, A, B_mat, C_mat, dt, ssm_state)
