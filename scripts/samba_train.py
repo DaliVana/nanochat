@@ -251,11 +251,11 @@ torch._dynamo.config.capture_scalar_outputs = True
 for i, block in enumerate(orig_model.transformer.h):
     if orig_model.layer_types[i] == 'M':
         # Compile linear layers individually — SSD computation stays eager/Triton
-        block.mamba.in_proj = torch.compile(block.mamba.in_proj, dynamic=False)
-        block.mamba.out_proj = torch.compile(block.mamba.out_proj, dynamic=False)
-        block.mlp = torch.compile(block.mlp, dynamic=False)
+        block.mamba.in_proj = torch.compile(block.mamba.in_proj, dynamic=True)
+        block.mamba.out_proj = torch.compile(block.mamba.out_proj, dynamic=True)
+        block.mlp = torch.compile(block.mlp, dynamic=True)
     else:
-        orig_model.transformer.h[i] = torch.compile(block, dynamic=False)
+        orig_model.transformer.h[i] = torch.compile(block, dynamic=True)
 model = orig_model
 
 # -----------------------------------------------------------------------------
