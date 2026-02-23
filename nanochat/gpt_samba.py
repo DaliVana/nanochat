@@ -51,6 +51,7 @@ class GPTConfigSamba:
     mamba_d_state: int = 64     # SSM state dimension
     mamba_d_conv: int = 4       # causal convolution kernel size
     mamba_expand: int = 2       # expansion factor for inner dim
+    mamba_ngroups: int = 1      # B/C group count (1=max sharing, n_heads=per-head like original)
     mamba_chunk_size: int = 256 # chunk size for SSD algorithm
 
 
@@ -165,6 +166,7 @@ class MambaBlock(nn.Module):
             d_state=config.mamba_d_state,
             d_conv=config.mamba_d_conv,
             expand=config.mamba_expand,
+            ngroups=config.mamba_ngroups,
             chunk_size=config.mamba_chunk_size,
         )
         self.mlp = MLP(config)

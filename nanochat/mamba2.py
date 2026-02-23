@@ -11,6 +11,12 @@ Key ideas:
   chunks, recurrent between chunks. This gives O(T * N * D) complexity.
 - For inference, we use the standard sequential recurrence.
 
+Memory optimization (following official Mamba-2 implementation):
+- ngroups: B/C projections are shared across heads (like GQA), reducing parameters
+  and activation memory. Default ngroups=1 matches the official implementation.
+- Chunk-sequential SSD (CUDA): processes one chunk at a time with per-chunk
+  gradient checkpointing, reducing peak quadratic memory by O(n_chunks).
+
 References:
 - Mamba-2: https://arxiv.org/abs/2405.21060
 - Samba: https://arxiv.org/abs/2406.07522
@@ -21,6 +27,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 class Mamba2Layer(nn.Module):
@@ -35,7 +42,7 @@ class Mamba2Layer(nn.Module):
     5. Output projection: linear back to model dimension
     """
 
-    def __init__(self, d_model, d_state=64, d_conv=4, expand=2, n_heads=None, chunk_size=256):
+    def __init__(self, d_model, d_state=64, d_conv=4, expand=2, n_heads=None, ngroups=1, chunk_size=256):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
@@ -50,9 +57,14 @@ class Mamba2Layer(nn.Module):
         assert self.d_inner % self.n_heads == 0, f"d_inner ({self.d_inner}) must be divisible by n_heads ({self.n_heads})"
         self.head_dim = self.d_inner // self.n_heads
 
+        # B/C group count (like GQA: ngroups=1 means all heads share one B/C,
+        # ngroups=n_heads means per-head B/C like the original implementation)
+        self.ngroups = ngroups
+        assert self.n_heads % self.ngroups == 0, f"n_heads ({self.n_heads}) must be divisible by ngroups ({self.ngroups})"
+
         # Input projection: single big linear for efficiency
-        # z(d_inner) + x_conv(d_inner) + B(n_heads*d_state) + C(n_heads*d_state) + dt(n_heads)
-        d_proj = 2 * self.d_inner + 2 * self.n_heads * self.d_state + self.n_heads
+        # z(d_inner) + x_conv(d_inner) + B(ngroups*d_state) + C(ngroups*d_state) + dt(n_heads)
+        d_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.n_heads
         self.in_proj = nn.Linear(d_model, d_proj, bias=False)
 
         # Short causal 1D depthwise convolution
@@ -80,6 +92,13 @@ class Mamba2Layer(nn.Module):
             torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool), diagonal=1),
             persistent=False,
         )
+
+    def _expand_groups(self, x):
+        """Expand grouped B/C from (*, ngroups, d_state) to (*, n_heads, d_state).
+        No-op when ngroups == n_heads."""
+        if self.ngroups == self.n_heads:
+            return x
+        return x.repeat_interleave(self.n_heads // self.ngroups, dim=-2)
 
     def forward(self, x, ssm_state=None, conv_state=None):
         """
@@ -121,8 +140,11 @@ class Mamba2Layer(nn.Module):
 
         # 4. SSD computation
         if ssm_state is None:
-            # Training: chunked parallel scan
-            y_heads = self._ssd_chunked(x_heads, A, B_mat, C_mat, dt)
+            # Training: CUDA uses chunk-sequential (memory-efficient), CPU/MPS uses vectorized
+            if x.device.type == 'cuda':
+                y_heads = self._ssd_chunked_sequential(x_heads, A, B_mat, C_mat, dt)
+            else:
+                y_heads = self._ssd_chunked(x_heads, A, B_mat, C_mat, dt)
         else:
             # Inference: sequential recurrent scan
             y_heads, ssm_state = self._ssd_recurrent(x_heads, A, B_mat, C_mat, dt, ssm_state)
@@ -140,17 +162,17 @@ class Mamba2Layer(nn.Module):
     def _split_projection(self, proj):
         """Split the input projection into its components."""
         d_inner = self.d_inner
-        n_heads = self.n_heads
+        ngroups = self.ngroups
         d_state = self.d_state
 
-        z = proj[..., :d_inner]                                                     # (B, T, d_inner)
-        x_conv = proj[..., d_inner:2*d_inner]                                       # (B, T, d_inner)
-        B_mat = proj[..., 2*d_inner:2*d_inner + n_heads*d_state]                    # (B, T, n_heads*d_state)
-        C_mat = proj[..., 2*d_inner + n_heads*d_state:2*d_inner + 2*n_heads*d_state] # (B, T, n_heads*d_state)
-        dt_raw = proj[..., 2*d_inner + 2*n_heads*d_state:]                          # (B, T, n_heads)
+        z = proj[..., :d_inner]                                                         # (B, T, d_inner)
+        x_conv = proj[..., d_inner:2*d_inner]                                           # (B, T, d_inner)
+        B_mat = proj[..., 2*d_inner:2*d_inner + ngroups*d_state]                        # (B, T, ngroups*d_state)
+        C_mat = proj[..., 2*d_inner + ngroups*d_state:2*d_inner + 2*ngroups*d_state]    # (B, T, ngroups*d_state)
+        dt_raw = proj[..., 2*d_inner + 2*ngroups*d_state:]                              # (B, T, n_heads)
 
-        B_mat = B_mat.view(*B_mat.shape[:-1], n_heads, d_state)  # (B, T, n_heads, d_state)
-        C_mat = C_mat.view(*C_mat.shape[:-1], n_heads, d_state)  # (B, T, n_heads, d_state)
+        B_mat = B_mat.view(*B_mat.shape[:-1], ngroups, d_state)  # (B, T, ngroups, d_state)
+        C_mat = C_mat.view(*C_mat.shape[:-1], ngroups, d_state)  # (B, T, ngroups, d_state)
 
         return z, x_conv, B_mat, C_mat, dt_raw
 
@@ -178,16 +200,162 @@ class Mamba2Layer(nn.Module):
 
     def _ssd_chunked(self, x, A, B, C, dt):
         """
-        Chunked SSD computation for training.
+        Chunked SSD computation for training (CPU/MPS path).
+        Materializes all chunks at once — faster but uses more memory.
 
         Args:
             x:  (B, T, n_heads, head_dim) - input after conv+silu
             A:  (n_heads,) - diagonal state decay (negative)
-            B:  (B, T, n_heads, d_state) - input-to-state matrix
-            C:  (B, T, n_heads, d_state) - state-to-output matrix
+            B:  (B, T, ngroups, d_state) - input-to-state matrix
+            C:  (B, T, ngroups, d_state) - state-to-output matrix
             dt: (B, T, n_heads) - discretization timestep
         Returns:
             y:  (B, T, n_heads, head_dim) - output
+        """
+        B_batch, T, n_heads, head_dim = x.shape
+        ngroups = B.shape[-2]
+        d_state = B.shape[-1]
+        chunk_size = min(self.chunk_size, T)
+
+        # Pad T to multiple of chunk_size if needed
+        pad_len = 0
+        if T % chunk_size != 0:
+            pad_len = chunk_size - (T % chunk_size)
+            x = F.pad(x, (0, 0, 0, 0, 0, pad_len))
+            B = F.pad(B, (0, 0, 0, 0, 0, pad_len))
+            C = F.pad(C, (0, 0, 0, 0, 0, pad_len))
+            dt = F.pad(dt, (0, 0, 0, pad_len))
+            T_padded = T + pad_len
+        else:
+            T_padded = T
+
+        n_chunks = T_padded // chunk_size
+        L = chunk_size
+
+        # Reshape into chunks: (B, n_chunks, L, ...)
+        x  = x.view(B_batch, n_chunks, L, n_heads, head_dim)
+        B_ = B.view(B_batch, n_chunks, L, ngroups, d_state)
+        C_ = C.view(B_batch, n_chunks, L, ngroups, d_state)
+        dt = dt.view(B_batch, n_chunks, L, n_heads)
+
+        # Decay computation (float32 for cumsum/exp stability)
+        log_dA = (A * dt).float()
+        cum_log_dA = torch.cumsum(log_dA, dim=2)  # (B, nc, L, nh)
+
+        # --- Within-chunk computation (quadratic / attention-like) ---
+        # Pairwise decay matrix with causal mask applied in log-space
+        log_decay_matrix = cum_log_dA.unsqueeze(3) - cum_log_dA.unsqueeze(2)  # (B, nc, L, L, nh)
+        mask = self._causal_mask[:L, :L].reshape(1, 1, L, L, 1)
+        log_decay_matrix = log_decay_matrix.masked_fill(mask, float('-inf'))
+        decay_matrix = torch.exp(log_decay_matrix)
+
+        # Scores: CB in grouped space, then expand to per-head and multiply by decay
+        scale = self._ssd_scale
+        scores = torch.einsum('bcign, bcjgn -> bcijg', C_.float(), B_.float())  # (B, nc, L, L, ngroups)
+        scores = scores * scale
+        if ngroups < n_heads:
+            scores = scores.repeat_interleave(n_heads // ngroups, dim=-1)  # -> (B, nc, L, L, nh)
+        scores = scores * decay_matrix
+
+        # Weighted sum
+        x_dt = (x * dt.unsqueeze(-1)).float()
+        y_intra = torch.einsum('bcijh, bcjhp -> bcihp', scores, x_dt)
+
+        # --- Between-chunk computation (recurrent state propagation) ---
+        chunk_decay = torch.exp(cum_log_dA[:, :, -1, :])  # (B, nc, nh)
+        decay_to_end = torch.exp(cum_log_dA[:, :, -1:, :] - cum_log_dA)  # (B, nc, L, nh)
+        B_expanded = self._expand_groups(B_)  # (B, nc, L, n_heads, d_state)
+        delta_h = torch.einsum('bclh, bclhp, bclhn -> bchpn', decay_to_end, x_dt.float(), B_expanded.float())
+
+        # Propagate states across chunks sequentially
+        states = torch.zeros(B_batch, n_heads, head_dim, d_state, device=x.device, dtype=torch.float32)
+        all_states = []
+        for c in range(n_chunks):
+            all_states.append(states)
+            states = chunk_decay[:, c, :, None, None] * states + delta_h[:, c]
+        all_states = torch.stack(all_states, dim=1)  # (B, nc, nh, hd, d_state)
+
+        # Contribution from previous state to current chunk's output
+        C_expanded = self._expand_groups(C_)  # (B, nc, L, n_heads, d_state)
+        decay_from_start = torch.exp(cum_log_dA)
+        state_contribution = torch.einsum('bcihn, bchpn -> bcihp', C_expanded.float(), all_states)
+        y_inter = state_contribution * (decay_from_start.unsqueeze(-1) * scale)
+
+        # Combine
+        y = (y_intra + y_inter).to(x.dtype)
+        y = y.contiguous().view(B_batch, T_padded, n_heads, head_dim)
+        if pad_len > 0:
+            y = y[:, :T, :, :]
+
+        return y
+
+    def _ssd_chunk_compute(self, x_c, B_c, C_c, dt_c, states, A, cum_log_dA_c):
+        """
+        Compute intra-chunk output and inter-chunk state update for a single chunk.
+        Designed to be wrapped in torch.utils.checkpoint for memory efficiency.
+
+        Args:
+            x_c:          (B, L, n_heads, head_dim)
+            B_c:          (B, L, ngroups, d_state)
+            C_c:          (B, L, ngroups, d_state)
+            dt_c:         (B, L, n_heads)
+            states:       (B, n_heads, head_dim, d_state) - incoming state
+            A:            (n_heads,)
+            cum_log_dA_c: (B, L, n_heads)
+        Returns:
+            y_c:        (B, L, n_heads, head_dim)
+            new_states: (B, n_heads, head_dim, d_state)
+        """
+        B_batch, L, n_heads, head_dim = x_c.shape
+        scale = self._ssd_scale
+
+        # --- Intra-chunk (quadratic) ---
+        log_decay = cum_log_dA_c.unsqueeze(2) - cum_log_dA_c.unsqueeze(1)  # (B, L, L, nh)
+        mask = self._causal_mask[:L, :L].unsqueeze(0).unsqueeze(-1)  # (1, L, L, 1)
+        log_decay = log_decay.masked_fill(mask, float('-inf'))
+        decay = torch.exp(log_decay)  # (B, L, L, nh)
+
+        # CB scores in grouped space, then expand to per-head
+        scores = torch.einsum('bign, bjgn -> bijg', C_c.float(), B_c.float())  # (B, L, L, ngroups)
+        scores = scores * scale
+        if self.ngroups < n_heads:
+            scores = scores.repeat_interleave(n_heads // self.ngroups, dim=-1)
+        scores = scores * decay
+
+        x_dt = (x_c * dt_c.unsqueeze(-1)).float()
+        y_intra = torch.einsum('bijh, bjhp -> bihp', scores, x_dt)
+
+        # --- Inter-chunk contribution from incoming state ---
+        decay_from_start = torch.exp(cum_log_dA_c)  # (B, L, nh)
+        C_expanded = self._expand_groups(C_c)  # (B, L, n_heads, d_state)
+        state_contrib = torch.einsum('bihn, bhpn -> bihp', C_expanded.float(), states)
+        y_inter = state_contrib * (decay_from_start.unsqueeze(-1) * scale)
+
+        y_c = y_intra + y_inter
+
+        # --- Update state for next chunk ---
+        chunk_decay = torch.exp(cum_log_dA_c[:, -1, :])  # (B, nh)
+        decay_to_end = torch.exp(cum_log_dA_c[:, -1:, :] - cum_log_dA_c)  # (B, L, nh)
+        B_expanded = self._expand_groups(B_c)  # (B, L, n_heads, d_state)
+        delta_h = torch.einsum('blh, blhp, blhn -> bhpn', decay_to_end, x_dt.float(), B_expanded.float())
+        new_states = chunk_decay[:, :, None, None] * states + delta_h
+
+        return y_c, new_states
+
+    def _ssd_chunked_sequential(self, x, A, B, C, dt):
+        """
+        Memory-efficient chunked SSD for CUDA training.
+        Processes one chunk at a time with per-chunk gradient checkpointing.
+        Peak quadratic memory: O(B * L^2 * nh) instead of O(B * n_chunks * L^2 * nh).
+
+        Args:
+            x:  (B, T, n_heads, head_dim)
+            A:  (n_heads,)
+            B:  (B, T, ngroups, d_state)
+            C:  (B, T, ngroups, d_state)
+            dt: (B, T, n_heads)
+        Returns:
+            y:  (B, T, n_heads, head_dim)
         """
         B_batch, T, n_heads, head_dim = x.shape
         d_state = B.shape[-1]
@@ -210,51 +378,29 @@ class Mamba2Layer(nn.Module):
 
         # Reshape into chunks: (B, n_chunks, L, ...)
         x  = x.view(B_batch, n_chunks, L, n_heads, head_dim)
-        B_ = B.view(B_batch, n_chunks, L, n_heads, d_state)
-        C_ = C.view(B_batch, n_chunks, L, n_heads, d_state)
+        B_ = B.view(B_batch, n_chunks, L, self.ngroups, d_state)
+        C_ = C.view(B_batch, n_chunks, L, self.ngroups, d_state)
         dt = dt.view(B_batch, n_chunks, L, n_heads)
 
-        # Decay computation (float32 for cumsum/exp stability)
-        # A broadcasts: (nh,) * (B, nc, L, nh) -> (B, nc, L, nh)
+        # Precompute cumulative log(dA) for all chunks (small: B, nc, L, nh)
         log_dA = (A * dt).float()
         cum_log_dA = torch.cumsum(log_dA, dim=2)  # (B, nc, L, nh)
 
-        # --- Within-chunk computation (quadratic / attention-like) ---
-        # Pairwise decay matrix with causal mask applied in log-space
-        log_decay_matrix = cum_log_dA.unsqueeze(3) - cum_log_dA.unsqueeze(2)  # (B, nc, L, L, nh)
-        mask = self._causal_mask[:L, :L].reshape(1, 1, L, L, 1)
-        log_decay_matrix = log_decay_matrix.masked_fill(mask, float('-inf'))
-        decay_matrix = torch.exp(log_decay_matrix)
+        # Process chunks sequentially with per-chunk checkpointing
+        states = torch.zeros(B_batch, n_heads, head_dim, d_state,
+                             device=x.device, dtype=torch.float32)
+        y_chunks = []
 
-        # Scores: C^T @ B * decay * scale
-        scale = self._ssd_scale
-        scores = torch.einsum('bcihn, bcjhn -> bcijh', C_.float(), B_.float())
-        scores = scores * (decay_matrix * scale)
-
-        # Weighted sum
-        x_dt = (x * dt.unsqueeze(-1)).float()  # bf16 multiply, then float32
-        y_intra = torch.einsum('bcijh, bcjhp -> bcihp', scores, x_dt)
-
-        # --- Between-chunk computation (recurrent state propagation) ---
-        chunk_decay = torch.exp(cum_log_dA[:, :, -1, :])  # (B, nc, nh)
-        decay_to_end = torch.exp(cum_log_dA[:, :, -1:, :] - cum_log_dA)  # (B, nc, L, nh)
-        delta_h = torch.einsum('bclh, bclhp, bclhn -> bchpn', decay_to_end, x_dt.float(), B_.float())
-
-        # Propagate states across chunks sequentially
-        states = torch.zeros(B_batch, n_heads, head_dim, d_state, device=x.device, dtype=torch.float32)
-        all_states = []
         for c in range(n_chunks):
-            all_states.append(states)
-            states = chunk_decay[:, c, :, None, None] * states + delta_h[:, c]
-        all_states = torch.stack(all_states, dim=1)  # (B, nc, nh, hd, d_state)
+            y_c, states = checkpoint(
+                self._ssd_chunk_compute,
+                x[:, c], B_[:, c], C_[:, c], dt[:, c],
+                states, A, cum_log_dA[:, c],
+                use_reentrant=False,
+            )
+            y_chunks.append(y_c.to(x.dtype))
 
-        # Contribution from previous state to current chunk's output
-        decay_from_start = torch.exp(cum_log_dA)
-        state_contribution = torch.einsum('bcihn, bchpn -> bcihp', C_.float(), all_states)
-        y_inter = state_contribution * (decay_from_start.unsqueeze(-1) * scale)
-
-        # Combine
-        y = (y_intra + y_inter).to(x.dtype)
+        y = torch.stack(y_chunks, dim=1)  # (B, nc, L, nh, hd)
         y = y.contiguous().view(B_batch, T_padded, n_heads, head_dim)
         if pad_len > 0:
             y = y[:, :T, :, :]
@@ -268,8 +414,8 @@ class Mamba2Layer(nn.Module):
         Args:
             x:  (B, T, n_heads, head_dim) where T is typically 1 during generation
             A:  (n_heads,)
-            B:  (B, T, n_heads, d_state)
-            C:  (B, T, n_heads, d_state)
+            B:  (B, T, ngroups, d_state)
+            C:  (B, T, ngroups, d_state)
             dt: (B, T, n_heads)
             ssm_state: (B, n_heads, head_dim, d_state)
         Returns:
@@ -277,6 +423,10 @@ class Mamba2Layer(nn.Module):
             new_state: (B, n_heads, head_dim, d_state)
         """
         B_batch, T, n_heads, head_dim = x.shape
+
+        # Expand B/C from ngroups to n_heads
+        B = self._expand_groups(B)  # (B, T, n_heads, d_state)
+        C = self._expand_groups(C)  # (B, T, n_heads, d_state)
 
         outputs = []
         h = ssm_state  # (B, n_heads, head_dim, d_state)

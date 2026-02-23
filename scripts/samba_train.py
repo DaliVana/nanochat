@@ -56,6 +56,7 @@ parser.add_argument("--layer-pattern", type=str, default="MA", help="layer patte
 parser.add_argument("--mamba-d-state", type=int, default=64, help="Mamba-2 SSM state dimension")
 parser.add_argument("--mamba-d-conv", type=int, default=4, help="Mamba-2 causal convolution kernel size")
 parser.add_argument("--mamba-expand", type=int, default=2, help="Mamba-2 expansion factor for inner dim")
+parser.add_argument("--mamba-ngroups", type=int, default=1, help="Mamba-2 B/C group count (1=max sharing, -1=per-head)")
 parser.add_argument("--mamba-chunk-size", type=int, default=256, help="Mamba-2 chunk size for SSD algorithm")
 parser.add_argument("--gradient-checkpointing", action="store_true", help="recompute forward during backward to save memory (slower but fits longer contexts)")
 # Training horizon (only one used, in order of precedence)
@@ -132,6 +133,10 @@ def build_model_meta(depth):
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
+    # Resolve ngroups=-1 to per-head (n_heads = d_inner // d_state)
+    d_inner = int(args.mamba_expand * model_dim)
+    mamba_n_heads = d_inner // args.mamba_d_state
+    mamba_ngroups = mamba_n_heads if args.mamba_ngroups == -1 else args.mamba_ngroups
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
@@ -140,6 +145,7 @@ def build_model_meta(depth):
         mamba_d_state=args.mamba_d_state,
         mamba_d_conv=args.mamba_d_conv,
         mamba_expand=args.mamba_expand,
+        mamba_ngroups=mamba_ngroups,
         mamba_chunk_size=args.mamba_chunk_size,
     )
     with torch.device("meta"):
@@ -238,14 +244,12 @@ def disable_fp8(model):
 
 orig_model = model
 torch._dynamo.config.capture_scalar_outputs = True
-# Compile each block individually. On MPS, Mamba blocks at large model dims exceed
-# Metal shader buffer limits (max 31 buffers per kernel), so we fall back to compiling
-# only the sub-components (linear layers + MLP).
-mamba_full_compile = (device_type == 'cuda') or (model_config.n_embd <= 512)
+# Compile each block individually. Mamba blocks use sub-component compilation
+# because the chunk-sequential SSD (CUDA) uses a Python loop with per-chunk
+# checkpointing that causes graph breaks. On MPS, Mamba blocks at large model
+# dims also exceed Metal shader buffer limits (max 31 buffers per kernel).
 for i, block in enumerate(orig_model.transformer.h):
     if orig_model.layer_types[i] == 'A':
-        orig_model.transformer.h[i] = torch.compile(block, dynamic=False)
-    elif mamba_full_compile:
         orig_model.transformer.h[i] = torch.compile(block, dynamic=False)
     else:
         # Compile linear layers individually — SSD computation stays eager
