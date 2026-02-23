@@ -38,6 +38,108 @@ except ImportError:
     pass
 
 
+def _ssd_chunked_pytorch(x, A, B, C, dt, causal_mask, ngroups, scale, chunk_size):
+    """Standalone PyTorch SSD chunked computation (autograd-compatible).
+
+    Args:
+        x:  (B, T, n_heads, head_dim) — already padded to multiple of chunk_size
+        A:  (n_heads,)
+        B:  (B, T, ngroups, d_state)
+        C:  (B, T, ngroups, d_state)
+        dt: (B, T, n_heads)
+        causal_mask: (chunk_size, chunk_size) upper-triangular bool mask
+        ngroups: int
+        scale: float
+        chunk_size: int
+    Returns:
+        y: (B, T, n_heads, head_dim)
+    """
+    B_batch, T, n_heads, head_dim = x.shape
+    d_state = B.shape[-1]
+    n_chunks = T // chunk_size
+    L = chunk_size
+
+    x  = x.view(B_batch, n_chunks, L, n_heads, head_dim)
+    B_ = B.view(B_batch, n_chunks, L, ngroups, d_state)
+    C_ = C.view(B_batch, n_chunks, L, ngroups, d_state)
+    dt = dt.view(B_batch, n_chunks, L, n_heads)
+
+    log_dA = (A * dt).float()
+    cum_log_dA = torch.cumsum(log_dA, dim=2)
+
+    # Within-chunk (quadratic)
+    log_decay_matrix = cum_log_dA.unsqueeze(3) - cum_log_dA.unsqueeze(2)
+    mask = causal_mask[:L, :L].reshape(1, 1, L, L, 1)
+    log_decay_matrix = log_decay_matrix.masked_fill(mask, float('-inf'))
+    decay_matrix = torch.exp(log_decay_matrix)
+
+    scores = torch.einsum('bcign, bcjgn -> bcijg', C_.float(), B_.float()) * scale
+    if ngroups < n_heads:
+        scores = scores.repeat_interleave(n_heads // ngroups, dim=-1)
+    scores = scores * decay_matrix
+
+    x_dt = (x * dt.unsqueeze(-1)).float()
+    y_intra = torch.einsum('bcijh, bcjhp -> bcihp', scores, x_dt)
+
+    # Between-chunk (recurrent)
+    chunk_decay = torch.exp(cum_log_dA[:, :, -1, :])
+    decay_to_end = torch.exp(cum_log_dA[:, :, -1:, :] - cum_log_dA)
+
+    # Expand B for delta_h
+    if ngroups < n_heads:
+        B_expanded = B_.repeat_interleave(n_heads // ngroups, dim=-2)
+    else:
+        B_expanded = B_
+    delta_h = torch.einsum('bclh, bclhp, bclhn -> bchpn', decay_to_end, x_dt, B_expanded.float())
+
+    states = torch.zeros(B_batch, n_heads, head_dim, d_state, device=x.device, dtype=torch.float32)
+    all_states = []
+    for c in range(n_chunks):
+        all_states.append(states)
+        states = chunk_decay[:, c, :, None, None] * states + delta_h[:, c]
+    all_states = torch.stack(all_states, dim=1)
+
+    if ngroups < n_heads:
+        C_expanded = C_.repeat_interleave(n_heads // ngroups, dim=-2)
+    else:
+        C_expanded = C_
+    decay_from_start = torch.exp(cum_log_dA)
+    state_contribution = torch.einsum('bcihn, bchpn -> bcihp', C_expanded.float(), all_states)
+    y_inter = state_contribution * (decay_from_start.unsqueeze(-1) * scale)
+
+    y = (y_intra + y_inter).to(x.dtype)
+    return y.contiguous().view(B_batch, T, n_heads, head_dim)
+
+
+class _SSDTritonFn(torch.autograd.Function):
+    """Triton forward (L never materialized) + PyTorch backward (recomputation)."""
+
+    @staticmethod
+    def forward(ctx, x, A, B, C, dt, causal_mask, ngroups, n_heads, scale, chunk_size):
+        ctx.save_for_backward(x, A, B, C, dt, causal_mask)
+        ctx.ngroups = ngroups
+        ctx.scale = scale
+        ctx.chunk_size = chunk_size
+        with torch.no_grad():
+            return ssd_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, scale)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, A, B, C, dt, causal_mask = ctx.saved_tensors
+        # Recompute with PyTorch ops to get autograd gradients
+        with torch.enable_grad():
+            x2 = x.detach().requires_grad_(True)
+            A2 = A.detach().requires_grad_(True)
+            B2 = B.detach().requires_grad_(True)
+            C2 = C.detach().requires_grad_(True)
+            dt2 = dt.detach().requires_grad_(True)
+            y = _ssd_chunked_pytorch(x2, A2, B2, C2, dt2, causal_mask,
+                                      ctx.ngroups, ctx.scale, ctx.chunk_size)
+            y.backward(grad_output)
+        # Grads for: x, A, B, C, dt, causal_mask, ngroups, n_heads, scale, chunk_size
+        return x2.grad, A2.grad, B2.grad, C2.grad, dt2.grad, None, None, None, None, None
+
+
 class Mamba2Layer(nn.Module):
     """
     Mamba-2 (SSD) layer.
@@ -299,17 +401,14 @@ class Mamba2Layer(nn.Module):
 
     def _ssd_triton(self, x, A, B, C, dt):
         """
-        Triton-accelerated chunked SSD for CUDA training.
-        The L (decay) matrix is never materialized — computed tile-by-tile in registers.
+        Triton forward + PyTorch backward for CUDA training.
 
-        Args:
-            x:  (B, T, n_heads, head_dim) - input after conv+silu
-            A:  (n_heads,) - diagonal state decay (negative)
-            B:  (B, T, ngroups, d_state) - input-to-state matrix
-            C:  (B, T, ngroups, d_state) - state-to-output matrix
-            dt: (B, T, n_heads) - discretization timestep
-        Returns:
-            y:  (B, T, n_heads, head_dim) - output
+        Forward: Triton kernels compute the output without materializing L.
+        Backward: Recomputes via PyTorch _ssd_chunked for autograd gradients.
+
+        This is useful with gradient checkpointing: forward pass across all blocks
+        uses Triton (low peak memory), then backward recomputes one block at a time
+        via PyTorch (L only exists for one block momentarily).
         """
         B_batch, T, n_heads, head_dim = x.shape
         chunk_size = min(self.chunk_size, T)
@@ -322,11 +421,9 @@ class Mamba2Layer(nn.Module):
             B = F.pad(B, (0, 0, 0, 0, 0, pad_len))
             C = F.pad(C, (0, 0, 0, 0, 0, pad_len))
             dt = F.pad(dt, (0, 0, 0, pad_len))
-            T_padded = T + pad_len
-        else:
-            T_padded = T
 
-        y = ssd_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, self._ssd_scale)
+        y = _SSDTritonFn.apply(x, A, B, C, dt, self._causal_mask, self.ngroups,
+                                self.n_heads, self._ssd_scale, chunk_size)
 
         if pad_len > 0:
             y = y[:, :T, :, :]
