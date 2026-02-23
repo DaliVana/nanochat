@@ -111,8 +111,9 @@ def _ssd_chunked_pytorch(x, A, B, C, dt, causal_mask, ngroups, scale, chunk_size
     return y.contiguous().view(B_batch, T, n_heads, head_dim)
 
 
-# ---- Custom op for torch.compile compatibility ----
-# torch.library.custom_op properly handles FakeTensors (no .data_ptr() calls during tracing)
+# ---- Custom ops for torch.compile compatibility ----
+# Both forward and backward are opaque custom ops so aot_autograd never traces
+# into Triton kernels with FakeTensors (which would call .data_ptr()).
 
 @torch.library.custom_op("nanochat::ssd_fwd", mutates_args=())
 def _ssd_fwd_op(x: torch.Tensor, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
@@ -123,13 +124,25 @@ def _ssd_fwd_op(x: torch.Tensor, A: torch.Tensor, B: torch.Tensor, C: torch.Tens
 def _ssd_fwd_fake(x, A, B, C, dt, chunk_size, scale):
     return x.new_empty(x.shape)
 
-def _ssd_bwd(ctx, grad_output):
+@torch.library.custom_op("nanochat::ssd_bwd", mutates_args=())
+def _ssd_bwd_op(dy: torch.Tensor, x: torch.Tensor, dt: torch.Tensor, A: torch.Tensor,
+                B: torch.Tensor, C: torch.Tensor, chunk_size: int,
+                scale: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return ssd_chunk_scan_combined_bwd(dy, x, dt, A, B, C, chunk_size, scale)
+
+@_ssd_bwd_op.register_fake
+def _ssd_bwd_fake(dy, x, dt, A, B, C, chunk_size, scale):
+    return (x.new_empty(x.shape),      # dx
+            A.new_empty(A.shape),       # dA
+            B.new_empty(B.shape),       # dB
+            C.new_empty(C.shape),       # dC
+            dt.new_empty(dt.shape))     # ddt
+
+def _ssd_autograd_bwd(ctx, *grad_outputs):
+    grad_output = grad_outputs[0]
     x, A, B, C, dt = ctx.saved_tensors
-    chunk_size = ctx.chunk_size
-    scale = ctx.scale
-    dx, dA, dB, dC, ddt = ssd_chunk_scan_combined_bwd(
-        grad_output, x, dt, A, B, C, chunk_size, scale
-    )
+    dx, dA, dB, dC, ddt = _ssd_bwd_op(grad_output, x, dt, A, B, C,
+                                        ctx.chunk_size, ctx.scale)
     return dx, dA, dB, dC, ddt, None, None
 
 def _ssd_setup_context(ctx, inputs, output):
@@ -138,7 +151,7 @@ def _ssd_setup_context(ctx, inputs, output):
     ctx.chunk_size = chunk_size
     ctx.scale = scale
 
-_ssd_fwd_op.register_autograd(_ssd_bwd, setup_context=_ssd_setup_context)
+_ssd_fwd_op.register_autograd(_ssd_autograd_bwd, setup_context=_ssd_setup_context)
 
 
 class Mamba2Layer(nn.Module):
