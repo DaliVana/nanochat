@@ -6,25 +6,24 @@ import triton.language as tl
 @triton.jit
 def _rotary_embedding_kernel(
     q_ptr, k_ptr, cos_ptr, sin_ptr,
-    seqlen, head_dim: tl.constexpr, rot_dim: tl.constexpr,
+    seqlen, head_dim: tl.constexpr,
     n_heads: tl.constexpr, n_kv_heads: tl.constexpr,
     stride_q_batch, stride_q_seq, stride_q_head, stride_q_dim,
     stride_k_batch, stride_k_seq, stride_k_head, stride_k_dim,
     stride_cos_seq, stride_cos_dim,
     stride_sin_seq, stride_sin_dim,
-    BLOCK_SEQ: tl.constexpr,
+    BLOCK_SEQ: tl.constexpr, HALF_ROT_DIM: tl.constexpr,
 ):
     pid_seq = tl.program_id(0)
     pid_batch = tl.program_id(1)
     pid_head = tl.program_id(2)
-    
+
     seq_start = pid_seq * BLOCK_SEQ
     seq_offs = seq_start + tl.arange(0, BLOCK_SEQ)
     seq_mask = seq_offs < seqlen
-    
-    half_rot_dim = rot_dim // 2
-    dim_offs_low = tl.arange(0, half_rot_dim)
-    dim_offs_high = half_rot_dim + tl.arange(0, half_rot_dim)
+
+    dim_offs_low = tl.arange(0, HALF_ROT_DIM)
+    dim_offs_high = HALF_ROT_DIM + tl.arange(0, HALF_ROT_DIM)
 
     # Load Cos/Sin for the current seq positions (broadcasting across batch/heads)
     cos = tl.load(cos_ptr + seq_offs[:, None] * stride_cos_seq + dim_offs_low[None, :] * stride_cos_dim, mask=seq_mask[:, None], other=1.0)
@@ -71,20 +70,20 @@ def apply_rotary_emb_triton(q, k, cos, sin):
     """
     batch, seqlen, n_heads, head_dim = q.shape
     _, _, n_kv_heads, _ = k.shape
-    rot_dim = cos.shape[-1] * 2
+    half_rot_dim = cos.shape[-1]
 
     BLOCK_SEQ = min(128, triton.next_power_of_2(seqlen))
     grid = (triton.cdiv(seqlen, BLOCK_SEQ), batch, n_heads + n_kv_heads)
 
     _rotary_embedding_kernel[grid](
         q, k, cos, sin,
-        seqlen, head_dim, rot_dim,
+        seqlen, head_dim,
         n_heads, n_kv_heads,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
         cos.stride(1), cos.stride(3),
         sin.stride(1), sin.stride(3),
-        BLOCK_SEQ=BLOCK_SEQ,
+        BLOCK_SEQ=BLOCK_SEQ, HALF_ROT_DIM=half_rot_dim,
     )
     return q, k
 
