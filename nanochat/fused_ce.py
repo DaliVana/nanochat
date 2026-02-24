@@ -23,7 +23,10 @@ class ChunkedCrossEntropyLossFn(torch.autograd.Function):
         K = x.shape[-1]
         N = weight.shape[0]
 
+        # Ensure matching dtypes for matmuls (weight may be fp32, x may be bf16)
+        compute_dtype = x.dtype
         x_flat = x.reshape(M, K)
+        w = weight.to(compute_dtype) if weight.dtype != compute_dtype else weight
         targets_flat = targets.reshape(M)
         valid_mask = targets_flat != ignore_index
 
@@ -36,7 +39,7 @@ class ChunkedCrossEntropyLossFn(torch.autograd.Function):
             n1 = min(n0 + _CHUNK_V, N)
 
             # cuBLAS GEMM: [M, K] @ [chunk, K]^T -> [M, chunk]
-            logits = (x_flat @ weight[n0:n1].T).float()
+            logits = (x_flat @ w[n0:n1].T).float()
             if softcap > 0.0:
                 logits = softcap * torch.tanh(logits / softcap)
 
@@ -66,7 +69,7 @@ class ChunkedCrossEntropyLossFn(torch.autograd.Function):
             inv_normalizer = loss.new_ones(())
             out_loss = loss.view(orig_shape[:-1])
 
-        ctx.save_for_backward(x_flat, weight, targets_flat, lse)
+        ctx.save_for_backward(x_flat, w, targets_flat, lse)
         ctx.softcap = softcap
         ctx.ignore_index = ignore_index
         ctx.inv_normalizer = inv_normalizer
@@ -76,7 +79,7 @@ class ChunkedCrossEntropyLossFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        x_flat, weight, targets_flat, lse = ctx.saved_tensors
+        x_flat, w, targets_flat, lse = ctx.saved_tensors
         M, N = ctx.M, ctx.N
         valid_mask = targets_flat != ctx.ignore_index
 
@@ -87,13 +90,13 @@ class ChunkedCrossEntropyLossFn(torch.autograd.Function):
             g = grad_output.reshape(M) * ctx.inv_normalizer  # [M]
 
         dx = torch.zeros_like(x_flat)
-        dw = torch.empty_like(weight)
+        dw = torch.empty_like(w)
 
         for n0 in range(0, N, _CHUNK_V):
             n1 = min(n0 + _CHUNK_V, N)
 
-            # Recompute logits (cuBLAS)
-            logits = (x_flat @ weight[n0:n1].T).float()
+            # Recompute logits (cuBLAS) — both x_flat and w are same dtype
+            logits = (x_flat @ w[n0:n1].T).float()
 
             if ctx.softcap > 0.0:
                 t = torch.tanh(logits / ctx.softcap)
@@ -122,8 +125,8 @@ class ChunkedCrossEntropyLossFn(torch.autograd.Function):
             dp = dp.to(x_flat.dtype)
 
             # cuBLAS GEMMs for parameter gradients
-            dx.addmm_(dp, weight[n0:n1])              # [M, K] += [M, chunk] @ [chunk, K]
-            torch.mm(dp.T, x_flat, out=dw[n0:n1])     # [chunk, K] = [chunk, M] @ [M, K]
+            dx.addmm_(dp, w[n0:n1])               # [M, K] += [M, chunk] @ [chunk, K]
+            torch.mm(dp.T, x_flat, out=dw[n0:n1]) # [chunk, K] = [chunk, M] @ [M, K]
 
         return dx.reshape(ctx.orig_shape), dw, None, None, None, None
 
