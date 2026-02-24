@@ -126,100 +126,78 @@ def _fused_cross_entropy_bwd_kernel(
     inv_normalizer: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    # Backward pass needs to compute:
-    # d(Loss) / d(logits) = softmax(logits) - 1(target)
-    # Since softcap: dp = (softmax(logits) - 1(target)) * (1 - tanh^2(x@W^T / softcap))
-    # dX = dp @ W
-    # dW = dp^T @ X
-    
-    # We tile across M and N to compute dX and dW
+    # 1D grid over M — each program owns its M rows, loops over all N internally.
+    # This eliminates atomics for dX (each program is sole writer to its rows).
+    # dW still uses atomics but with cdiv(M, BLOCK_M) contention instead of
+    # cdiv(M, BLOCK_M) * cdiv(N, BLOCK_N).
     pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    
+
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    
     m_mask = offs_m < M
-    n_mask = offs_n < N
-    
+
     targets = tl.load(targets_ptr + offs_m, mask=m_mask, other=ignore_index)
     lse = tl.load(lse_ptr + offs_m * stride_lse, mask=m_mask, other=0.0)
     grad_out = tl.load(grad_out_ptr + offs_m * stride_grad_out, mask=m_mask, other=0.0).to(tl.float32)
     valid_mask = (targets != ignore_index) & m_mask
-    
-    # Recompute logits for this block
-    logits_pre_cap = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k_start in range(0, K, BLOCK_K):
-        offs_k = k_start + tl.arange(0, BLOCK_K)
-        k_mask = offs_k < K
-        
-        x = tl.load(X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
-                    mask=m_mask[:, None] & k_mask[None, :], other=0.0).to(tl.bfloat16)
-        w = tl.load(W_ptr + offs_n[None, :] * stride_wn + offs_k[:, None] * stride_wk,
-                    mask=n_mask[None, :] & k_mask[:, None], other=0.0).to(tl.bfloat16)
 
-        logits_pre_cap += tl.dot(x, w)
+    # Loop over N blocks (like forward), recomputing logits and dp per chunk
+    for n_start in range(0, N, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        n_mask = offs_n < N
 
-    # Re-apply softcap
-    if softcap > 0.0:
-        tanh_val = libdevice.tanh(logits_pre_cap / softcap)
-        logits = softcap * tanh_val
-        # derivative of softcap * tanh(x / softcap) is 1 - tanh^2(x / softcap)
-        d_softcap = 1.0 - tanh_val * tanh_val
-    else:
-        logits = logits_pre_cap
-        d_softcap = 1.0
-
-    # dp = softmax(logits) - 1_target
-    probs = tl.exp(logits - lse[:, None])
-    
-    # indicator for targets
-    is_target = (targets[:, None] == offs_n[None, :]) & valid_mask[:, None]
-    
-    dp = probs - tl.where(is_target, 1.0, 0.0)
-    
-    # apply mask for ignore_index
-    dp = tl.where(valid_mask[:, None], dp, 0.0)
-    
-    # chain rule through softcap
-    dp = dp * d_softcap
-    
-    # scale by loss normalizer and incoming gradient
-    dp = dp * grad_out[:, None] * inv_normalizer
-    
-    # Cast dp to bf16 for tensor-core dot products
-    dp_bf16 = dp.to(tl.bfloat16)
-
-    # Accumulate dX
-    # dX[m, k] += dp[m, n] @ W[n, k]
-    for k_start in range(0, K, BLOCK_K):
-        offs_k = k_start + tl.arange(0, BLOCK_K)
-        k_mask = offs_k < K
-
-        w_trans = tl.load(W_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
-                          mask=n_mask[:, None] & k_mask[None, :], other=0.0).to(tl.bfloat16)
-
-        dx_val = tl.dot(dp_bf16, w_trans)
-
-        # Use atomic add because grid is over N as well
-        tl.atomic_add(dX_ptr + offs_m[:, None] * stride_dxm + offs_k[None, :] * stride_dxk,
-                      dx_val, mask=m_mask[:, None] & k_mask[None, :])
-
-    # Accumulate dW
-    # dW[n, k] += dp[m, n]^T @ X[m, k]
-    dp_trans = tl.trans(dp_bf16)
-    for k_start in range(0, K, BLOCK_K):
-        offs_k = k_start + tl.arange(0, BLOCK_K)
-        k_mask = offs_k < K
-
-        x_val = tl.load(X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
+        # Recompute logits for this (M, N) tile
+        logits_pre_cap = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k_start in range(0, K, BLOCK_K):
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < K
+            x = tl.load(X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
                         mask=m_mask[:, None] & k_mask[None, :], other=0.0).to(tl.bfloat16)
+            w = tl.load(W_ptr + offs_n[None, :] * stride_wn + offs_k[:, None] * stride_wk,
+                        mask=n_mask[None, :] & k_mask[:, None], other=0.0).to(tl.bfloat16)
+            logits_pre_cap += tl.dot(x, w)
 
-        dw_val = tl.dot(dp_trans, x_val)
+        # Softcap
+        if softcap > 0.0:
+            tanh_val = libdevice.tanh(logits_pre_cap / softcap)
+            logits = softcap * tanh_val
+            d_softcap = 1.0 - tanh_val * tanh_val
+        else:
+            logits = logits_pre_cap
+            d_softcap = 1.0
 
-        # Use atomic add because grid is over M as well
-        tl.atomic_add(dW_ptr + offs_n[:, None] * stride_dwn + offs_k[None, :] * stride_dwk,
-                      dw_val, mask=n_mask[:, None] & k_mask[None, :])
+        # dp = softmax(logits) - 1_target
+        probs = tl.exp(logits - lse[:, None])
+        is_target = (targets[:, None] == offs_n[None, :]) & valid_mask[:, None]
+        dp = probs - tl.where(is_target, 1.0, 0.0)
+        dp = tl.where(valid_mask[:, None], dp, 0.0)
+        dp = dp * d_softcap * grad_out[:, None] * inv_normalizer
+        dp_bf16 = dp.to(tl.bfloat16)
+
+        # Accumulate dX: read-modify-write (non-atomic — we own these M rows)
+        # dX[m, k] += dp[m, n] @ W[n, k]
+        for k_start in range(0, K, BLOCK_K):
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < K
+            w_chunk = tl.load(W_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
+                              mask=n_mask[:, None] & k_mask[None, :], other=0.0).to(tl.bfloat16)
+            dx_val = tl.dot(dp_bf16, w_chunk)
+            # Non-atomic: load existing, add, store
+            dx_prev = tl.load(dX_ptr + offs_m[:, None] * stride_dxm + offs_k[None, :] * stride_dxk,
+                              mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+            tl.store(dX_ptr + offs_m[:, None] * stride_dxm + offs_k[None, :] * stride_dxk,
+                     dx_prev + dx_val, mask=m_mask[:, None] & k_mask[None, :])
+
+        # Accumulate dW: atomic (multiple M programs contribute to same dW rows)
+        # dW[n, k] += dp[m, n]^T @ X[m, k]
+        dp_trans = tl.trans(dp_bf16)
+        for k_start in range(0, K, BLOCK_K):
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < K
+            x_chunk = tl.load(X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
+                              mask=m_mask[:, None] & k_mask[None, :], other=0.0).to(tl.bfloat16)
+            dw_val = tl.dot(dp_trans, x_chunk)
+            tl.atomic_add(dW_ptr + offs_n[:, None] * stride_dwn + offs_k[None, :] * stride_dwk,
+                          dw_val, mask=n_mask[:, None] & k_mask[None, :])
 
 
 class FastCrossEntropyLossFn(torch.autograd.Function):
@@ -300,7 +278,7 @@ class FastCrossEntropyLossFn(torch.autograd.Function):
         BLOCK_N = 64
         BLOCK_K = min(64, triton.next_power_of_2(ctx.K))
         
-        grid = (triton.cdiv(ctx.M, BLOCK_M), triton.cdiv(ctx.N, BLOCK_N), 1)
+        grid = (triton.cdiv(ctx.M, BLOCK_M),)
         
         _fused_cross_entropy_bwd_kernel[grid](
             x_flat, weight, targets_flat, lse, grad_out_flat,
