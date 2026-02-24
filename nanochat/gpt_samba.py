@@ -28,10 +28,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from nanochat.common import get_dist_info, print0
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 from nanochat.flash_attention import flash_attn
 from nanochat.mamba2 import Mamba2Layer
+from nanochat.fused_ce import fused_cross_entropy
+from nanochat.fused_rope import apply_rotary_emb_triton
 
 
 @dataclass
@@ -115,14 +116,15 @@ class CausalSelfAttention(nn.Module):
         if kv_cache is None:
             # Training: sliding window attention with global RoPE
             cos, sin = cos_sin
-            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+            # Fused Triton kernel applies this in-place
+            apply_rotary_emb_triton(q, k, cos, sin)
             q, k = norm(q), norm(k)
             y = flash_attn.flash_attn_func(q, k, v, causal=True,
                                            window_size=(self.sliding_window, 0))
         else:
             # Inference: use KV cache with sliding window
             cos, sin = cos_sin  # global positions for inference
-            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+            apply_rotary_emb_triton(q, k, cos, sin)
             q, k = norm(q), norm(k)
 
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
@@ -475,10 +477,9 @@ class GPTSamba(nn.Module):
 
         x = norm(x)
 
-        if targets is not None and self.gradient_checkpointing and self.training:
-            # Chunked cross-entropy: compute loss in chunks to avoid materializing
-            # the full (T × vocab) logits tensor (e.g. 32k × 34k × 4B = 4 GB)
-            return self._chunked_cross_entropy(x, targets, loss_reduction)
+        if targets is not None and self.training:
+            # Fused Cross Entropy avoids materializing the massive [B, T, V] tensor
+            return fused_cross_entropy(x, self.lm_head.weight, targets, softcap=15.0, ignore_index=-1, reduction=loss_reduction)
 
         softcap = 15
         logits = self.lm_head(x)
@@ -492,29 +493,7 @@ class GPTSamba(nn.Module):
         else:
             return logits
 
-    def _chunked_cross_entropy(self, x, targets, loss_reduction, chunk_size=4096):
-        """Compute cross-entropy in chunks, each wrapped in checkpoint to avoid storing logits."""
-        softcap = 15
-        B, T, _ = x.shape
-        total_loss = torch.tensor(0.0, device=x.device, dtype=torch.float32)
-        n_tokens = 0
 
-        def _chunk_loss(chunk_x, chunk_targets):
-            logits = self.lm_head(chunk_x)
-            logits = logits[..., :self.config.vocab_size].float()
-            logits = softcap * torch.tanh(logits / softcap)
-            return F.cross_entropy(logits.view(-1, logits.size(-1)),
-                                   chunk_targets.view(-1), ignore_index=-1, reduction='sum')
-
-        for i in range(0, T, chunk_size):
-            chunk_loss = checkpoint(_chunk_loss, x[:, i:i+chunk_size],
-                                    targets[:, i:i+chunk_size], use_reentrant=False)
-            total_loss = total_loss + chunk_loss
-            n_tokens += targets[:, i:i+chunk_size].ne(-1).sum()
-
-        if loss_reduction == 'mean':
-            return total_loss / n_tokens
-        return total_loss
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
