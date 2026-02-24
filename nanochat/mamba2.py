@@ -162,7 +162,7 @@ class Mamba2Layer(nn.Module):
     1. Input projection: x -> (z, x_conv, B, C, dt)
     2. Short causal 1D depthwise convolution on x_conv, then SiLU
     3. SSD scan: selective state space (chunked for training, recurrent for inference)
-    4. Output gate: y = rms_norm(y) * silu(z)
+    4. Output gate: y = rms_norm(y) * silu(z) (fused via torch.compile)
     5. Output projection: linear back to model dimension
     """
 
@@ -197,7 +197,7 @@ class Mamba2Layer(nn.Module):
             out_channels=self.d_inner,
             kernel_size=d_conv,
             groups=self.d_inner,
-            padding=d_conv - 1,  # causal: we'll truncate the future
+            padding=0,  # We will manually left-pad inputs to avoid computing future tokens
             bias=False,
         )
 
@@ -247,7 +247,9 @@ class Mamba2Layer(nn.Module):
         if conv_state is None:
             # Training: full convolution
             x_conv = x_conv.transpose(1, 2)  # (B, d_inner, T)
-            x_conv = self.conv1d(x_conv)[:, :, :T]  # causal: truncate future
+            # Pad explicitly on the left to avoid materializing redundant future tokens
+            x_conv = F.pad(x_conv, (self.d_conv - 1, 0))
+            x_conv = self.conv1d(x_conv)  # causal convolution over precisely T steps
             x_conv = x_conv.transpose(1, 2)  # (B, T, d_inner)
         else:
             # Inference: step-by-step convolution
@@ -276,8 +278,7 @@ class Mamba2Layer(nn.Module):
 
         # 5. Output gate: norm then gate with z
         y = y_heads.reshape(B, T, self.d_inner)
-        y = F.rms_norm(y, (y.size(-1),))
-        y = y * F.silu(z)
+        y = self._fused_norm_gate(y, z)
 
         # 6. Output projection
         y = self.out_proj(y)
@@ -301,6 +302,17 @@ class Mamba2Layer(nn.Module):
 
         return z, x_conv, B_mat, C_mat, dt_raw
 
+    @torch.compile
+    def _fused_norm_gate(self, y_raw, z):
+        """
+        Fused RMSNorm and SiLU gate via torch.compile.
+        This forces Inductor to generate a single GPU kernel that normalizes y_raw
+        and immediately gates it with silu(z), bypassing intermediate memory materialization.
+        """
+        # torch.compile handles this inline fusion on PyTorch 2.0+
+        y_norm = F.rms_norm(y_raw, (y_raw.size(-1),))
+        return y_norm * F.silu(z)
+
     def _conv_step(self, x_conv, conv_state):
         """
         Single-step convolution for inference.
@@ -309,14 +321,15 @@ class Mamba2Layer(nn.Module):
             conv_state: (B, d_inner, d_conv-1) - buffer of recent inputs
         Returns:
             y: (B, T, d_inner)
-            new_conv_state: (B, d_inner, d_conv-1)
+            new_conv_state: (B, d_inner, d_conv-1) updated in-place
         """
         B, T, d_inner = x_conv.shape
         outputs = []
         for t in range(T):
             x_t = x_conv[:, t, :]  # (B, d_inner)
-            # Shift and insert
-            conv_state = torch.cat([conv_state[:, :, 1:], x_t.unsqueeze(-1)], dim=-1)
+            # Shift buffer left without forcing reallocation
+            conv_state[:, :, :-1] = conv_state[:, :, 1:].clone()
+            conv_state[:, :, -1] = x_t
             # Apply conv: weight is (d_inner, 1, d_conv)
             y_t = (conv_state * self.conv1d.weight.squeeze(1)).sum(dim=-1)  # (B, d_inner)
             outputs.append(y_t)

@@ -27,7 +27,7 @@ import torch
 from nanochat.gpt_samba import GPTSamba as GPT, GPTConfigSamba as GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
-from nanochat.tokenizer import get_tokenizer, get_token_bytes
+from nanochat.tokenizer import get_o200k_harmony_tokenizer, compute_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
@@ -140,8 +140,8 @@ else:
 
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
-tokenizer = get_tokenizer()
-token_bytes = get_token_bytes(device=device)
+tokenizer = get_o200k_harmony_tokenizer()
+token_bytes = compute_token_bytes(tokenizer, device=device)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 
@@ -269,9 +269,13 @@ _raw_blocks = list(orig_model.transformer.h)
 # Compile each block as a whole unit. SSD forward/backward are custom ops so
 # torch.compile treats them as opaque nodes and fuses surrounding ops (conv1d,
 # silu, rms_norm, gating). dynamic=False because training shapes are fixed within each phase.
-_compiled_blocks = [torch.compile(block, dynamic=False) for block in _raw_blocks]
-for i in range(len(orig_model.transformer.h)):
-    orig_model.transformer.h[i] = _compiled_blocks[i]
+# Skip compilation on MPS — Metal shader compiler can't handle large-vocab kernels.
+if device_type == "cuda":
+    _compiled_blocks = [torch.compile(block, dynamic=False) for block in _raw_blocks]
+    for i in range(len(orig_model.transformer.h)):
+        orig_model.transformer.h[i] = _compiled_blocks[i]
+else:
+    _compiled_blocks = _raw_blocks
 model = orig_model
 
 # -----------------------------------------------------------------------------
@@ -461,8 +465,14 @@ while True:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (current_batch_size * current_seq_len * ddp_world_size)
-        with disable_fp8(model), autocast_ctx:
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        # Swap in uncompiled blocks for eval (avoids MPS shader compilation failures)
+        for i in range(len(_raw_blocks)):
+            orig_model.transformer.h[i] = _raw_blocks[i]
+        with disable_fp8(orig_model), autocast_ctx:
+            val_bpb = evaluate_bpb(orig_model, val_loader, eval_steps, token_bytes)
+        # Restore compiled blocks
+        for i in range(len(_compiled_blocks)):
+            orig_model.transformer.h[i] = _compiled_blocks[i]
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -512,7 +522,7 @@ while True:
             orig_model.transformer.h[i] = _raw_blocks[i]
         engine = Engine(orig_model, tokenizer)
         for prompt in prompts:
-            tokens = tokenizer(prompt, prepend="<|bos|>")
+            tokens = tokenizer(prompt, prepend="<|startoftext|>")
             with disable_fp8(orig_model), autocast_ctx:
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))

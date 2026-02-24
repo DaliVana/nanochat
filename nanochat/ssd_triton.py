@@ -643,22 +643,20 @@ def _chunk_scan_bwd_dC_kernel(
              acc, mask=(offs_m[:, None] < chunk_size) & (offs_n[None, :] < dstate))
 
 
-def chunk_scan_bwd_dC(dy, prev_states, dA_cumsum, scale):
+def chunk_scan_bwd_dC(dy, prev_states, dA_cumsum, ngroups, scale):
     """
     Args:
         dy:          (batch, nchunks, chunk_size, nheads, headdim)
         prev_states: (batch, nchunks, nheads, headdim, dstate)
         dA_cumsum:   (batch, nchunks, chunk_size, nheads)
+        ngroups:     int
         scale:       float
     Returns:
         dC: (batch, nchunks, chunk_size, ngroups, dstate) float32
     """
     batch, nchunks, L, nheads, headdim = dy.shape
-    ngroups = prev_states.shape[2] // (nheads // (nheads // 1))  # need actual ngroups
-    # Infer ngroups from C shape — caller must provide or we compute from nheads
     dstate = prev_states.shape[4]
-    # We need ngroups — infer from caller context. For now use nheads (will be overridden by orchestrator)
-    return _chunk_scan_bwd_dC_impl(dy, prev_states, dA_cumsum, scale, nheads, dstate)
+    return _chunk_scan_bwd_dC_impl(dy, prev_states, dA_cumsum, scale, ngroups, dstate)
 
 
 def _chunk_scan_bwd_dC_impl(dy, prev_states, dA_cumsum, scale, ngroups, dstate_unused=None):
@@ -949,6 +947,7 @@ def _chunk_state_bwd_dx_kernel(
         ds_vals = tl.load(off_ds + offs_p[:, None] * stride_ds_hdim + k_offs[None, :] * stride_ds_dstate,
                           mask=(offs_p[:, None] < headdim) & k_mask[None, :], other=0.0).to(tl.float32)
         acc += tl.dot(b_vals, tl.trans(ds_vals))
+    unweighted_acc = acc
     acc = acc * weight[:, None]
 
     off_dx = dx_ptr + pid_b * stride_dx_batch + pid_c * stride_dx_chunk
@@ -957,34 +956,15 @@ def _chunk_state_bwd_dx_kernel(
              mask=(offs_l[:, None] < chunk_size) & (offs_p[None, :] < headdim))
 
     # ddt[l,h] = decay[l] * sum_p x[l,h,p] * (sum_n B[l,g,n]*d_states[h,p,n])
-    # = decay[l] * sum_p x[l,p] * (acc[l,p] / weight[l]) = sum_p x[l,p] * acc_unweighted[l,p]
-    # where acc before weighting = acc / weight. Easier: ddt = sum_p x * dx / dt
-    # Compute only for first p-block to avoid race, then accumulate
-    if pid_n == 0:
-        off_bc_x = pid_b * stride_x_batch + pid_c * stride_x_chunk
-        ddt_acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
-        for p_start in range(0, headdim, BLOCK_N):
-            p_offs2 = p_start + tl.arange(0, BLOCK_N)
-            p_mask = p_offs2 < headdim
-            x_vals = tl.load(x_ptr + off_bc_x + offs_l[:, None] * stride_x_seqlen + pid_h * stride_x_head + p_offs2[None, :] * stride_x_hdim,
-                             mask=(offs_l[:, None] < chunk_size) & p_mask[None, :], other=0.0).to(tl.float32)
-            # Reload dx for this p range (we computed it above for one p-block, need all)
-            # Recompute acc for this p range
-            acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-            for k_start2 in range(0, dstate, BLOCK_K):
-                k_offs2 = k_start2 + tl.arange(0, BLOCK_K)
-                k_mask2 = k_offs2 < dstate
-                b_vals2 = tl.load(B_ptr + off_bc_B + offs_l[:, None] * stride_B_seqlen + group_idx * stride_B_group + k_offs2[None, :] * stride_B_dstate,
-                                  mask=(offs_l[:, None] < chunk_size) & k_mask2[None, :], other=0.0).to(tl.float32)
-                ds_vals2 = tl.load(off_ds + p_offs2[:, None] * stride_ds_hdim + k_offs2[None, :] * stride_ds_dstate,
-                                   mask=p_mask[:, None] & k_mask2[None, :], other=0.0).to(tl.float32)
-                acc2 += tl.dot(b_vals2, tl.trans(ds_vals2))
-            # ddt += decay * sum_p x * acc2
-            ddt_acc += tl.sum(x_vals * acc2, axis=1)
-        ddt_acc = ddt_acc * decay
-        off_ddt = ddt_ptr + pid_b * stride_ddt_batch + pid_c * stride_ddt_chunk
-        tl.store(off_ddt + offs_l * stride_ddt_seqlen + pid_h * stride_ddt_head,
-                 ddt_acc, mask=offs_l < chunk_size)
+    # = decay[l] * sum_p x[l,p] * unweighted_acc[l,p]
+    off_bc_x = pid_b * stride_x_batch + pid_c * stride_x_chunk
+    x_vals = tl.load(x_ptr + off_bc_x + offs_l[:, None] * stride_x_seqlen + pid_h * stride_x_head + offs_p[None, :] * stride_x_hdim,
+                     mask=(offs_l[:, None] < chunk_size) & (offs_p[None, :] < headdim), other=0.0).to(tl.float32)
+    
+    ddt_partial = tl.sum(x_vals * unweighted_acc, axis=1) * decay
+    off_ddt = ddt_ptr + pid_b * stride_ddt_batch + pid_c * stride_ddt_chunk
+    tl.atomic_add(off_ddt + offs_l * stride_ddt_seqlen + pid_h * stride_ddt_head,
+                  ddt_partial, mask=offs_l < chunk_size)
 
 
 def chunk_state_bwd_dx(d_states, B, x, dt, dA_cumsum):
@@ -998,7 +978,7 @@ def chunk_state_bwd_dx(d_states, B, x, dt, dA_cumsum):
     ngroups = B.shape[3]
     nheads_per_group = nheads // ngroups
     dx = torch.empty(batch, nchunks, L, nheads, headdim, device=x.device, dtype=x.dtype)
-    ddt = torch.empty(batch, nchunks, L, nheads, device=x.device, dtype=torch.float32)
+    ddt = torch.zeros(batch, nchunks, L, nheads, device=x.device, dtype=torch.float32)
     BLOCK_M = min(64, triton.next_power_of_2(L))
     BLOCK_N = min(64, triton.next_power_of_2(headdim))
     BLOCK_K = min(64, triton.next_power_of_2(dstate))
@@ -1079,10 +1059,9 @@ def _chunk_state_bwd_dB_kernel(
              acc, mask=(offs_l[:, None] < chunk_size) & (offs_n[None, :] < dstate))
 
 
-def chunk_state_bwd_dB(d_states, x, dt, dA_cumsum):
+def chunk_state_bwd_dB(d_states, x, dt, dA_cumsum, ngroups):
     batch, nchunks, nheads, headdim, dstate = d_states.shape
     L = x.shape[2]
-    ngroups = d_states.shape[2] // (nheads // 1)  # Will be set properly by orchestrator
     return _chunk_state_bwd_dB_impl(d_states, x, dt, dA_cumsum, ngroups)
 
 
@@ -1242,7 +1221,7 @@ def chunk_scan_bwd_ddt_ddA(dy, x, dt, CB, dA_cumsum, C, prev_states, ngroups, sc
         # L[m,k,h] = exp(min(dA_cs[m]-dA_cs[k], 0)) with causal mask
         log_L = dA_c.unsqueeze(2) - dA_c.unsqueeze(1)  # (B, L, L, H)
         causal = torch.arange(L, device=dy.device)
-        causal_mask = causal.unsqueeze(0) >= causal.unsqueeze(1)  # (L, L) lower-triangular
+        causal_mask = causal.unsqueeze(1) >= causal.unsqueeze(0)  # (L, L) lower-triangular
         log_L_clamped = torch.clamp(log_L, max=0.0)
         L_mat = torch.exp(log_L_clamped) * causal_mask.unsqueeze(0).unsqueeze(-1)  # (B, L, L, H)
 

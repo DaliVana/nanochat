@@ -27,7 +27,28 @@ SPECIAL_TOKENS = [
 # NOTE: this split pattern deviates from GPT-4 in that we use \p{N}{1,2} instead of \p{N}{1,3}
 # I did this because I didn't want to "waste" too many tokens on numbers for smaller vocab sizes.
 # I verified that 2 is the sweet spot for vocab size of 32K. 1 is a bit worse, 3 was worse still.
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+SPLIT_PATTERN = r"""[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+(?:'[\p{L}\p{M}]+)*|0[xXbBoO][\p{N}a-fA-F]+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
+
+# OpenAI's o200k_harmony special tokens (used by GPT-4o/GPT-5 models)
+# Built on o200k_base with structured tokens for the "harmony" response format
+O200K_HARMONY_SPECIAL_TOKENS = {
+    "<|startoftext|>": 199998,
+    "<|endoftext|>": 199999,
+    "<|reserved_200000|>": 200000,
+    "<|reserved_200001|>": 200001,
+    "<|return|>": 200002,
+    "<|constrain|>": 200003,
+    "<|reserved_200004|>": 200004,
+    "<|channel|>": 200005,
+    "<|start|>": 200006,
+    "<|end|>": 200007,
+    "<|message|>": 200008,
+    "<|reserved_200009|>": 200009,
+    "<|reserved_200010|>": 200010,
+    "<|reserved_200011|>": 200011,
+    "<|call|>": 200012,
+    **{f"<|reserved_{i}|>": i for i in range(200013, 201088)},
+}
 
 # -----------------------------------------------------------------------------
 # Generic GPT-4-style tokenizer based on HuggingFace Tokenizer
@@ -404,3 +425,21 @@ def get_token_bytes(device="cpu"):
     with open(token_bytes_path, "rb") as f:
         token_bytes = torch.load(f, map_location=device)
     return token_bytes
+
+def get_o200k_harmony_tokenizer():
+    enc = tiktoken.get_encoding("o200k_harmony")
+    return RustBPETokenizer(enc, "<|startoftext|>")
+
+def compute_token_bytes(tokenizer, device="cpu"):
+    """Compute token_bytes tensor for any tokenizer (for bpb evaluation)."""
+    import torch
+    vocab_size = tokenizer.get_vocab_size()
+    special_set = set(tokenizer.get_special_tokens())
+    token_bytes_list = []
+    for token_id in range(vocab_size):
+        token_str = tokenizer.decode([token_id])
+        if token_str in special_set:
+            token_bytes_list.append(0)
+        else:
+            token_bytes_list.append(len(token_str.encode("utf-8")))
+    return torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
