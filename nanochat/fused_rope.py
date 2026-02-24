@@ -111,7 +111,7 @@ def _fused_rms_norm_kernel(
     variance = tl.sum(x_sq, axis=0) / d_model
     
     # Rsqrt and normalize
-    rsqrt = tl.math.rsqrt(variance + eps)
+    rsqrt = tl.rsqrt(variance + eps)
     y = x * rsqrt
     
     tl.store(y_base + offs_d, y.to(x_ptr.dtype.element_ty), mask=mask)

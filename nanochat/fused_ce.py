@@ -12,6 +12,13 @@ import triton.language as tl
 
 
 @triton.jit
+def _tanh(x):
+    # Portable tanh: works across all Triton versions
+    exp2x = tl.exp(2.0 * x)
+    return (exp2x - 1.0) / (exp2x + 1.0)
+
+
+@triton.jit
 def _fused_cross_entropy_fwd_kernel(
     X_ptr, W_ptr, targets_ptr,
     loss_ptr, lse_ptr,
@@ -61,7 +68,7 @@ def _fused_cross_entropy_fwd_kernel(
 
         # Apply Softcap
         if softcap > 0.0:
-            logits = softcap * tl.math.tanh(logits / softcap)
+            logits = softcap * _tanh(logits / softcap)
 
         # Update running max and sum for logsumexp
         # Mask out out-of-bounds N
@@ -98,7 +105,7 @@ def _fused_cross_entropy_fwd_kernel(
         target_logits += target_logit_block_vals
 
     # Finalize logsumexp
-    lse = m_i + tl.math.log(l_i)
+    lse = m_i + tl.log(l_i)
     
     # Loss = lse - target_logit
     loss = lse - target_logits
@@ -161,7 +168,7 @@ def _fused_cross_entropy_bwd_kernel(
 
     # Re-apply softcap
     if softcap > 0.0:
-        tanh_val = tl.math.tanh(logits_pre_cap / softcap)
+        tanh_val = _tanh(logits_pre_cap / softcap)
         logits = softcap * tanh_val
         # derivative of softcap * tanh(x / softcap) is 1 - tanh^2(x / softcap)
         d_softcap = 1.0 - tanh_val * tanh_val
