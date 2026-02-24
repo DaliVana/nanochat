@@ -43,77 +43,6 @@ def chunk_cumsum(dt, A, chunk_size):
 
 
 # =============================================================================
-# Kernel 2: bmm_chunk — CB = C @ B^T per chunk, in grouped space
-# =============================================================================
-
-@triton.jit
-def _bmm_chunk_fwd_kernel(
-    C_ptr, B_ptr, CB_ptr,
-    stride_C_batch, stride_C_chunk, stride_C_seqlen, stride_C_group, stride_C_dstate,
-    stride_B_batch, stride_B_chunk, stride_B_seqlen, stride_B_group, stride_B_dstate,
-    stride_CB_batch, stride_CB_chunk, stride_CB_group, stride_CB_m, stride_CB_n,
-    chunk_size: tl.constexpr, dstate: tl.constexpr, ngroups: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-):
-    # Grid: (cdiv(L,BM)*cdiv(L,BN), batch, nchunks*ngroups)
-    pid_mn = tl.program_id(0)
-    pid_b = tl.program_id(1)
-    pid_cg = tl.program_id(2)
-    pid_c = pid_cg // ngroups
-    pid_g = pid_cg % ngroups
-
-    pid_m = pid_mn // tl.cdiv(chunk_size, BLOCK_N)
-    pid_n = pid_mn % tl.cdiv(chunk_size, BLOCK_N)
-
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-    C_base = C_ptr + pid_b * stride_C_batch + pid_c * stride_C_chunk + pid_g * stride_C_group
-    B_base = B_ptr + pid_b * stride_B_batch + pid_c * stride_B_chunk + pid_g * stride_B_group
-
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k_start in range(0, dstate, BLOCK_K):
-        k_offs = k_start + tl.arange(0, BLOCK_K)
-        k_mask = k_offs < dstate
-        c = tl.load(C_base + offs_m[:, None] * stride_C_seqlen + k_offs[None, :] * stride_C_dstate,
-                     mask=(offs_m[:, None] < chunk_size) & k_mask[None, :], other=0.0).to(tl.float32)
-        b = tl.load(B_base + offs_n[:, None] * stride_B_seqlen + k_offs[None, :] * stride_B_dstate,
-                     mask=(offs_n[:, None] < chunk_size) & k_mask[None, :], other=0.0).to(tl.float32)
-        acc += tl.dot(c, tl.trans(b))
-
-    CB_base = CB_ptr + pid_b * stride_CB_batch + pid_c * stride_CB_chunk + pid_g * stride_CB_group
-    tl.store(CB_base + offs_m[:, None] * stride_CB_m + offs_n[None, :] * stride_CB_n,
-             acc, mask=(offs_m[:, None] < chunk_size) & (offs_n[None, :] < chunk_size))
-
-
-def bmm_chunk_fwd(C, B, chunk_size):
-    """
-    Args:
-        C: (batch, nchunks, chunk_size, ngroups, dstate)
-        B: (batch, nchunks, chunk_size, ngroups, dstate)
-    Returns:
-        CB: (batch, nchunks, ngroups, chunk_size, chunk_size) float32
-    """
-    batch, nchunks, L, ngroups, dstate = C.shape
-    CB = torch.empty(batch, nchunks, ngroups, L, L, device=C.device, dtype=torch.float32)
-
-    BLOCK_M = min(64, triton.next_power_of_2(L))
-    BLOCK_N = min(64, triton.next_power_of_2(L))
-    BLOCK_K = min(64, triton.next_power_of_2(dstate))
-    grid = (triton.cdiv(L, BLOCK_M) * triton.cdiv(L, BLOCK_N), batch, nchunks * ngroups)
-
-    _bmm_chunk_fwd_kernel[grid](
-        C, B, CB,
-        C.stride(0), C.stride(1), C.stride(2), C.stride(3), C.stride(4),
-        B.stride(0), B.stride(1), B.stride(2), B.stride(3), B.stride(4),
-        CB.stride(0), CB.stride(1), CB.stride(2), CB.stride(3), CB.stride(4),
-        chunk_size=L, dstate=dstate, ngroups=ngroups,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-    )
-    return CB
-
-
-# =============================================================================
 # Kernel 3: chunk_state — compute per-chunk state deltas
 # =============================================================================
 
@@ -298,9 +227,9 @@ def state_passing_fwd(states, dA_cumsum_last):
 
 @triton.jit
 def _chunk_scan_fwd_kernel(
-    CB_ptr, x_ptr, dt_ptr, dA_cumsum_ptr, C_ptr, prev_states_ptr, out_ptr,
-    # CB: (batch, nchunks, ngroups, chunk_size, chunk_size)
-    stride_CB_batch, stride_CB_chunk, stride_CB_group, stride_CB_m, stride_CB_n,
+    B_ptr, x_ptr, dt_ptr, dA_cumsum_ptr, C_ptr, prev_states_ptr, out_ptr,
+    # B: (batch, nchunks, chunk_size, ngroups, dstate)
+    stride_B_batch, stride_B_chunk, stride_B_seqlen, stride_B_group, stride_B_dstate,
     # x: (batch, nchunks, chunk_size, nheads, headdim)
     stride_x_batch, stride_x_chunk, stride_x_seqlen, stride_x_head, stride_x_hdim,
     # dt: (batch, nchunks, chunk_size, nheads)
@@ -321,7 +250,7 @@ def _chunk_scan_fwd_kernel(
     BLOCK_DSTATE: tl.constexpr,
 ):
     """
-    y[m,h,:] = scale * sum_k L[m,k,h] * CB[m,k,g(h)] * dt[k,h] * x[k,h,:]
+    y[m,h,:] = scale * sum_k L[m,k,h] * (C[m,g(h),:] @ B[k,g(h),:]) * dt[k,h] * x[k,h,:]
              + scale * exp(dA_cs[m,h]) * C[m,g(h),:] @ prev_states[h,:,:]
     L[m,k,h] = exp(min(dA_cs[m,h] - dA_cs[k,h], 0)) for k<=m, 0 otherwise.
     L is computed tile-by-tile in registers, never stored to global memory.
@@ -343,7 +272,7 @@ def _chunk_scan_fwd_kernel(
 
     # Base offsets for this (batch, chunk)
     off_bc_dA = pid_b * stride_dA_batch + pid_c * stride_dA_chunk
-    off_bc_CB = pid_b * stride_CB_batch + pid_c * stride_CB_chunk + group_idx * stride_CB_group
+    off_bc_B = pid_b * stride_B_batch + pid_c * stride_B_chunk + group_idx * stride_B_group
     off_bc_dt = pid_b * stride_dt_batch + pid_c * stride_dt_chunk
     off_bc_x = pid_b * stride_x_batch + pid_c * stride_x_chunk
     off_bc_C = pid_b * stride_C_batch + pid_c * stride_C_chunk
@@ -367,15 +296,23 @@ def _chunk_scan_fwd_kernel(
 
     acc = acc * (tl.exp(dA_cs_m)[:, None] * scale)
 
-    # --- Intra-chunk: scale * sum_k L[m,k] * CB[m,k] * dt[k] * x[k] ---
+    # --- Intra-chunk: scale * sum_k L[m,k] * (C[m]@B[k]^T) * dt[k] * x[k] ---
     k_max = tl.minimum((pid_m + 1) * BLOCK_M, chunk_size)
     for k_start in range(0, k_max, BLOCK_K):
         k_offs = k_start + tl.arange(0, BLOCK_K)
         k_mask = k_offs < chunk_size
 
-        # CB[m, k]
-        cb = tl.load(CB_ptr + off_bc_CB + offs_m[:, None] * stride_CB_m + k_offs[None, :] * stride_CB_n,
-                     mask=(offs_m[:, None] < chunk_size) & k_mask[None, :], other=0.0).to(tl.float32)
+        # Compute CB[m, k] = C[m] @ B[k]^T on the fly
+        cb = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+        for d_start in range(0, dstate, BLOCK_DSTATE):
+            d_offs = d_start + tl.arange(0, BLOCK_DSTATE)
+            d_mask = d_offs < dstate
+            
+            c_vals2 = tl.load(C_ptr + off_bc_C + offs_m[:, None] * stride_C_seqlen + group_idx * stride_C_group + d_offs[None, :] * stride_C_dstate,
+                             mask=(offs_m[:, None] < chunk_size) & d_mask[None, :], other=0.0).to(tl.float32)
+            b_vals = tl.load(B_ptr + off_bc_B + k_offs[:, None] * stride_B_seqlen + d_offs[None, :] * stride_B_dstate,
+                             mask=(k_offs[:, None] < chunk_size) & d_mask[None, :], other=0.0).to(tl.float32)
+            cb += tl.dot(c_vals2, tl.trans(b_vals))
 
         # === L computed tile-by-tile, NEVER stored to global memory ===
         dA_cs_k = tl.load(dA_cumsum_ptr + off_bc_dA + k_offs * stride_dA_seqlen + pid_h * stride_dA_head,
@@ -404,10 +341,10 @@ def _chunk_scan_fwd_kernel(
              mask=(offs_m[:, None] < chunk_size) & (offs_n[None, :] < headdim))
 
 
-def chunk_scan_fwd(CB, x, dt, dA_cumsum, C, prev_states, scale, chunk_size):
+def chunk_scan_fwd(B, x, dt, dA_cumsum, C, prev_states, scale, chunk_size):
     """
     Args:
-        CB:          (batch, nchunks, ngroups, chunk_size, chunk_size)
+        B:           (batch, nchunks, chunk_size, ngroups, dstate)
         x:           (batch, nchunks, chunk_size, nheads, headdim)
         dt:          (batch, nchunks, chunk_size, nheads)
         dA_cumsum:   (batch, nchunks, chunk_size, nheads)
@@ -432,8 +369,8 @@ def chunk_scan_fwd(CB, x, dt, dA_cumsum, C, prev_states, scale, chunk_size):
     grid = (triton.cdiv(L, BLOCK_M) * triton.cdiv(headdim, BLOCK_N), batch * nchunks, nheads)
 
     _chunk_scan_fwd_kernel[grid](
-        CB, x, dt, dA_cumsum, C, prev_states, out,
-        CB.stride(0), CB.stride(1), CB.stride(2), CB.stride(3), CB.stride(4),
+        B, x, dt, dA_cumsum, C, prev_states, out,
+        B.stride(0), B.stride(1), B.stride(2), B.stride(3), B.stride(4),
         x.stride(0), x.stride(1), x.stride(2), x.stride(3), x.stride(4),
         dt.stride(0), dt.stride(1), dt.stride(2), dt.stride(3),
         dA_cumsum.stride(0), dA_cumsum.stride(1), dA_cumsum.stride(2), dA_cumsum.stride(3),
@@ -444,6 +381,8 @@ def chunk_scan_fwd(CB, x, dt, dA_cumsum, C, prev_states, scale, chunk_size):
         nheads=nheads, ngroups=ngroups, nheads_per_group=nheads_per_group,
         nchunks=nchunks, scale=scale,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_DSTATE=BLOCK_DSTATE,
+        num_warps=8,
+        num_stages=4,
     )
     return out
 
@@ -481,18 +420,15 @@ def ssd_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, scale):
     # Step 1: cumsum
     dA_cumsum, dt_c = chunk_cumsum(dt, A, chunk_size)
 
-    # Step 2: CB = C @ B^T (in grouped space)
-    CB = bmm_chunk_fwd(C_c, B_c, chunk_size)
-
-    # Step 3: per-chunk state deltas
+    # Step 2: per-chunk state deltas
     states = chunk_state_fwd(B_c, x_c, dt_c, dA_cumsum)
 
     # Step 4: propagate states across chunks
     dA_last = dA_cumsum[:, :, -1, :]  # (batch, nchunks, nheads)
     prev_states = state_passing_fwd(states, dA_last)
 
-    # Step 5: fused chunk scan (L computed tile-by-tile, never materialized)
-    y = chunk_scan_fwd(CB, x_c, dt_c, dA_cumsum, C_c, prev_states, scale, chunk_size)
+    # Step 4: fused chunk scan (L computed tile-by-tile, never materialized)
+    y = chunk_scan_fwd(B_c, x_c, dt_c, dA_cumsum, C_c, prev_states, scale, chunk_size)
 
     return y.view(batch, seqlen, nheads, headdim)
 
@@ -787,15 +723,17 @@ def chunk_scan_bwd_dCB(dy, x, dt, dA_cumsum, ngroups, scale):
 
 @triton.jit
 def _chunk_scan_bwd_dx_kernel(
-    dy_ptr, CB_ptr, dt_ptr, dA_cumsum_ptr, dx_ptr,
+    dy_ptr, C_ptr, B_ptr, dt_ptr, dA_cumsum_ptr, dx_ptr,
     stride_dy_batch, stride_dy_chunk, stride_dy_seqlen, stride_dy_head, stride_dy_hdim,
-    stride_CB_batch, stride_CB_chunk, stride_CB_group, stride_CB_m, stride_CB_n,
+    stride_C_batch, stride_C_chunk, stride_C_seqlen, stride_C_group, stride_C_dstate,
+    stride_B_batch, stride_B_chunk, stride_B_seqlen, stride_B_group, stride_B_dstate,
     stride_dt_batch, stride_dt_chunk, stride_dt_seqlen, stride_dt_head,
     stride_dA_batch, stride_dA_chunk, stride_dA_seqlen, stride_dA_head,
     stride_dx_batch, stride_dx_chunk, stride_dx_seqlen, stride_dx_head, stride_dx_hdim,
-    chunk_size: tl.constexpr, headdim: tl.constexpr,
+    chunk_size: tl.constexpr, headdim: tl.constexpr, dstate: tl.constexpr,
     nheads_per_group: tl.constexpr, nchunks: tl.constexpr, scale: tl.constexpr,
     BLOCK_K: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_M: tl.constexpr,
+    BLOCK_DSTATE: tl.constexpr,
 ):
     """
     Grid: (cdiv(L,BK)*cdiv(headdim,BN), batch*nchunks, nheads)
@@ -813,7 +751,8 @@ def _chunk_scan_bwd_dx_kernel(
     group_idx = pid_h // nheads_per_group
 
     off_bc_dy = pid_b * stride_dy_batch + pid_c * stride_dy_chunk
-    off_bc_CB = pid_b * stride_CB_batch + pid_c * stride_CB_chunk + group_idx * stride_CB_group
+    off_bc_C = pid_b * stride_C_batch + pid_c * stride_C_chunk + group_idx * stride_C_group
+    off_bc_B = pid_b * stride_B_batch + pid_c * stride_B_chunk + group_idx * stride_B_group
     off_bc_dA = pid_b * stride_dA_batch + pid_c * stride_dA_chunk
     off_bc_dt = pid_b * stride_dt_batch + pid_c * stride_dt_chunk
 
@@ -831,9 +770,18 @@ def _chunk_scan_bwd_dx_kernel(
                           mask=m_mask, other=0.0).to(tl.float32)
         L_tile = tl.exp(tl.minimum(dA_cs_m[:, None] - dA_cs_k[None, :], 0.0))  # (BM, BK)
         L_tile = tl.where(m_offs[:, None] >= offs_k[None, :], L_tile, 0.0)
-        # CB[m, k, g]
-        cb = tl.load(CB_ptr + off_bc_CB + m_offs[:, None] * stride_CB_m + offs_k[None, :] * stride_CB_n,
-                     mask=m_mask[:, None] & (offs_k[None, :] < chunk_size), other=0.0).to(tl.float32)
+        # cb[m, k, g] = C[m] @ B[k]^T on the fly
+        cb = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+        for d_start in range(0, dstate, BLOCK_DSTATE):
+            d_offs = d_start + tl.arange(0, BLOCK_DSTATE)
+            d_mask = d_offs < dstate
+            
+            c_vals2 = tl.load(C_ptr + off_bc_C + m_offs[:, None] * stride_C_seqlen + d_offs[None, :] * stride_C_dstate,
+                             mask=(m_offs[:, None] < chunk_size) & d_mask[None, :], other=0.0).to(tl.float32)
+            b_vals = tl.load(B_ptr + off_bc_B + offs_k[:, None] * stride_B_seqlen + d_offs[None, :] * stride_B_dstate,
+                             mask=(offs_k[:, None] < chunk_size) & d_mask[None, :], other=0.0).to(tl.float32)
+            cb += tl.dot(c_vals2, tl.trans(b_vals))
+
         # score[m,k] = scale * L[m,k] * CB[m,k,g]
         score = scale * L_tile * cb  # (BM, BK)
         # dy[m, h, p]: (BM, BN)
@@ -853,11 +801,12 @@ def _chunk_scan_bwd_dx_kernel(
              mask=(offs_k[:, None] < chunk_size) & (offs_n[None, :] < headdim))
 
 
-def chunk_scan_bwd_dx(dy, CB, dt, dA_cumsum, scale):
+def chunk_scan_bwd_dx(dy, C, B, dt, dA_cumsum, scale):
     """
     Args:
         dy:         (batch, nchunks, chunk_size, nheads, headdim)
-        CB:         (batch, nchunks, ngroups, chunk_size, chunk_size)
+        C:          (batch, nchunks, chunk_size, ngroups, dstate)
+        B:          (batch, nchunks, chunk_size, ngroups, dstate)
         dt:         (batch, nchunks, chunk_size, nheads)
         dA_cumsum:  (batch, nchunks, chunk_size, nheads)
         scale:      float
@@ -865,23 +814,28 @@ def chunk_scan_bwd_dx(dy, CB, dt, dA_cumsum, scale):
         dx: (batch, nchunks, chunk_size, nheads, headdim) same dtype as dy
     """
     batch, nchunks, L, nheads, headdim = dy.shape
-    ngroups = CB.shape[2]
+    ngroups = C.shape[3]
+    dstate = C.shape[4]
     nheads_per_group = nheads // ngroups
     dx = torch.empty_like(dy)
     BLOCK_K = min(64, triton.next_power_of_2(L))
     BLOCK_N = min(64, triton.next_power_of_2(headdim))
     BLOCK_M = min(64, triton.next_power_of_2(L))
+    BLOCK_DSTATE = min(64, triton.next_power_of_2(dstate))
     grid = (triton.cdiv(L, BLOCK_K) * triton.cdiv(headdim, BLOCK_N), batch * nchunks, nheads)
     _chunk_scan_bwd_dx_kernel[grid](
-        dy, CB, dt, dA_cumsum, dx,
+        dy, C, B, dt, dA_cumsum, dx,
         dy.stride(0), dy.stride(1), dy.stride(2), dy.stride(3), dy.stride(4),
-        CB.stride(0), CB.stride(1), CB.stride(2), CB.stride(3), CB.stride(4),
+        C.stride(0), C.stride(1), C.stride(2), C.stride(3), C.stride(4),
+        B.stride(0), B.stride(1), B.stride(2), B.stride(3), B.stride(4),
         dt.stride(0), dt.stride(1), dt.stride(2), dt.stride(3),
         dA_cumsum.stride(0), dA_cumsum.stride(1), dA_cumsum.stride(2), dA_cumsum.stride(3),
         dx.stride(0), dx.stride(1), dx.stride(2), dx.stride(3), dx.stride(4),
-        chunk_size=L, headdim=headdim,
+        chunk_size=L, headdim=headdim, dstate=dstate,
         nheads_per_group=nheads_per_group, nchunks=nchunks, scale=scale,
-        BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N, BLOCK_M=BLOCK_M,
+        BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N, BLOCK_M=BLOCK_M, BLOCK_DSTATE=BLOCK_DSTATE,
+        num_warps=8,
+        num_stages=4,
     )
     return dx
 
@@ -1170,7 +1124,7 @@ def chunk_cumsum_bwd(d_dA_cumsum, A, dt_chunked):
     return ddt, dA
 
 
-def chunk_scan_bwd_ddt_ddA(dy, x, dt, CB, dA_cumsum, C, prev_states, ngroups, scale):
+def chunk_scan_bwd_ddt_ddA(dy, x, dt, B, dA_cumsum, C, prev_states, ngroups, scale):
     """
     Compute ddt and d_dA_cumsum from both intra-chunk and inter-chunk.
     Processes one chunk at a time to avoid materializing full L.
@@ -1179,7 +1133,7 @@ def chunk_scan_bwd_ddt_ddA(dy, x, dt, CB, dA_cumsum, C, prev_states, ngroups, sc
         dy:          (batch, nchunks, L, nheads, headdim)
         x:           (batch, nchunks, L, nheads, headdim)
         dt:          (batch, nchunks, L, nheads)
-        CB:          (batch, nchunks, ngroups, L, L)
+        B:           (batch, nchunks, L, ngroups, dstate)
         dA_cumsum:   (batch, nchunks, L, nheads)
         C:           (batch, nchunks, L, ngroups, dstate)
         prev_states: (batch, nchunks, nheads, headdim, dstate)
@@ -1228,8 +1182,9 @@ def chunk_scan_bwd_ddt_ddA(dy, x, dt, CB, dA_cumsum, C, prev_states, ngroups, sc
         # D[m,k,h] = sum_p dy[m,h,p]*x[k,h,p]
         D = torch.einsum('bmhp, bkhp -> bmkh', dy_c, x_c)  # (B, L, L, H)
 
-        # Expand CB for per-head
-        CB_c = CB[:, c].float()  # (B, ng, L, L)
+        # Expand local chunk CB for per-head
+        B_c = B[:, c].float()
+        CB_c = torch.einsum('blgd,bkgd->bglk', C_c, B_c)  # (B, ng, L, L)
         if ngroups < nheads:
             CB_exp = CB_c.repeat_interleave(nheads_per_group, dim=1)  # (B, H, L, L)
         else:
@@ -1287,7 +1242,6 @@ def ssd_chunk_scan_combined_bwd(dy, x, dt, A, B, C, chunk_size, scale):
 
     # Recompute cheap forward intermediates
     dA_cumsum, dt_c = chunk_cumsum(dt, A, chunk_size)
-    CB = bmm_chunk_fwd(C_c, B_c, chunk_size)
     states = chunk_state_fwd(B_c, x_c, dt_c, dA_cumsum)
     dA_last = dA_cumsum[:, :, -1, :]
     prev_states = state_passing_fwd(states, dA_last)
@@ -1296,7 +1250,7 @@ def ssd_chunk_scan_combined_bwd(dy, x, dt, A, B, C, chunk_size, scale):
     d_prev_states = chunk_scan_bwd_dstates(dy_c, C_c, dA_cumsum, prev_states, scale)
     dC = _chunk_scan_bwd_dC_impl(dy_c, prev_states, dA_cumsum, scale, ngroups)
     dCB = chunk_scan_bwd_dCB(dy_c, x_c, dt_c, dA_cumsum, ngroups, scale)
-    dx = chunk_scan_bwd_dx(dy_c, CB, dt_c, dA_cumsum, scale)
+    dx = chunk_scan_bwd_dx(dy_c, C_c, B_c, dt_c, dA_cumsum, scale)
 
     # Step 4': state_passing backward (PyTorch)
     d_states, d_dA_last = state_passing_bwd(d_prev_states, prev_states, dA_last)
@@ -1310,7 +1264,7 @@ def ssd_chunk_scan_combined_bwd(dy, x, dt, A, B, C, chunk_size, scale):
 
     # Compute ddt and d_dA_cumsum from intra+inter chunk (PyTorch, per-chunk)
     ddt_scan, d_dA_cumsum = chunk_scan_bwd_ddt_ddA(
-        dy_c, x_c, dt_c, CB, dA_cumsum, C_c, prev_states, ngroups, scale
+        dy_c, x_c, dt_c, B_c, dA_cumsum, C_c, prev_states, ngroups, scale
     )
 
     # Add d_dA_last contribution from state_passing backward
