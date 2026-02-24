@@ -264,19 +264,14 @@ def disable_fp8(model):
 
 orig_model = model
 torch._dynamo.config.capture_scalar_outputs = True
-# Save uncompiled blocks for generation (where seq_len varies per step).
-_raw_blocks = list(orig_model.transformer.h)
-# Compile each block as a whole unit. SSD forward/backward are custom ops so
-# torch.compile treats them as opaque nodes and fuses surrounding ops (conv1d,
-# silu, rms_norm, gating). dynamic=False because training shapes are fixed within each phase.
+# Whole-model compile: SSD forward/backward are registered as custom ops so
+# torch.compile treats them as opaque nodes and fuses surrounding ops. Whole-model
+# (vs per-block) eliminates Python overhead at block boundaries and enables cross-block
+# fusion. dynamic=False because training shapes are fixed within each phase.
 # Skip compilation on MPS — Metal shader compiler can't handle large-vocab kernels.
 if device_type == "cuda":
-    _compiled_blocks = [torch.compile(block, dynamic=False) for block in _raw_blocks]
-    for i in range(len(orig_model.transformer.h)):
-        orig_model.transformer.h[i] = _compiled_blocks[i]
-else:
-    _compiled_blocks = _raw_blocks
-model = orig_model
+    model = torch.compile(model, dynamic=False)
+
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations
@@ -465,14 +460,8 @@ while True:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (current_batch_size * current_seq_len * ddp_world_size)
-        # Swap in uncompiled blocks for eval (avoids MPS shader compilation failures)
-        for i in range(len(_raw_blocks)):
-            orig_model.transformer.h[i] = _raw_blocks[i]
         with disable_fp8(orig_model), autocast_ctx:
             val_bpb = evaluate_bpb(orig_model, val_loader, eval_steps, token_bytes)
-        # Restore compiled blocks
-        for i in range(len(_compiled_blocks)):
-            orig_model.transformer.h[i] = _compiled_blocks[i]
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -488,14 +477,8 @@ while True:
     results = {}
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
-        # Swap in uncompiled blocks for eval (variable seq_len)
-        for i in range(len(_raw_blocks)):
-            orig_model.transformer.h[i] = _raw_blocks[i]
         with disable_fp8(orig_model), autocast_ctx:
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
-        # Restore compiled blocks
-        for i in range(len(_compiled_blocks)):
-            orig_model.transformer.h[i] = _compiled_blocks[i]
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
             "step": step,
@@ -517,18 +500,12 @@ while True:
             "My favorite color is",
             "If 5*x + 3 = 13, then x is",
         ]
-        # Swap in uncompiled blocks for generation (varying seq_len)
-        for i in range(len(_raw_blocks)):
-            orig_model.transformer.h[i] = _raw_blocks[i]
         engine = Engine(orig_model, tokenizer)
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|startoftext|>")
             with disable_fp8(orig_model), autocast_ctx:
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
-        # Restore compiled blocks for training
-        for i in range(len(_compiled_blocks)):
-            orig_model.transformer.h[i] = _compiled_blocks[i]
         model.train()
 
     # save checkpoint
@@ -632,11 +609,10 @@ while True:
 
     if first_step_of_run:
         gc.collect()
-        # NOTE: Unlike base_train.py, we do NOT freeze/disable GC here.
-        # Samba uses per-block compilation (not whole-model), so the main forward
-        # loop runs in eager Python, creating autograd objects at block boundaries
-        # that need periodic garbage collection. The base model's whole-model
-        # torch.compile uses compiled autograd (C++) which doesn't need Python GC.
+        gc.freeze()
+        gc.disable()
+    elif step % 5000 == 0:
+        gc.collect()
 
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")

@@ -330,7 +330,12 @@ class GPTSamba(nn.Module):
         """
         Return estimated FLOPs per token (forward + backward).
         Attention layers: 6 * matmul_params + 12*h*q*effective_seq
-        Mamba layers: 6 * matmul_params + 12 * d_inner * d_state (SSD state-space ops)
+        Mamba layers: 6 * matmul_params + SSD ops (within-chunk + between-chunk)
+
+        SSD FLOPs per token per layer (forward+backward = 3× forward):
+          CB computation (like QK^T):    6 * chunk_size * ngroups * d_state
+          Weighted sum (like AV):        6 * chunk_size * d_inner
+          State delta + contribution:   12 * d_inner * d_state
         """
         nparams = sum(p.numel() for p in self.parameters())
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
@@ -356,8 +361,14 @@ class GPTSamba(nn.Module):
         # SSD FLOPs for Mamba layers
         d_inner = int(self.config.mamba_expand * self.config.n_embd)
         d_state = self.config.mamba_d_state
+        ngroups = self.config.mamba_ngroups
+        chunk_size = self.config.mamba_chunk_size
         n_mamba = sum(1 for lt in self.layer_types if lt == 'M')
-        ssd_flops = n_mamba * 12 * d_inner * d_state
+        ssd_flops = n_mamba * (
+            6 * chunk_size * ngroups * d_state   # CB (C @ B^T within each chunk)
+            + 6 * chunk_size * d_inner            # weighted sum (scores @ x*dt within chunk)
+            + 12 * d_inner * d_state              # state delta + state contribution (between chunks)
+        )
 
         num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops + ssd_flops
         return num_flops_per_token
