@@ -2,17 +2,15 @@
 Chunked Softcap Cross Entropy
 Replaces: `loss = F.cross_entropy(softcap * tanh(x @ weight.T / softcap), targets)`
 
-Uses cuBLAS (torch.matmul) for matmuls in chunks along the vocab dimension,
-avoiding materializing the full [B*T, V] logits tensor while retaining GEMM speed.
-The forward uses online logsumexp across vocab chunks; the backward recomputes
-logits per chunk and delegates the heavy GEMMs to cuBLAS.
+Uses cuBLAS for matmuls in chunks along the vocab dimension, avoiding
+materializing the full [B*T, V] logits tensor while retaining GEMM speed.
 """
 
 import torch
 
 # Vocab chunk size: trades peak memory for kernel launch overhead.
-# 4096 is a good default — each chunk is [M, 4096] in float32.
-_CHUNK_V = 4096
+# 16384 keeps per-chunk logits at ~1GB (float32) while limiting loop iterations.
+_CHUNK_V = 16384
 
 
 class ChunkedCrossEntropyLossFn(torch.autograd.Function):
@@ -34,9 +32,11 @@ class ChunkedCrossEntropyLossFn(torch.autograd.Function):
         max_logit = torch.full((M,), float('-inf'), device=x.device, dtype=torch.float32)
         sum_exp = torch.zeros(M, device=x.device, dtype=torch.float32)
         target_logits = torch.zeros(M, device=x.device, dtype=torch.float32)
+        rows = torch.arange(M, device=x.device)
 
         for n0 in range(0, N, _CHUNK_V):
             n1 = min(n0 + _CHUNK_V, N)
+            chunk_n = n1 - n0
 
             # cuBLAS GEMM: [M, K] @ [chunk, K]^T -> [M, chunk]
             logits = (x_flat @ w[n0:n1].T).float()
@@ -49,10 +49,10 @@ class ChunkedCrossEntropyLossFn(torch.autograd.Function):
             sum_exp = sum_exp * torch.exp(max_logit - new_max) + torch.exp(logits - new_max.unsqueeze(1)).sum(dim=1)
             max_logit = new_max
 
-            # Extract target logits for targets in this chunk
+            # Extract target logits — no .any() CUDA sync, always execute masked
             in_chunk = valid_mask & (targets_flat >= n0) & (targets_flat < n1)
-            if in_chunk.any():
-                target_logits[in_chunk] = logits[in_chunk, targets_flat[in_chunk] - n0]
+            local_idx = (targets_flat - n0).clamp(0, chunk_n - 1)
+            target_logits += torch.where(in_chunk, logits[rows, local_idx], target_logits.new_zeros(()))
 
         lse = max_logit + torch.log(sum_exp)
         loss = torch.where(valid_mask, lse - target_logits, lse.new_zeros(()))
@@ -91,11 +91,13 @@ class ChunkedCrossEntropyLossFn(torch.autograd.Function):
 
         dx = torch.zeros_like(x_flat)
         dw = torch.empty_like(w)
+        rows = torch.arange(M, device=x_flat.device)
 
         for n0 in range(0, N, _CHUNK_V):
             n1 = min(n0 + _CHUNK_V, N)
+            chunk_n = n1 - n0
 
-            # Recompute logits (cuBLAS) — both x_flat and w are same dtype
+            # Recompute logits (cuBLAS)
             logits = (x_flat @ w[n0:n1].T).float()
 
             if ctx.softcap > 0.0:
@@ -106,11 +108,11 @@ class ChunkedCrossEntropyLossFn(torch.autograd.Function):
                 logits_capped = logits
                 dsoftcap = 1.0
 
-            # dp = softmax - one_hot(target)
+            # dp = softmax - one_hot(target), no .any() CUDA sync
             dp = torch.exp(logits_capped - lse.unsqueeze(1))
             in_chunk = valid_mask & (targets_flat >= n0) & (targets_flat < n1)
-            if in_chunk.any():
-                dp[in_chunk, targets_flat[in_chunk] - n0] -= 1.0
+            local_idx = (targets_flat - n0).clamp(0, chunk_n - 1)
+            dp[rows, local_idx] -= in_chunk.float()
 
             # Zero out ignored tokens, apply softcap derivative
             dp *= valid_mask.unsqueeze(1)
