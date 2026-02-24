@@ -460,8 +460,9 @@ while True:
         if device_type == "cuda":
             torch.cuda.empty_cache()
         model.eval()
-        val_loader = build_val_loader()
-        eval_steps = args.eval_tokens // (current_batch_size * current_seq_len * ddp_world_size)
+        eval_batch_size = max(1, current_batch_size // 4)
+        val_loader = create_val_loader(eval_batch_size, current_seq_len)
+        eval_steps = args.eval_tokens // (eval_batch_size * current_seq_len * ddp_world_size)
         with disable_fp8(orig_model), autocast_ctx:
             val_bpb = evaluate_bpb(orig_model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
