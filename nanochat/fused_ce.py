@@ -9,13 +9,7 @@ the chunked matmul and the cross_entropy reduction on-the-fly in SRAM.
 import torch
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def _tanh(x):
-    # Portable tanh: works across all Triton versions
-    exp2x = tl.exp(2.0 * x)
-    return (exp2x - 1.0) / (exp2x + 1.0)
+from triton.language.extra.cuda import libdevice
 
 
 @triton.jit
@@ -64,11 +58,11 @@ def _fused_cross_entropy_fwd_kernel(
             w = tl.load(W_ptr + offs_n[None, :] * stride_wn + offs_k[:, None] * stride_wk,
                         mask=n_mask[None, :] & k_mask[:, None], other=0.0).to(tl.bfloat16)
 
-            logits += tl.dot(x, w).to(tl.float32)
+            logits += tl.dot(x, w)
 
         # Apply Softcap
         if softcap > 0.0:
-            logits = softcap * _tanh(logits / softcap)
+            logits = softcap * libdevice.tanh(logits / softcap)
 
         # Update running max and sum for logsumexp
         # Mask out out-of-bounds N
@@ -164,11 +158,11 @@ def _fused_cross_entropy_bwd_kernel(
         w = tl.load(W_ptr + offs_n[None, :] * stride_wn + offs_k[:, None] * stride_wk,
                     mask=n_mask[None, :] & k_mask[:, None], other=0.0).to(tl.bfloat16)
 
-        logits_pre_cap += tl.dot(x, w).to(tl.float32)
+        logits_pre_cap += tl.dot(x, w)
 
     # Re-apply softcap
     if softcap > 0.0:
-        tanh_val = _tanh(logits_pre_cap / softcap)
+        tanh_val = libdevice.tanh(logits_pre_cap / softcap)
         logits = softcap * tanh_val
         # derivative of softcap * tanh(x / softcap) is 1 - tanh^2(x / softcap)
         d_softcap = 1.0 - tanh_val * tanh_val
@@ -205,7 +199,7 @@ def _fused_cross_entropy_bwd_kernel(
         w_trans = tl.load(W_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
                           mask=n_mask[:, None] & k_mask[None, :], other=0.0).to(tl.bfloat16)
 
-        dx_val = tl.dot(dp_bf16, w_trans).to(tl.float32)
+        dx_val = tl.dot(dp_bf16, w_trans)
 
         # Use atomic add because grid is over N as well
         tl.atomic_add(dX_ptr + offs_m[:, None] * stride_dxm + offs_k[None, :] * stride_dxk,
@@ -221,7 +215,7 @@ def _fused_cross_entropy_bwd_kernel(
         x_val = tl.load(X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
                         mask=m_mask[:, None] & k_mask[None, :], other=0.0).to(tl.bfloat16)
 
-        dw_val = tl.dot(dp_trans, x_val).to(tl.float32)
+        dw_val = tl.dot(dp_trans, x_val)
 
         # Use atomic add because grid is over M as well
         tl.atomic_add(dW_ptr + offs_n[:, None] * stride_dwn + offs_k[None, :] * stride_dwk,
