@@ -457,6 +457,8 @@ while True:
 
     # once in a while: evaluate the val bpb
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
+        if device_type == "cuda":
+            torch.cuda.empty_cache()
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (current_batch_size * current_seq_len * ddp_world_size)
