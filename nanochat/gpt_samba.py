@@ -32,7 +32,7 @@ from nanochat.common import get_dist_info, print0
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 from nanochat.flash_attention import flash_attn
 from nanochat.mamba2 import Mamba2Layer
-from nanochat.fused_ce import fused_cross_entropy
+
 from nanochat.fused_rope import apply_rotary_emb_triton
 
 
@@ -477,10 +477,6 @@ class GPTSamba(nn.Module):
                     x = block(x)
 
         x = norm(x)
-
-        if targets is not None and self.training:
-            # Fused Cross Entropy avoids materializing the massive [B, T, V] tensor
-            return fused_cross_entropy(x, self.lm_head.weight, targets, softcap=15.0, ignore_index=-1, reduction=loss_reduction)
 
         softcap = 15
         logits = self.lm_head(x)
