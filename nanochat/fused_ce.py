@@ -52,12 +52,12 @@ def _fused_cross_entropy_fwd_kernel(
             k_mask = offs_k < K
             
             x = tl.load(X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
-                        mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+                        mask=m_mask[:, None] & k_mask[None, :], other=0.0).to(tl.bfloat16)
             # W is of shape (N, K)
             w = tl.load(W_ptr + offs_n[None, :] * stride_wn + offs_k[:, None] * stride_wk,
-                        mask=n_mask[None, :] & k_mask[:, None], other=0.0)
-            
-            logits += tl.dot(x, w)
+                        mask=n_mask[None, :] & k_mask[:, None], other=0.0).to(tl.bfloat16)
+
+            logits += tl.dot(x, w).to(tl.float32)
 
         # Apply Softcap
         if softcap > 0.0:
@@ -153,11 +153,11 @@ def _fused_cross_entropy_bwd_kernel(
         k_mask = offs_k < K
         
         x = tl.load(X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
-                    mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+                    mask=m_mask[:, None] & k_mask[None, :], other=0.0).to(tl.bfloat16)
         w = tl.load(W_ptr + offs_n[None, :] * stride_wn + offs_k[:, None] * stride_wk,
-                    mask=n_mask[None, :] & k_mask[:, None], other=0.0)
-        
-        logits_pre_cap += tl.dot(x, w)
+                    mask=n_mask[None, :] & k_mask[:, None], other=0.0).to(tl.bfloat16)
+
+        logits_pre_cap += tl.dot(x, w).to(tl.float32)
 
     # Re-apply softcap
     if softcap > 0.0:
@@ -186,36 +186,36 @@ def _fused_cross_entropy_bwd_kernel(
     # scale by loss normalizer and incoming gradient
     dp = dp * grad_out[:, None] * inv_normalizer
     
-    # Cast to computation float type
-    dp_dtype = dp.to(X_ptr.dtype.element_ty)
-    
+    # Cast dp to bf16 for tensor-core dot products
+    dp_bf16 = dp.to(tl.bfloat16)
+
     # Accumulate dX
     # dX[m, k] += dp[m, n] @ W[n, k]
     for k_start in range(0, K, BLOCK_K):
         offs_k = k_start + tl.arange(0, BLOCK_K)
         k_mask = offs_k < K
-        
+
         w_trans = tl.load(W_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
-                          mask=n_mask[:, None] & k_mask[None, :], other=0.0).to(dp_dtype)
-        
-        dx_val = tl.dot(dp_dtype, w_trans)
-        
+                          mask=n_mask[:, None] & k_mask[None, :], other=0.0).to(tl.bfloat16)
+
+        dx_val = tl.dot(dp_bf16, w_trans).to(tl.float32)
+
         # Use atomic add because grid is over N as well
         tl.atomic_add(dX_ptr + offs_m[:, None] * stride_dxm + offs_k[None, :] * stride_dxk,
                       dx_val, mask=m_mask[:, None] & k_mask[None, :])
-                      
+
     # Accumulate dW
     # dW[n, k] += dp[m, n]^T @ X[m, k]
-    dp_trans = tl.trans(dp_dtype)
+    dp_trans = tl.trans(dp_bf16)
     for k_start in range(0, K, BLOCK_K):
         offs_k = k_start + tl.arange(0, BLOCK_K)
         k_mask = offs_k < K
-        
+
         x_val = tl.load(X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
-                        mask=m_mask[:, None] & k_mask[None, :], other=0.0).to(dp_dtype)
-                        
-        dw_val = tl.dot(dp_trans, x_val)
-        
+                        mask=m_mask[:, None] & k_mask[None, :], other=0.0).to(tl.bfloat16)
+
+        dw_val = tl.dot(dp_trans, x_val).to(tl.float32)
+
         # Use atomic add because grid is over M as well
         tl.atomic_add(dW_ptr + offs_n[:, None] * stride_dwn + offs_k[None, :] * stride_dwk,
                       dw_val, mask=n_mask[:, None] & k_mask[None, :])
