@@ -314,10 +314,10 @@ class RustBPETokenizer:
 
         # fetch all the special tokens we need
         bos = self.get_bos_token_id()
-        user_start, user_end = self.encode_special("<|user_start|>"), self.encode_special("<|user_end|>")
-        assistant_start, assistant_end = self.encode_special("<|assistant_start|>"), self.encode_special("<|assistant_end|>")
-        python_start, python_end = self.encode_special("<|python_start|>"), self.encode_special("<|python_end|>")
-        output_start, output_end = self.encode_special("<|output_start|>"), self.encode_special("<|output_end|>")
+        user_start, user_end = self.encode_special("<|start|>"), self.encode_special("<|end|>")
+        assistant_start, assistant_end = self.encode_special("<|start|>"), self.encode_special("<|return|>")
+        python_start, python_end = self.encode_special("<|call|>"), self.encode_special("<|end|>")
+        output_start, output_end = self.encode_special("<|message|>"), self.encode_special("<|end|>")
 
         # now we can tokenize the conversation
         add_tokens(bos, 0)
@@ -401,7 +401,7 @@ class RustBPETokenizer:
         ids, mask = self.render_conversation(conversation)
 
         # Finally, to prime the Assistant for a completion, append the Assistant start token
-        assistant_start = self.encode_special("<|assistant_start|>")
+        assistant_start = self.encode_special("<|start|>")
         ids.append(assistant_start)
         return ids
 
