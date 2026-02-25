@@ -272,7 +272,6 @@ orig_model = model
 torch._dynamo.config.capture_scalar_outputs = True
 # Whole-model compile: SSD forward/backward are registered as custom ops so
 # torch.compile treats them as opaque nodes and fuses surrounding ops.
-# _gated_mlp is decorated with @torch.compiler.disable for dynamic shapes.
 # Skip compilation on MPS — Metal shader compiler can't handle large-vocab kernels.
 if device_type == "cuda":
     model = torch.compile(model, dynamic=False)

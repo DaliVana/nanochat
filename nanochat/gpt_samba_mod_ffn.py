@@ -17,8 +17,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
-
 from nanochat.common import get_dist_info, print0
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 from nanochat.flash_attention import flash_attn
@@ -189,31 +187,6 @@ def _compute_layer_types(config):
     return [pattern[i % len(pattern)] for i in range(config.n_layer)]
 
 
-def _gated_mlp(mlp, x, mask_i, training):
-    """
-    Run MLP with routing mask.
-
-    Training: mask-multiply (torch.compile compatible, no graph break).
-    Inference: gather/scatter for actual tok/sec improvement.
-
-    Args:
-        mlp: MLP module
-        x: (B, T, C) input tensor
-        mask_i: (B, T) float mask with STE gradients (~0 or ~1)
-        training: bool
-    Returns:
-        x with MLP residual applied only to selected tokens
-    """
-    if training:
-        # Mask-multiply: runs MLP on all tokens, masks output.
-        # Compatible with torch.compile (no dynamic shapes / graph breaks).
-        # Router still learns which tokens matter via STE gradients.
-        mlp_out = mlp(norm(x))
-        return x + mlp_out * mask_i.unsqueeze(-1)
-    else:
-        return _gated_mlp_inference(mlp, x, mask_i)
-
-
 @torch.compiler.disable
 def _gated_mlp_inference(mlp, x, mask_i):
     """Gather/scatter path for inference — real tok/sec improvement."""
@@ -375,31 +348,6 @@ class GPTSambaMoDFFN(nn.Module):
 
     def get_device(self):
         return self.transformer.wte.weight.device
-
-    def _full_layer_forward(self, block, x, x0, idx, cos_sin, kv_cache,
-                            resid_lambda, x0_lambda, layer_type, ve_embed, router):
-        """Single layer forward: scaling + attn/mamba + routed MLP. Used for gradient checkpointing."""
-        x = resid_lambda * x + x0_lambda * x0
-
-        # Attn or Mamba sub-layer (always on all tokens)
-        if layer_type == 'A':
-            ve = ve_embed(idx) if ve_embed is not None else None
-            x = x + block.attn(norm(x), ve, cos_sin, kv_cache)
-        else:
-            mamba_out, _, _ = block.mamba(norm(x))
-            x = x + mamba_out
-
-        # Per-layer MLP routing from current hidden state
-        score = router(x).squeeze(-1)  # (B, T)
-        prob = torch.sigmoid(score)
-        mask_hard = (prob >= self.config.mod_ffn_threshold).float()
-        mask_i = mask_hard + prob - prob.detach()  # STE
-        sparsity_loss_i = 0.1 * (prob.mean() - self.config.mod_ffn_target_ratio) ** 2
-
-        # Gated MLP with gather/scatter
-        x = _gated_mlp(block.mlp, x, mask_i, self.training)
-
-        return x, mask_i, sparsity_loss_i
 
     def estimate_flops(self):
         """
@@ -563,28 +511,32 @@ class GPTSambaMoDFFN(nn.Module):
         x = norm(x)
         x0 = x
 
-        total_sparsity_loss = 0.0
-        all_masks = []
+        all_probs = []
 
         for i, block in enumerate(self.transformer.h):
-            resid_lambda = self.resid_lambdas[i]
-            x0_lambda = self.x0_lambdas[i]
-            layer_type = self.layer_types[i]
-            ve_embed = self.value_embeds[str(i)] if str(i) in self.value_embeds else None
-            router = self.mlp_routers[i]
-            if self.gradient_checkpointing and self.training:
-                x, mask_i, sparsity_loss_i = checkpoint(
-                    self._full_layer_forward, block, x, x0, idx, cos_sin, kv_cache,
-                    resid_lambda, x0_lambda, layer_type, ve_embed, router,
-                    use_reentrant=False,
-                )
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+
+            # Attn or Mamba sub-layer (always on all tokens)
+            if self.layer_types[i] == 'A':
+                ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+                x = x + block.attn(norm(x), ve, cos_sin, kv_cache)
             else:
-                x, mask_i, sparsity_loss_i = self._full_layer_forward(
-                    block, x, x0, idx, cos_sin, kv_cache,
-                    resid_lambda, x0_lambda, layer_type, ve_embed, router,
-                )
-            total_sparsity_loss = total_sparsity_loss + sparsity_loss_i
-            all_masks.append(mask_i.detach())
+                mamba_out, _, _ = block.mamba(norm(x))
+                x = x + mamba_out
+
+            # Per-layer MLP routing from current hidden state
+            prob = torch.sigmoid(self.mlp_routers[i](x).squeeze(-1))  # (B, T)
+            mask_hard = (prob >= self.config.mod_ffn_threshold).float()
+            mask_i = mask_hard + prob - prob.detach()  # STE
+
+            # Routed MLP
+            if self.training:
+                # Mask-multiply: torch.compile compatible (no dynamic shapes)
+                x = x + block.mlp(norm(x)) * mask_i.unsqueeze(-1)
+            else:
+                x = _gated_mlp_inference(block.mlp, x, mask_i)
+
+            all_probs.append(prob.detach())
 
         x = norm(x)
 
@@ -597,17 +549,23 @@ class GPTSambaMoDFFN(nn.Module):
         if targets is not None:
             ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
 
+            # Compute sparsity + balance losses from collected probs
+            prob_stack = torch.stack(all_probs, dim=-1)  # (B, T, n_layer)
+            target_ratio = self.config.mod_ffn_target_ratio
+            # Sparsity loss: push each layer's mean activation toward target_ratio
+            per_layer_mean = prob_stack.mean(dim=[0, 1])  # (n_layer,)
+            sparsity_loss = 0.1 * ((per_layer_mean - target_ratio) ** 2).sum()
             # Balance loss: encourage even MLP usage across layers
-            mlp_mask = torch.stack(all_masks, dim=-1)  # (B, T, n_layer)
+            mlp_mask = (prob_stack >= self.config.mod_ffn_threshold).float()
             balance_loss = compute_load_balance_loss(mlp_mask, num_options=self.config.n_layer, weight=0.01)
 
-            total_loss = ce_loss + total_sparsity_loss + balance_loss
+            total_loss = ce_loss + sparsity_loss + balance_loss
 
             if self.training:
                 self.routing_stats = compute_routing_stats(mlp_mask)
                 if loss_reduction == 'mean':
                     self.routing_stats['ce_loss'] = ce_loss.item()
-                    self.routing_stats['sparsity_loss'] = total_sparsity_loss.item() if isinstance(total_sparsity_loss, torch.Tensor) else total_sparsity_loss
+                    self.routing_stats['sparsity_loss'] = sparsity_loss.item()
                     self.routing_stats['balance_loss'] = balance_loss.item()
 
             return total_loss
