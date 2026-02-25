@@ -559,7 +559,7 @@ class GPTSambaMoDFFN(nn.Module):
             resid_lambda = self.resid_lambdas[i]
             x0_lambda = self.x0_lambdas[i]
             layer_type = self.layer_types[i]
-            ve_embed = self.value_embeds.get(str(i))
+            ve_embed = self.value_embeds[str(i)] if str(i) in self.value_embeds else None
             router = self.mlp_routers[i]
             if self.gradient_checkpointing and self.training:
                 x, mask_i, sparsity_loss_i = checkpoint(
