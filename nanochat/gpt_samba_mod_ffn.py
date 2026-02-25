@@ -483,8 +483,9 @@ class GPTSambaMoDFFN(nn.Module):
         return optimizer
 
     def get_mod_stats(self):
-        """Collect routing statistics for logging."""
-        return self.routing_stats
+        """Collect routing statistics for logging. Calls .item() here, outside compiled graph."""
+        return {k: v.item() if isinstance(v, torch.Tensor) else v
+                for k, v in self.routing_stats.items()} if self.routing_stats else {}
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
@@ -574,12 +575,13 @@ class GPTSambaMoDFFN(nn.Module):
             total_loss = ce_loss + total_sparsity_loss + balance_loss
 
             if self.training:
-                mean_usage = (mlp_usage_for_stats / n_layer).item()
+                # Store detached tensors — .item() calls happen in get_mod_stats()
+                # to avoid graph breaks inside torch.compile
                 self.routing_stats = {
-                    'mean_usage': mean_usage,
-                    'ce_loss': ce_loss.item(),
-                    'sparsity_loss': total_sparsity_loss.item() if isinstance(total_sparsity_loss, torch.Tensor) else total_sparsity_loss,
-                    'balance_loss': balance_loss.item(),
+                    'mean_usage': (mlp_usage_for_stats / n_layer).detach(),
+                    'ce_loss': ce_loss.detach(),
+                    'sparsity_loss': total_sparsity_loss.detach() if isinstance(total_sparsity_loss, torch.Tensor) else total_sparsity_loss,
+                    'balance_loss': balance_loss.detach(),
                 }
 
             return total_loss
