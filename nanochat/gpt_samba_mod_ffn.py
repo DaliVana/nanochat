@@ -222,7 +222,8 @@ def _gated_mlp(mlp, x, mask_i, training):
     x_selected = x.view(-1, C)[indices]       # (K, C) — K ≈ target_ratio * B*T
     mlp_out = mlp(norm(x_selected))            # MLP on fewer tokens → faster
 
-    # Scatter back
+    # Scatter back (cast to match x.dtype in case autocast context differs)
+    mlp_out = mlp_out.to(x.dtype)
     out_flat = torch.zeros(B * T, C, device=x.device, dtype=x.dtype)
     out_flat[indices] = mlp_out
     # Multiply by STE mask for gradient flow to the router
