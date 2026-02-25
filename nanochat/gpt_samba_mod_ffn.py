@@ -1,23 +1,14 @@
 """
-Samba model variant: Mamba-2 (SSD) + Sliding Window Attention.
+Samba + MoD-FFN: Mamba-2 + Sliding Window Attention with per-layer MLP routing.
 
-Inspired by Microsoft's Samba architecture, this variant interleaves Mamba-2 layers
-with sliding window attention layers. Mamba layers handle long-range dependencies via
-compressed recurrent state; attention layers (with RoPE + sliding window) handle precise
-local retrieval.
+Based on gpt_samba.py. Attention and Mamba layers always run on all tokens.
+MLP is conditionally executed per-token via a per-layer router (decided from the
+current hidden state after attn/mamba). Gather/scatter on selected tokens gives
+real tok/sec improvement since MLP is token-independent.
 
-Layer composition is configurable via `layer_pattern` (e.g. "MA" = alternating,
-"MMA" = two Mamba per one Attention).
-
-Notable features (inherited from base gpt.py):
-- rotary embeddings on attention layers
-- QK norm on attention layers
-- untied weights for token embedding and lm_head
-- relu^2 activation in MLP
-- no learnable params in rmsnorm, no bias in linear layers
-- GQA support, Flash Attention 3 integration
-- sliding window attention on attention layers
-- value embeddings (ResFormer-style) on attention layers
+The router is a cheap dot-product (n_embd -> 1) per layer. Sigmoid + hard threshold
+with straight-through estimator for gradients. Sparsity loss pushes mean activation
+toward target_ratio. Balance loss encourages even MLP usage across layers.
 """
 
 import math
@@ -32,12 +23,13 @@ from nanochat.common import get_dist_info, print0
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 from nanochat.flash_attention import flash_attn
 from nanochat.mamba2 import Mamba2Layer
+from nanochat.routing import compute_load_balance_loss, compute_routing_stats
 
 from nanochat.fused_rope import apply_rotary_emb_triton
 
 
 @dataclass
-class GPTConfigSamba:
+class GPTConfigSambaMoDFFN:
     sequence_len: int = 32768
     vocab_size: int = 32768
     n_layer: int = 12
@@ -47,14 +39,16 @@ class GPTConfigSamba:
     # Sliding window size for all attention layers (Mamba handles long-range)
     sliding_window: int = 1024
     # Layer pattern: M=Mamba-2, A=Attention, tiled across layers
-    # Examples: "MA"=alternating, "MMA"=two Mamba per one Attn, "MMMA"=three Mamba per one Attn
     layer_pattern: str = "MA"
     # Mamba-2 parameters
-    mamba_d_state: int = 64     # SSM state dimension
-    mamba_d_conv: int = 4       # causal convolution kernel size
-    mamba_expand: int = 2       # expansion factor for inner dim
-    mamba_ngroups: int = 1      # B/C group count (1=max sharing, n_heads=per-head like original)
-    mamba_chunk_size: int = 256 # chunk size for SSD algorithm
+    mamba_d_state: int = 64
+    mamba_d_conv: int = 4
+    mamba_expand: int = 2
+    mamba_ngroups: int = 1
+    mamba_chunk_size: int = 256
+    # MoD-FFN parameters
+    mod_ffn_target_ratio: float = 0.5   # target fraction of tokens that run MLP
+    mod_ffn_threshold: float = 0.5      # sigmoid threshold for MLP activation
 
 
 def norm(x):
@@ -115,16 +109,13 @@ class CausalSelfAttention(nn.Module):
             v = v + gate.unsqueeze(-1) * ve
 
         if kv_cache is None:
-            # Training: sliding window attention with global RoPE
             cos, sin = cos_sin
-            # Fused Triton kernel applies this in-place
             apply_rotary_emb_triton(q, k, cos, sin)
             q, k = norm(q), norm(k)
             y = flash_attn.flash_attn_func(q, k, v, causal=True,
                                            window_size=(self.sliding_window, 0))
         else:
-            # Inference: use KV cache with sliding window
-            cos, sin = cos_sin  # global positions for inference
+            cos, sin = cos_sin
             apply_rotary_emb_triton(q, k, cos, sin)
             q, k = norm(q), norm(k)
 
@@ -198,7 +189,48 @@ def _compute_layer_types(config):
     return [pattern[i % len(pattern)] for i in range(config.n_layer)]
 
 
-class GPTSamba(nn.Module):
+@torch.compiler.disable
+def _gated_mlp(mlp, x, mask_i, training):
+    """
+    Run MLP only on tokens selected by mask_i, using gather/scatter.
+
+    Args:
+        mlp: MLP module
+        x: (B, T, C) input tensor
+        mask_i: (B, T) float mask with STE gradients (~0 or ~1)
+        training: bool
+    Returns:
+        x with MLP residual applied only to selected tokens
+    """
+    B, T, C = x.shape
+    mask_bool = (mask_i > 0.5)
+
+    # Inference fast paths (T=1 during generation)
+    if not training:
+        if mask_bool.all():
+            return x + mlp(norm(x))
+        if not mask_bool.any():
+            return x
+
+    # Gather active tokens
+    flat_mask = mask_bool.view(-1)
+    indices = flat_mask.nonzero(as_tuple=False).squeeze(-1)  # (K,)
+
+    if indices.numel() == 0:
+        return x
+
+    x_selected = x.view(-1, C)[indices]       # (K, C) — K ≈ target_ratio * B*T
+    mlp_out = mlp(norm(x_selected))            # MLP on fewer tokens → faster
+
+    # Scatter back
+    out_flat = torch.zeros(B * T, C, device=x.device, dtype=x.dtype)
+    out_flat[indices] = mlp_out
+    # Multiply by STE mask for gradient flow to the router
+    x = x + out_flat.view(B, T, C) * mask_i.unsqueeze(-1)
+    return x
+
+
+class GPTSambaMoDFFN(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
         """
         NOTE: this __init__ runs in meta device context.
@@ -242,6 +274,11 @@ class GPTSamba(nn.Module):
             if self.layer_types[i] == 'A' and has_ve(i, config.n_layer)
         })
 
+        # Per-layer MLP routers: cheap dot-product from current hidden state
+        self.mlp_routers = nn.ModuleList([
+            nn.Linear(config.n_embd, 1, bias=False) for _ in range(config.n_layer)
+        ])
+
         # Rotary embeddings (only used by attention layers, but precompute for all positions)
         self.rotary_seq_len = config.sequence_len * 10
         head_dim = config.n_embd // config.n_head
@@ -251,6 +288,9 @@ class GPTSamba(nn.Module):
 
         # Gradient checkpointing: recompute forward during backward to save memory
         self.gradient_checkpointing = False
+
+        # Routing statistics for logging
+        self.routing_stats = {}
 
     @torch.no_grad()
     def init_weights(self):
@@ -264,7 +304,6 @@ class GPTSamba(nn.Module):
 
         for i, block in enumerate(self.transformer.h):
             if self.layer_types[i] == 'A':
-                # Attention block: same as base gpt.py
                 torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
                 torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
                 torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
@@ -272,18 +311,13 @@ class GPTSamba(nn.Module):
                 torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
                 torch.nn.init.zeros_(block.mlp.c_proj.weight)
             else:
-                # Mamba block
                 mamba = block.mamba
                 torch.nn.init.uniform_(mamba.in_proj.weight, -s, s)
                 torch.nn.init.kaiming_uniform_(mamba.conv1d.weight, a=math.sqrt(5))
-                # A_log: log(1..n_heads) for diverse timescales
                 mamba.A_log.copy_(torch.log(torch.linspace(0.001, mamba.n_heads, mamba.n_heads, dtype=torch.float32, device=mamba.A_log.device)))
-                # dt_bias: softplus(-4..-2) gives ~0.02-0.13
                 torch.nn.init.uniform_(mamba.dt_bias, -4.0, -2.0)
                 torch.nn.init.zeros_(mamba.out_proj.weight)
-                # Re-initialize causal mask buffer (was garbage after to_empty from meta device)
                 mamba._causal_mask.copy_(torch.triu(torch.ones(mamba.chunk_size, mamba.chunk_size, dtype=torch.bool, device=mamba._causal_mask.device), diagonal=1))
-                # MLP in Mamba block: same as base
                 torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
                 torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
@@ -299,6 +333,10 @@ class GPTSamba(nn.Module):
         for i, block in enumerate(self.transformer.h):
             if self.layer_types[i] == 'A' and block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
+
+        # MLP routers: near-zero so sigmoid(~0) ≈ 0.5, ~50% activation at start
+        for router in self.mlp_routers:
+            torch.nn.init.normal_(router.weight, mean=0.0, std=0.01)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -326,21 +364,39 @@ class GPTSamba(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
+    def _full_layer_forward(self, i, block, x, x0, idx, cos_sin, kv_cache):
+        """Single layer forward: scaling + attn/mamba + routed MLP. Used for gradient checkpointing."""
+        x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+
+        # Attn or Mamba sub-layer (always on all tokens)
+        if self.layer_types[i] == 'A':
+            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+            x = x + block.attn(norm(x), ve, cos_sin, kv_cache)
+        else:
+            mamba_out, _, _ = block.mamba(norm(x))
+            x = x + mamba_out
+
+        # Per-layer MLP routing from current hidden state
+        score = self.mlp_routers[i](x).squeeze(-1)  # (B, T)
+        prob = torch.sigmoid(score)
+        mask_hard = (prob >= self.config.mod_ffn_threshold).float()
+        mask_i = mask_hard + prob - prob.detach()  # STE
+        sparsity_loss_i = 0.1 * (prob.mean() - self.config.mod_ffn_target_ratio) ** 2
+
+        # Gated MLP with gather/scatter
+        x = _gated_mlp(block.mlp, x, mask_i, self.training)
+
+        return x, mask_i, sparsity_loss_i
+
     def estimate_flops(self):
         """
         Return estimated FLOPs per token (forward + backward).
-        Attention layers: 6 * matmul_params + 12*h*q*effective_seq
-        Mamba layers: 6 * matmul_params + SSD ops (within-chunk + between-chunk)
-
-        SSD FLOPs per token per layer (forward+backward = 3× forward):
-          CB computation (like QK^T):    6 * chunk_size * ngroups * d_state
-          Weighted sum (like AV):        6 * chunk_size * d_inner
-          State delta + contribution:   12 * d_inner * d_state
+        MLP FLOPs scaled by mod_ffn_target_ratio, everything else full.
         """
         nparams = sum(p.numel() for p in self.parameters())
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
+        router_numel = sum(p.numel() for p in self.mlp_routers.parameters())
 
-        # Exclude non-matmul params
         mamba_scalar_numel = 0
         for name, p in self.named_parameters():
             if 'A_log' in name or 'dt_bias' in name:
@@ -348,29 +404,39 @@ class GPTSamba(nn.Module):
 
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
-                          mamba_scalar_numel)
+                          mamba_scalar_numel + router_numel)
 
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
 
-        # Attention FLOPs (sliding window — each attention layer sees at most W tokens)
+        # Attention FLOPs (sliding window — full, not reduced by MoD)
         W = self.config.sliding_window
         n_attn = sum(1 for lt in self.layer_types if lt == 'A')
         effective_seq = min(W, t)
         attn_flops = n_attn * 12 * h * q * effective_seq
 
-        # SSD FLOPs for Mamba layers
+        # SSD FLOPs for Mamba layers (full, not reduced by MoD)
         d_inner = int(self.config.mamba_expand * self.config.n_embd)
         d_state = self.config.mamba_d_state
         ngroups = self.config.mamba_ngroups
         chunk_size = self.config.mamba_chunk_size
         n_mamba = sum(1 for lt in self.layer_types if lt == 'M')
         ssd_flops = n_mamba * (
-            6 * chunk_size * ngroups * d_state   # CB (C @ B^T within each chunk)
-            + 6 * chunk_size * d_inner            # weighted sum (scores @ x*dt within chunk)
-            + 12 * d_inner * d_state              # state delta + state contribution (between chunks)
+            6 * chunk_size * ngroups * d_state
+            + 6 * chunk_size * d_inner
+            + 12 * d_inner * d_state
         )
 
-        num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops + ssd_flops
+        # Split matmul params into MLP vs non-MLP
+        n_embd = self.config.n_embd
+        mlp_params_per_layer = n_embd * (4 * n_embd) + (4 * n_embd) * n_embd
+        total_mlp_params = self.config.n_layer * mlp_params_per_layer
+        non_mlp_matmul_params = (nparams - nparams_exclude) - total_mlp_params
+
+        # Non-MLP matmuls at full rate, MLP at target_ratio
+        active_ratio = self.config.mod_ffn_target_ratio
+        num_flops_per_token = (6 * non_mlp_matmul_params +
+                              6 * total_mlp_params * active_ratio +
+                              attn_flops + ssd_flops)
         return num_flops_per_token
 
     def num_scaling_params(self):
@@ -379,8 +445,9 @@ class GPTSamba(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
+        router = sum(p.numel() for p in self.mlp_routers.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        total = wte + value_embeds + lm_head + transformer_matrices + router + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
 
         # Per-layer-type breakdown
@@ -400,6 +467,7 @@ class GPTSamba(nn.Module):
             'transformer_matrices': transformer_matrices,
             'attn_blocks': attn_params,
             'mamba_blocks': mamba_params,
+            'router': router,
             'scalars': scalars,
             'total': total,
         }
@@ -420,6 +488,7 @@ class GPTSamba(nn.Module):
             else:
                 matrix_params.append(p)
 
+        router_params = list(self.mlp_routers.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -428,7 +497,8 @@ class GPTSamba(nn.Module):
 
         # Verify all params accounted for
         all_params = len(list(self.parameters()))
-        grouped = (len(matrix_params) + len(mamba_scalar_params) + len(mamba_conv_params) + len(embedding_params) +
+        grouped = (len(matrix_params) + len(mamba_scalar_params) + len(mamba_conv_params) +
+                   len(router_params) + len(embedding_params) +
                    len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
         assert all_params == grouped, f"Parameter count mismatch: {all_params} != {grouped}"
 
@@ -443,6 +513,7 @@ class GPTSamba(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=mamba_scalar_params, lr=scalar_lr * 0.1, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=mamba_conv_params, lr=scalar_lr * 0.1, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=router_params, lr=scalar_lr * 0.1, betas=adam_betas, eps=1e-10, weight_decay=0.0),
         ]
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
@@ -458,6 +529,10 @@ class GPTSamba(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
+    def get_mod_stats(self):
+        """Collect routing statistics for logging."""
+        return self.routing_stats
+
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
 
@@ -466,10 +541,8 @@ class GPTSamba(nn.Module):
         assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
 
         if kv_cache is None:
-            # Training: global RoPE positions (0..T-1) for sliding window attention
             cos_sin = self.cos[:, :T], self.sin[:, :T]
         else:
-            # Inference: global RoPE positions for KV cache
             T0 = kv_cache.get_pos()
             cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
 
@@ -477,19 +550,21 @@ class GPTSamba(nn.Module):
         x = norm(x)
         x0 = x
 
+        total_sparsity_loss = 0.0
+        all_masks = []
+
         for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            if self.layer_types[i] == 'A':
-                ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-                if self.gradient_checkpointing and self.training:
-                    x = checkpoint(block, x, ve, cos_sin, kv_cache, use_reentrant=False)
-                else:
-                    x = block(x, ve, cos_sin, kv_cache)
+            if self.gradient_checkpointing and self.training:
+                x, mask_i, sparsity_loss_i = checkpoint(
+                    self._full_layer_forward, i, block, x, x0, idx, cos_sin, kv_cache,
+                    use_reentrant=False,
+                )
             else:
-                if self.gradient_checkpointing and self.training:
-                    x = checkpoint(block, x, use_reentrant=False)
-                else:
-                    x = block(x)
+                x, mask_i, sparsity_loss_i = self._full_layer_forward(
+                    i, block, x, x0, idx, cos_sin, kv_cache,
+                )
+            total_sparsity_loss = total_sparsity_loss + sparsity_loss_i
+            all_masks.append(mask_i.detach())
 
         x = norm(x)
 
@@ -500,12 +575,24 @@ class GPTSamba(nn.Module):
         logits = softcap * torch.tanh(logits / softcap)
 
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
+            ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+
+            # Balance loss: encourage even MLP usage across layers
+            mlp_mask = torch.stack(all_masks, dim=-1)  # (B, T, n_layer)
+            balance_loss = compute_load_balance_loss(mlp_mask, num_options=self.config.n_layer, weight=0.01)
+
+            total_loss = ce_loss + total_sparsity_loss + balance_loss
+
+            if self.training:
+                self.routing_stats = compute_routing_stats(mlp_mask)
+                if loss_reduction == 'mean':
+                    self.routing_stats['ce_loss'] = ce_loss.item()
+                    self.routing_stats['sparsity_loss'] = total_sparsity_loss.item() if isinstance(total_sparsity_loss, torch.Tensor) else total_sparsity_loss
+                    self.routing_stats['balance_loss'] = balance_loss.item()
+
+            return total_loss
         else:
             return logits
-
-
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):

@@ -1,14 +1,14 @@
 """
-Train Samba model (Mamba-2 + Sliding Window Attention). From root directory of the project, run as:
+Train Samba MoD-FFN model (Mamba-2 + Sliding Window Attention + MLP routing). From root directory of the project, run as:
 
-python -m scripts.samba_train
+python -m scripts.samba_mod_ffn_train
 
 or distributed as:
 
-torchrun --nproc_per_node=8 -m scripts.samba_train
+torchrun --nproc_per_node=8 -m scripts.samba_mod_ffn_train
 
 If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
-python -m scripts.samba_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
+python -m scripts.samba_mod_ffn_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
 """
 
 import os
@@ -24,7 +24,7 @@ from contextlib import nullcontext, contextmanager
 import wandb
 import torch
 
-from nanochat.gpt_samba import GPTSamba as GPT, GPTConfigSamba as GPTConfig
+from nanochat.gpt_samba_mod_ffn import GPTSambaMoDFFN as GPT, GPTConfigSambaMoDFFN as GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
 from nanochat.tokenizer import get_o200k_harmony_tokenizer, compute_token_bytes
@@ -37,7 +37,7 @@ print_banner()
 
 # -----------------------------------------------------------------------------
 # CLI arguments
-parser = argparse.ArgumentParser(description="Pretrain Samba model (Mamba-2 + Sliding Window Attention)")
+parser = argparse.ArgumentParser(description="Pretrain Samba MoD-FFN model (Mamba-2 + Sliding Window Attention + MLP routing)")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
@@ -59,6 +59,9 @@ parser.add_argument("--mamba-expand", type=int, default=2, help="Mamba-2 expansi
 parser.add_argument("--mamba-ngroups", type=int, default=1, help="Mamba-2 B/C group count (1=max sharing, -1=per-head)")
 parser.add_argument("--mamba-chunk-size", type=int, default=128, help="Mamba-2 chunk size for SSD algorithm")
 parser.add_argument("--gradient-checkpointing", action="store_true", help="recompute forward during backward to save memory (slower but fits longer contexts)")
+# MoD-FFN specific
+parser.add_argument("--mod-ffn-target-ratio", type=float, default=0.5, help="target fraction of tokens to run MLP on (default: 0.5 = 50%%)")
+parser.add_argument("--mod-ffn-threshold", type=float, default=0.5, help="sigmoid threshold for MLP activation (default: 0.5)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -167,6 +170,8 @@ def build_model_meta(depth):
         mamba_expand=args.mamba_expand,
         mamba_ngroups=mamba_ngroups,
         mamba_chunk_size=args.mamba_chunk_size,
+        mod_ffn_target_ratio=args.mod_ffn_target_ratio,
+        mod_ffn_threshold=args.mod_ffn_threshold,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -178,6 +183,7 @@ model_config = model.config
 model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 print0(f"Layer types: {''.join(model.layer_types)}")
+print0(f"MoD-FFN target ratio: {model_config.mod_ffn_target_ratio}, threshold: {model_config.mod_ffn_threshold}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
 if args.gradient_checkpointing:
@@ -186,8 +192,8 @@ if args.gradient_checkpointing:
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
-output_dirname = args.model_tag if args.model_tag else f"samba_d{args.depth}" # e.g. samba_d12
-checkpoint_dir = os.path.join(base_dir, "samba_checkpoints", output_dirname)
+output_dirname = args.model_tag if args.model_tag else f"samba_mod_ffn_d{args.depth}" # e.g. samba_mod_ffn_d12
+checkpoint_dir = os.path.join(base_dir, "samba_mod_ffn_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
@@ -265,9 +271,8 @@ def disable_fp8(model):
 orig_model = model
 torch._dynamo.config.capture_scalar_outputs = True
 # Whole-model compile: SSD forward/backward are registered as custom ops so
-# torch.compile treats them as opaque nodes and fuses surrounding ops. Whole-model
-# (vs per-block) eliminates Python overhead at block boundaries and enables cross-block
-# fusion. dynamic=False because training shapes are fixed within each phase.
+# torch.compile treats them as opaque nodes and fuses surrounding ops.
+# _gated_mlp is decorated with @torch.compiler.disable for dynamic shapes.
 # Skip compilation on MPS — Metal shader compiler can't handle large-vocab kernels.
 if device_type == "cuda":
     model = torch.compile(model, dynamic=False)
@@ -567,6 +572,9 @@ while True:
     dt = t1 - t0
     # -------------------------------------------------------------------------
 
+    # Collect routing stats
+    routing_stats = model.get_mod_stats()
+
     # logging
     ema_beta = 0.9
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
@@ -587,7 +595,8 @@ while True:
         eta_str = ""
     epoch = dataloader_state_dict["epoch"]
     phase_str = f" | phase: {current_phase_idx} (B={current_batch_size},T={current_seq_len})" if schedule_phases is not None else ""
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch}{phase_str} | total time: {total_training_time/60:.2f}m{eta_str}")
+    usage_str = f" | mlp_usage: {routing_stats.get('mean_usage', 0):.2f}" if routing_stats else ""
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch}{phase_str}{usage_str} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -604,6 +613,8 @@ while True:
             log_data["schedule/phase"] = current_phase_idx
             log_data["schedule/batch_size"] = current_batch_size
             log_data["schedule/seq_len"] = current_seq_len
+        if routing_stats:
+            log_data.update({f"routing/{k}": v for k, v in routing_stats.items()})
         wandb_run.log(log_data)
 
     # state update
@@ -625,7 +636,7 @@ if val_bpb is not None:
 
 # Log to report
 from nanochat.report import get_report
-get_report().log(section="Samba model training", data=[
+get_report().log(section="Samba MoD-FFN model training", data=[
     user_config,
     {
         "Number of parameters": num_params,
