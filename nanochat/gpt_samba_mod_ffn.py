@@ -189,10 +189,12 @@ def _compute_layer_types(config):
     return [pattern[i % len(pattern)] for i in range(config.n_layer)]
 
 
-@torch.compiler.disable
 def _gated_mlp(mlp, x, mask_i, training):
     """
-    Run MLP only on tokens selected by mask_i, using gather/scatter.
+    Run MLP with routing mask.
+
+    Training: mask-multiply (torch.compile compatible, no graph break).
+    Inference: gather/scatter for actual tok/sec improvement.
 
     Args:
         mlp: MLP module
@@ -202,17 +204,27 @@ def _gated_mlp(mlp, x, mask_i, training):
     Returns:
         x with MLP residual applied only to selected tokens
     """
+    if training:
+        # Mask-multiply: runs MLP on all tokens, masks output.
+        # Compatible with torch.compile (no dynamic shapes / graph breaks).
+        # Router still learns which tokens matter via STE gradients.
+        mlp_out = mlp(norm(x))
+        return x + mlp_out * mask_i.unsqueeze(-1)
+    else:
+        return _gated_mlp_inference(mlp, x, mask_i)
+
+
+@torch.compiler.disable
+def _gated_mlp_inference(mlp, x, mask_i):
+    """Gather/scatter path for inference — real tok/sec improvement."""
     B, T, C = x.shape
     mask_bool = (mask_i > 0.5)
 
-    # Inference fast paths (T=1 during generation)
-    if not training:
-        if mask_bool.all():
-            return x + mlp(norm(x))
-        if not mask_bool.any():
-            return x
+    if mask_bool.all():
+        return x + mlp(norm(x))
+    if not mask_bool.any():
+        return x
 
-    # Gather active tokens
     flat_mask = mask_bool.view(-1)
     indices = flat_mask.nonzero(as_tuple=False).squeeze(-1)  # (K,)
 
@@ -226,7 +238,6 @@ def _gated_mlp(mlp, x, mask_i, training):
     mlp_out = mlp_out.to(x.dtype)
     out_flat = torch.zeros(B * T, C, device=x.device, dtype=x.dtype)
     out_flat[indices] = mlp_out
-    # Multiply by STE mask for gradient flow to the router
     x = x + out_flat.view(B, T, C) * mask_i.unsqueeze(-1)
     return x
 
