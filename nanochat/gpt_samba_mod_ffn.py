@@ -21,6 +21,8 @@ from nanochat.common import get_dist_info, print0
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 from nanochat.flash_attention import flash_attn
 from nanochat.mamba2 import Mamba2Layer
+from torch.utils.checkpoint import checkpoint
+
 from nanochat.fused_rope import apply_rotary_emb_triton
 
 
@@ -385,17 +387,9 @@ class GPTSambaMoDFFN(nn.Module):
             + 12 * d_inner * d_state
         )
 
-        # Split matmul params into MLP vs non-MLP
-        n_embd = self.config.n_embd
-        mlp_params_per_layer = n_embd * (4 * n_embd) + (4 * n_embd) * n_embd
-        total_mlp_params = self.config.n_layer * mlp_params_per_layer
-        non_mlp_matmul_params = (nparams - nparams_exclude) - total_mlp_params
-
-        # Non-MLP matmuls at full rate, MLP at target_ratio
-        active_ratio = self.config.mod_ffn_target_ratio
-        num_flops_per_token = (6 * non_mlp_matmul_params +
-                              6 * total_mlp_params * active_ratio +
-                              attn_flops + ssd_flops)
+        # Training runs MLP on 100% of tokens (mask applied post-MLP),
+        # so FLOPs are not reduced. MoD savings are inference-only.
+        num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops + ssd_flops
         return num_flops_per_token
 
     def num_scaling_params(self):
@@ -518,39 +512,48 @@ class GPTSambaMoDFFN(nn.Module):
         n_layer = len(self.transformer.h)
         target_ratio = self.config.mod_ffn_target_ratio
 
-        for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-
-            # Attn or Mamba sub-layer (always on all tokens)
-            if self.layer_types[i] == 'A':
-                ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+        def _layer_forward(x, block, layer_type, ve, cos_sin, kv_cache, router, threshold):
+            """Single layer: attn/mamba + routed MLP. Checkpointable."""
+            if layer_type == 'A':
                 x = x + block.attn(norm(x), ve, cos_sin, kv_cache)
             else:
                 mamba_out, _, _ = block.mamba(norm(x))
                 x = x + mamba_out
-
-            # Per-layer MLP routing from current hidden state
-            prob = torch.sigmoid(self.mlp_routers[i](x).squeeze(-1))  # (B, T)
-            layer_mean = prob.mean()
-
-            # Sparsity loss: push this layer toward target_ratio
-            total_sparsity_loss = total_sparsity_loss + 0.1 * (layer_mean - target_ratio) ** 2
-
-            # Accumulate for balance loss (variance of per-layer usage)
-            usage_sum = usage_sum + layer_mean
-            usage_sq_sum = usage_sq_sum + layer_mean ** 2
-
-            # STE mask
-            mask_hard = (prob >= self.config.mod_ffn_threshold).float()
+            prob = torch.sigmoid(router(x).squeeze(-1))
+            mask_hard = (prob >= threshold).float()
             mask_i = mask_hard + prob - prob.detach()  # STE
+            x = x + block.mlp(norm(x)) * mask_i.unsqueeze(-1)
+            return x, prob
 
-            # Routed MLP
-            if self.training:
-                # Mask-multiply: torch.compile compatible (no dynamic shapes)
-                x = x + block.mlp(norm(x)) * mask_i.unsqueeze(-1)
+        for i, block in enumerate(self.transformer.h):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+
+            ve = self.value_embeds[str(i)](idx) if (self.layer_types[i] == 'A' and str(i) in self.value_embeds) else None
+
+            if self.gradient_checkpointing and self.training:
+                x, prob = checkpoint(
+                    _layer_forward, x, block, self.layer_types[i], ve, cos_sin, kv_cache,
+                    self.mlp_routers[i], self.config.mod_ffn_threshold, use_reentrant=False)
+            elif self.training:
+                x, prob = _layer_forward(
+                    x, block, self.layer_types[i], ve, cos_sin, kv_cache,
+                    self.mlp_routers[i], self.config.mod_ffn_threshold)
             else:
+                # Inference: use gather/scatter for real speedup
+                if self.layer_types[i] == 'A':
+                    x = x + block.attn(norm(x), ve, cos_sin, kv_cache)
+                else:
+                    mamba_out, _, _ = block.mamba(norm(x))
+                    x = x + mamba_out
+                prob = torch.sigmoid(self.mlp_routers[i](x).squeeze(-1))
+                mask_hard = (prob >= self.config.mod_ffn_threshold).float()
+                mask_i = mask_hard + prob - prob.detach()
                 x = _gated_mlp_inference(block.mlp, x, mask_i)
 
+            layer_mean = prob.mean()
+            total_sparsity_loss = total_sparsity_loss + 0.1 * (layer_mean - target_ratio) ** 2
+            usage_sum = usage_sum + layer_mean
+            usage_sq_sum = usage_sq_sum + layer_mean ** 2
             mlp_usage_for_stats = mlp_usage_for_stats + layer_mean.detach()
 
         x = norm(x)
@@ -564,9 +567,9 @@ class GPTSambaMoDFFN(nn.Module):
         if targets is not None:
             ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
 
-            # Balance loss: penalize variance of per-layer MLP usage
-            # = sum_i (mean_i - 1/n)^2 = sq_sum - 2*sum/n + 1/n
-            balance_loss = 0.01 * (usage_sq_sum - 2.0 * usage_sum / n_layer + 1.0 / n_layer)
+            # Balance loss: penalize variance of per-layer MLP usage = Var(mean_i)
+            layer_mean_avg = usage_sum / n_layer
+            balance_loss = 0.01 * (usage_sq_sum / n_layer - layer_mean_avg ** 2)
 
             total_loss = ce_loss + total_sparsity_loss + balance_loss
 

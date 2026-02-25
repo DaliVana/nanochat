@@ -571,12 +571,13 @@ while True:
     dt = t1 - t0
     # -------------------------------------------------------------------------
 
-    # Collect routing stats
+    # Collect routing stats — use CE loss (not total loss with aux) for comparable tracking
     routing_stats = model.get_mod_stats()
+    ce_loss_f = routing_stats.get('ce_loss', train_loss_f) if routing_stats else train_loss_f
 
     # logging
     ema_beta = 0.9
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
+    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * ce_loss_f
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
