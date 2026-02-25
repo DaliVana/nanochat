@@ -365,20 +365,21 @@ class GPTSambaMoDFFN(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
-    def _full_layer_forward(self, i, block, x, x0, idx, cos_sin, kv_cache):
+    def _full_layer_forward(self, block, x, x0, idx, cos_sin, kv_cache,
+                            resid_lambda, x0_lambda, layer_type, ve_embed, router):
         """Single layer forward: scaling + attn/mamba + routed MLP. Used for gradient checkpointing."""
-        x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+        x = resid_lambda * x + x0_lambda * x0
 
         # Attn or Mamba sub-layer (always on all tokens)
-        if self.layer_types[i] == 'A':
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+        if layer_type == 'A':
+            ve = ve_embed(idx) if ve_embed is not None else None
             x = x + block.attn(norm(x), ve, cos_sin, kv_cache)
         else:
             mamba_out, _, _ = block.mamba(norm(x))
             x = x + mamba_out
 
         # Per-layer MLP routing from current hidden state
-        score = self.mlp_routers[i](x).squeeze(-1)  # (B, T)
+        score = router(x).squeeze(-1)  # (B, T)
         prob = torch.sigmoid(score)
         mask_hard = (prob >= self.config.mod_ffn_threshold).float()
         mask_i = mask_hard + prob - prob.detach()  # STE
@@ -555,14 +556,21 @@ class GPTSambaMoDFFN(nn.Module):
         all_masks = []
 
         for i, block in enumerate(self.transformer.h):
+            resid_lambda = self.resid_lambdas[i]
+            x0_lambda = self.x0_lambdas[i]
+            layer_type = self.layer_types[i]
+            ve_embed = self.value_embeds.get(str(i))
+            router = self.mlp_routers[i]
             if self.gradient_checkpointing and self.training:
                 x, mask_i, sparsity_loss_i = checkpoint(
-                    self._full_layer_forward, i, block, x, x0, idx, cos_sin, kv_cache,
+                    self._full_layer_forward, block, x, x0, idx, cos_sin, kv_cache,
+                    resid_lambda, x0_lambda, layer_type, ve_embed, router,
                     use_reentrant=False,
                 )
             else:
                 x, mask_i, sparsity_loss_i = self._full_layer_forward(
-                    i, block, x, x0, idx, cos_sin, kv_cache,
+                    block, x, x0, idx, cos_sin, kv_cache,
+                    resid_lambda, x0_lambda, layer_type, ve_embed, router,
                 )
             total_sparsity_loss = total_sparsity_loss + sparsity_loss_i
             all_masks.append(mask_i.detach())
