@@ -21,8 +21,6 @@ from nanochat.common import get_dist_info, print0
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 from nanochat.flash_attention import flash_attn
 from nanochat.mamba2 import Mamba2Layer
-from nanochat.routing import compute_load_balance_loss, compute_routing_stats
-
 from nanochat.fused_rope import apply_rotary_emb_triton
 
 
@@ -511,7 +509,14 @@ class GPTSambaMoDFFN(nn.Module):
         x = norm(x)
         x0 = x
 
-        all_probs = []
+        # Accumulate losses as scalars inline (no list/stack — torch.compile friendly)
+        total_sparsity_loss = 0.0
+        usage_sum = 0.0       # for balance loss
+        usage_sq_sum = 0.0    # for balance loss
+        mlp_usage_for_stats = 0.0  # detached, for logging
+
+        n_layer = len(self.transformer.h)
+        target_ratio = self.config.mod_ffn_target_ratio
 
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
@@ -526,6 +531,16 @@ class GPTSambaMoDFFN(nn.Module):
 
             # Per-layer MLP routing from current hidden state
             prob = torch.sigmoid(self.mlp_routers[i](x).squeeze(-1))  # (B, T)
+            layer_mean = prob.mean()
+
+            # Sparsity loss: push this layer toward target_ratio
+            total_sparsity_loss = total_sparsity_loss + 0.1 * (layer_mean - target_ratio) ** 2
+
+            # Accumulate for balance loss (variance of per-layer usage)
+            usage_sum = usage_sum + layer_mean
+            usage_sq_sum = usage_sq_sum + layer_mean ** 2
+
+            # STE mask
             mask_hard = (prob >= self.config.mod_ffn_threshold).float()
             mask_i = mask_hard + prob - prob.detach()  # STE
 
@@ -536,7 +551,7 @@ class GPTSambaMoDFFN(nn.Module):
             else:
                 x = _gated_mlp_inference(block.mlp, x, mask_i)
 
-            all_probs.append(prob.detach())
+            mlp_usage_for_stats = mlp_usage_for_stats + layer_mean.detach()
 
         x = norm(x)
 
@@ -549,24 +564,20 @@ class GPTSambaMoDFFN(nn.Module):
         if targets is not None:
             ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
 
-            # Compute sparsity + balance losses from collected probs
-            prob_stack = torch.stack(all_probs, dim=-1)  # (B, T, n_layer)
-            target_ratio = self.config.mod_ffn_target_ratio
-            # Sparsity loss: push each layer's mean activation toward target_ratio
-            per_layer_mean = prob_stack.mean(dim=[0, 1])  # (n_layer,)
-            sparsity_loss = 0.1 * ((per_layer_mean - target_ratio) ** 2).sum()
-            # Balance loss: encourage even MLP usage across layers
-            mlp_mask = (prob_stack >= self.config.mod_ffn_threshold).float()
-            balance_loss = compute_load_balance_loss(mlp_mask, num_options=self.config.n_layer, weight=0.01)
+            # Balance loss: penalize variance of per-layer MLP usage
+            # = sum_i (mean_i - 1/n)^2 = sq_sum - 2*sum/n + 1/n
+            balance_loss = 0.01 * (usage_sq_sum - 2.0 * usage_sum / n_layer + 1.0 / n_layer)
 
-            total_loss = ce_loss + sparsity_loss + balance_loss
+            total_loss = ce_loss + total_sparsity_loss + balance_loss
 
             if self.training:
-                self.routing_stats = compute_routing_stats(mlp_mask)
-                if loss_reduction == 'mean':
-                    self.routing_stats['ce_loss'] = ce_loss.item()
-                    self.routing_stats['sparsity_loss'] = sparsity_loss.item()
-                    self.routing_stats['balance_loss'] = balance_loss.item()
+                mean_usage = (mlp_usage_for_stats / n_layer).item()
+                self.routing_stats = {
+                    'mean_usage': mean_usage,
+                    'ce_loss': ce_loss.item(),
+                    'sparsity_loss': total_sparsity_loss.item() if isinstance(total_sparsity_loss, torch.Tensor) else total_sparsity_loss,
+                    'balance_loss': balance_loss.item(),
+                }
 
             return total_loss
         else:
