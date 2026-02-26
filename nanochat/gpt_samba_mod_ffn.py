@@ -143,6 +143,18 @@ class MLP(nn.Module):
         x = F.relu(x).square()
         x = self.c_proj(x)
         return x
+    
+class GatedMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = F.relu(x).square()
+        x = self.c_proj(x)
+        return x
 
 
 class AttentionBlock(nn.Module):
@@ -150,12 +162,23 @@ class AttentionBlock(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = GatedMLP(config)
+        self.mlp_router = nn.Linear(config.n_embd, 1, bias=False)
+        self.mlp_k_ratio = config.mod_ffn_target_ratio
 
     def forward(self, x, ve, cos_sin, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, kv_cache)
-        x = x + self.mlp(norm(x))
-        return x
+        B, T, C = x.shape
+        prob = torch.sigmoid(self.mlp_router(x).squeeze(-1))       # (B, T)
+        k = max(1, int(self.mlp_k_ratio * T))
+        top_probs, top_idx = torch.topk(prob, k, dim=-1)           # (B, k)
+        idx_exp = top_idx.unsqueeze(-1).expand(-1, -1, C)          # (B, k, C)
+        x_sel = x.gather(1, idx_exp)                                # (B, k, C)
+        mlp_out = self.mlp(norm(x_sel)) * top_probs.unsqueeze(-1)  # (B, k, C)
+        out = torch.zeros_like(x)
+        out.scatter_(1, idx_exp, mlp_out)
+        x = x + out
+        return x, prob
 
 
 class MambaBlock(nn.Module):
@@ -170,13 +193,24 @@ class MambaBlock(nn.Module):
             ngroups=config.mamba_ngroups,
             chunk_size=config.mamba_chunk_size,
         )
-        self.mlp = MLP(config)
+        self.mlp = GatedMLP(config)
+        self.mlp_router = nn.Linear(config.n_embd, 1, bias=False)
+        self.mlp_k_ratio = config.mod_ffn_target_ratio
 
     def forward(self, x):
         mamba_out, _, _ = self.mamba(norm(x))
         x = x + mamba_out
-        x = x + self.mlp(norm(x))
-        return x
+        B, T, C = x.shape
+        prob = torch.sigmoid(self.mlp_router(x).squeeze(-1))       # (B, T)
+        k = max(1, int(self.mlp_k_ratio * T))
+        top_probs, top_idx = torch.topk(prob, k, dim=-1)           # (B, k)
+        idx_exp = top_idx.unsqueeze(-1).expand(-1, -1, C)          # (B, k, C)
+        x_sel = x.gather(1, idx_exp)                                # (B, k, C)
+        mlp_out = self.mlp(norm(x_sel)) * top_probs.unsqueeze(-1)  # (B, k, C)
+        out = torch.zeros_like(x)
+        out.scatter_(1, idx_exp, mlp_out)
+        x = x + out
+        return x, prob
 
 
 def _compute_layer_types(config):
@@ -185,34 +219,6 @@ def _compute_layer_types(config):
     assert all(c in "MA" for c in pattern), f"Invalid layer_pattern: {pattern}. Use only M and A."
     assert any(c == 'A' for c in pattern), "layer_pattern must contain at least one A (attention) layer"
     return [pattern[i % len(pattern)] for i in range(config.n_layer)]
-
-
-@torch.compiler.disable
-def _gated_mlp_inference(mlp, x, mask_i):
-    """Gather/scatter path for inference — real tok/sec improvement."""
-    B, T, C = x.shape
-    mask_bool = (mask_i > 0.5)
-
-    if mask_bool.all():
-        return x + mlp(norm(x))
-    if not mask_bool.any():
-        return x
-
-    flat_mask = mask_bool.view(-1)
-    indices = flat_mask.nonzero(as_tuple=False).squeeze(-1)  # (K,)
-
-    if indices.numel() == 0:
-        return x
-
-    x_selected = x.view(-1, C)[indices]       # (K, C) — K ≈ target_ratio * B*T
-    mlp_out = mlp(norm(x_selected))            # MLP on fewer tokens → faster
-
-    # Scatter back (cast to match x.dtype in case autocast context differs)
-    mlp_out = mlp_out.to(x.dtype)
-    out_flat = torch.zeros(B * T, C, device=x.device, dtype=x.dtype)
-    out_flat[indices] = mlp_out
-    x = x + out_flat.view(B, T, C) * mask_i.unsqueeze(-1)
-    return x
 
 
 class GPTSambaMoDFFN(nn.Module):
@@ -258,11 +264,6 @@ class GPTSambaMoDFFN(nn.Module):
             for i in range(config.n_layer)
             if self.layer_types[i] == 'A' and has_ve(i, config.n_layer)
         })
-
-        # Per-layer MLP routers: cheap dot-product from current hidden state
-        self.mlp_routers = nn.ModuleList([
-            nn.Linear(config.n_embd, 1, bias=False) for _ in range(config.n_layer)
-        ])
 
         # Rotary embeddings (only used by attention layers, but precompute for all positions)
         self.rotary_seq_len = config.sequence_len * 10
@@ -320,8 +321,8 @@ class GPTSambaMoDFFN(nn.Module):
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
 
         # MLP routers: near-zero so sigmoid(~0) ≈ 0.5, ~50% activation at start
-        for router in self.mlp_routers:
-            torch.nn.init.normal_(router.weight, mean=0.0, std=0.01)
+        for block in self.transformer.h:
+            torch.nn.init.normal_(block.mlp_router.weight, mean=0.0, std=0.01)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -356,7 +357,7 @@ class GPTSambaMoDFFN(nn.Module):
         """
         nparams = sum(p.numel() for p in self.parameters())
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        router_numel = sum(p.numel() for p in self.mlp_routers.parameters())
+        router_numel = sum(block.mlp_router.weight.numel() for block in self.transformer.h)
 
         mamba_scalar_numel = 0
         for name, p in self.named_parameters():

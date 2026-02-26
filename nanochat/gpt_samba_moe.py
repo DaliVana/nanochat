@@ -1,23 +1,24 @@
 """
-Samba model variant: Mamba-2 (SSD) + Sliding Window Attention.
+Samba + MoE model variant: Mamba-2 (SSD) + Sliding Window Attention + Mixture of Experts.
 
-Inspired by Microsoft's Samba architecture, this variant interleaves Mamba-2 layers
-with sliding window attention layers. Mamba layers handle long-range dependencies via
-compressed recurrent state; attention layers (with RoPE + sliding window) handle precise
-local retrieval.
+Combines the Samba architecture (Mamba-2 for long-range + sliding window attention for local)
+with Mixture of Experts (replacing the dense MLP in each block with MoE routing).
 
 Layer composition is configurable via `layer_pattern` (e.g. "MA" = alternating,
-"MMA" = two Mamba per one Attention).
+"MMA" = two Mamba per one Attention). Each block (both Mamba and Attention) uses MoE
+instead of a dense MLP, so total parameters scale with num_experts but per-token FLOPs
+remain approximately constant (iso-FLOP with the dense MLP).
 
-Notable features (inherited from base gpt.py):
+Notable features:
 - rotary embeddings on attention layers
 - QK norm on attention layers
 - untied weights for token embedding and lm_head
-- relu^2 activation in MLP
+- relu^2 activation in expert MLPs
 - no learnable params in rmsnorm, no bias in linear layers
 - GQA support, Flash Attention 3 integration
 - sliding window attention on attention layers
 - value embeddings (ResFormer-style) on attention layers
+- auxiliary-loss-free load balancing (DeepSeekV3)
 """
 
 import math
@@ -32,13 +33,13 @@ from nanochat.common import get_dist_info, print0
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 from nanochat.flash_attention import flash_attn
 from nanochat.mamba2 import Mamba2Layer
-from nanochat.mamba3 import Mamba3Layer
+from nanochat.moe import MoE
 
 from nanochat.fused_rope import apply_rotary_emb_triton
 
 
 @dataclass
-class GPTConfigSamba:
+class GPTConfigSambaMoE:
     sequence_len: int = 32768
     vocab_size: int = 32768
     n_layer: int = 12
@@ -53,10 +54,13 @@ class GPTConfigSamba:
     # Mamba-2 parameters
     mamba_d_state: int = 64     # SSM state dimension
     mamba_d_conv: int = 4       # causal convolution kernel size
-    mamba_expand: int = 1       # expansion factor for inner dim
+    mamba_expand: int = 2       # expansion factor for inner dim
     mamba_ngroups: int = 1      # B/C group count (1=max sharing, n_heads=per-head like original)
     mamba_chunk_size: int = 256 # chunk size for SSD algorithm
-    mamba_version: int = 2      # 2=Mamba-2 (SSD), 3=Mamba-3 (trapezoidal SSD + RoPE)
+    # Mixture of Experts parameters
+    num_experts: int = 8        # number of routed expert MLPs
+    top_k: int = 2              # number of active routed experts per token
+    num_shared_experts: int = 1 # number of shared (always-active) experts
 
 
 def norm(x):
@@ -145,59 +149,37 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
-        x = self.c_proj(x)
-        return x
-
-
 class AttentionBlock(nn.Module):
-    """Transformer block: CausalSelfAttention + MLP, pre-norm residual."""
+    """Transformer block: CausalSelfAttention + MoE, pre-norm residual."""
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.moe = MoE(config)
 
     def forward(self, x, ve, cos_sin, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, kv_cache)
-        x = x + self.mlp(norm(x))
+        x = x + self.moe(norm(x))
         return x
 
 
 class MambaBlock(nn.Module):
-    """Mamba block: Mamba2Layer or Mamba3Layer + MLP, pre-norm residual."""
+    """Mamba-2 block: Mamba2Layer + MoE, pre-norm residual."""
     def __init__(self, config):
         super().__init__()
-        if config.mamba_version == 3:
-            self.mamba = Mamba3Layer(
-                d_model=config.n_embd,
-                d_state=config.mamba_d_state,
-                expand=config.mamba_expand,
-                ngroups=config.mamba_ngroups,
-                chunk_size=config.mamba_chunk_size,
-            )
-        else:
-            self.mamba = Mamba2Layer(
-                d_model=config.n_embd,
-                d_state=config.mamba_d_state,
-                d_conv=config.mamba_d_conv,
-                expand=config.mamba_expand,
-                ngroups=config.mamba_ngroups,
-                chunk_size=config.mamba_chunk_size,
-            )
-        self.mlp = MLP(config)
+        self.mamba = Mamba2Layer(
+            d_model=config.n_embd,
+            d_state=config.mamba_d_state,
+            d_conv=config.mamba_d_conv,
+            expand=config.mamba_expand,
+            ngroups=config.mamba_ngroups,
+            chunk_size=config.mamba_chunk_size,
+        )
+        self.moe = MoE(config)
 
     def forward(self, x):
         mamba_out, _, _ = self.mamba(norm(x))
         x = x + mamba_out
-        x = x + self.mlp(norm(x))
+        x = x + self.moe(norm(x))
         return x
 
 
@@ -209,7 +191,7 @@ def _compute_layer_types(config):
     return [pattern[i % len(pattern)] for i in range(config.n_layer)]
 
 
-class GPTSamba(nn.Module):
+class GPTSambaMoE(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
         """
         NOTE: this __init__ runs in meta device context.
@@ -265,7 +247,28 @@ class GPTSamba(nn.Module):
 
     @torch.no_grad()
     def init_weights(self):
-        """Initialize all weights."""
+        """
+        Initialize all weights.
+
+        wte (embedding):     normal, std=1.0
+        lm_head:             normal, std=0.001
+        for each attention block:
+            attn.c_q:        uniform, std=1/sqrt(n_embd)
+            attn.c_k:        uniform, std=1/sqrt(n_embd)
+            attn.c_v:        uniform, std=1/sqrt(n_embd)
+            attn.c_proj:     zeros
+            moe.router.gate:     uniform, std=1/sqrt(n_embd)
+            moe.experts.w_up:    uniform, std=1/sqrt(n_embd)
+            moe.experts.w_down:  zeros
+            moe.shared_expert:   same pattern
+        for each mamba block:
+            mamba.in_proj:   uniform, std=1/sqrt(n_embd)
+            mamba.conv1d:    kaiming_uniform
+            mamba.A_log:     log-linspace
+            mamba.dt_bias:   uniform(-4, -2)
+            mamba.out_proj:  zeros
+            moe.*:           same as attention block
+        """
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
@@ -274,20 +277,27 @@ class GPTSamba(nn.Module):
         s = 3**0.5 * n_embd**-0.5
 
         for i, block in enumerate(self.transformer.h):
+            # MoE init (shared by both block types)
+            torch.nn.init.uniform_(block.moe.router.gate.weight, -s, s)
+            torch.nn.init.uniform_(block.moe.experts.w_up, -s, s)
+            torch.nn.init.zeros_(block.moe.experts.w_down)
+            if block.moe.shared_expert is not None:
+                torch.nn.init.uniform_(block.moe.shared_expert.w_up.weight, -s, s)
+                torch.nn.init.zeros_(block.moe.shared_expert.w_down.weight)
+            block.moe.router.expert_bias.zero_()
+            block.moe.router.tokens_per_expert_counter.zero_()
+
             if self.layer_types[i] == 'A':
-                # Attention block: same as base gpt.py
+                # Attention block
                 torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
                 torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
                 torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
                 torch.nn.init.zeros_(block.attn.c_proj.weight)
-                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-                torch.nn.init.zeros_(block.mlp.c_proj.weight)
             else:
-                # Mamba block (v2 or v3)
+                # Mamba block
                 mamba = block.mamba
                 torch.nn.init.uniform_(mamba.in_proj.weight, -s, s)
-                if self.config.mamba_version == 2:
-                    torch.nn.init.kaiming_uniform_(mamba.conv1d.weight, a=math.sqrt(5))
+                torch.nn.init.kaiming_uniform_(mamba.conv1d.weight, a=math.sqrt(5))
                 # A_log: log(1..n_heads) for diverse timescales
                 mamba.A_log.copy_(torch.log(torch.linspace(0.001, mamba.n_heads, mamba.n_heads, dtype=torch.float32, device=mamba.A_log.device)))
                 # dt_bias: softplus(-4..-2) gives ~0.02-0.13
@@ -295,9 +305,6 @@ class GPTSamba(nn.Module):
                 torch.nn.init.zeros_(mamba.out_proj.weight)
                 # Re-initialize causal mask buffer (was garbage after to_empty from meta device)
                 mamba._causal_mask.copy_(torch.triu(torch.ones(mamba.chunk_size, mamba.chunk_size, dtype=torch.bool, device=mamba._causal_mask.device), diagonal=1))
-                # MLP in Mamba block: same as base
-                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-                torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
@@ -343,8 +350,9 @@ class GPTSamba(nn.Module):
         Return estimated FLOPs per token (forward + backward).
         Attention layers: 6 * matmul_params + 12*h*q*effective_seq
         Mamba layers: 6 * matmul_params + SSD ops (within-chunk + between-chunk)
+        MoE: only top_k + num_shared experts active per token (iso-FLOP)
 
-        SSD FLOPs per token per layer (forward+backward = 3× forward):
+        SSD FLOPs per token per layer (forward+backward = 3x forward):
           CB computation (like QK^T):    6 * chunk_size * ngroups * d_state
           Weighted sum (like AV):        6 * chunk_size * d_inner
           State delta + contribution:   12 * d_inner * d_state
@@ -355,12 +363,18 @@ class GPTSamba(nn.Module):
         # Exclude non-matmul params
         mamba_scalar_numel = 0
         for name, p in self.named_parameters():
-            if 'A_log' in name or 'dt_bias' in name or 'B_norm_bias' in name or 'C_norm_bias' in name:
+            if 'A_log' in name or 'dt_bias' in name:
                 mamba_scalar_numel += p.numel()
 
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
                           mamba_scalar_numel)
+
+        # MoE: only top_k/num_experts fraction of routed expert params active per token
+        expert_hidden = self.transformer.h[0].moe.expert_hidden_dim
+        routed_params_per_layer = self.config.num_experts * 2 * self.config.n_embd * expert_hidden
+        inactive_per_layer = routed_params_per_layer * (self.config.num_experts - self.config.top_k) // self.config.num_experts
+        nparams_exclude += inactive_per_layer * self.config.n_layer
 
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
 
@@ -376,8 +390,7 @@ class GPTSamba(nn.Module):
         ngroups = self.config.mamba_ngroups
         chunk_size = self.config.mamba_chunk_size
         n_mamba = sum(1 for lt in self.layer_types if lt == 'M')
-        ssd_multiplier = 2 if self.config.mamba_version == 3 else 1  # Two-SSD for Mamba-3
-        ssd_flops = n_mamba * ssd_multiplier * (
+        ssd_flops = n_mamba * (
             6 * chunk_size * ngroups * d_state   # CB (C @ B^T within each chunk)
             + 6 * chunk_size * d_inner            # weighted sum (scores @ x*dt within chunk)
             + 12 * d_inner * d_state              # state delta + state contribution (between chunks)
@@ -387,7 +400,11 @@ class GPTSamba(nn.Module):
         return num_flops_per_token
 
     def num_scaling_params(self):
-        """Return detailed parameter counts for scaling law analysis."""
+        """
+        Return detailed parameter counts for scaling law analysis.
+        For MoE, 'active_*' fields count only the parameters active per token
+        (top_k out of num_experts routed experts, plus shared experts).
+        """
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
@@ -395,6 +412,14 @@ class GPTSamba(nn.Module):
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
+
+        # MoE: inactive expert params
+        expert_hidden = self.transformer.h[0].moe.expert_hidden_dim
+        routed_params_per_layer = self.config.num_experts * 2 * self.config.n_embd * expert_hidden
+        inactive_per_layer = routed_params_per_layer * (self.config.num_experts - self.config.top_k) // self.config.num_experts
+        moe_inactive = inactive_per_layer * self.config.n_layer
+        active_transformer_matrices = transformer_matrices - moe_inactive
+        active_total = total - moe_inactive
 
         # Per-layer-type breakdown
         mamba_params = 0
@@ -411,22 +436,25 @@ class GPTSamba(nn.Module):
             'value_embeds': value_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
+            'active_transformer_matrices': active_transformer_matrices,
             'attn_blocks': attn_params,
             'mamba_blocks': mamba_params,
             'scalars': scalars,
+            'moe_inactive': moe_inactive,
             'total': total,
+            'active_total': active_total,
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
-        # Separate Mamba 1D params (A_log, dt_bias, norm biases) and conv1d from matrix params
+        # Separate Mamba 1D params (A_log, dt_bias) and conv1d from matrix params
         mamba_scalar_params = []
         mamba_conv_params = []
         matrix_params = []
         for name, p in self.transformer.h.named_parameters():
-            if 'A_log' in name or 'dt_bias' in name or 'B_norm_bias' in name or 'C_norm_bias' in name:
+            if 'A_log' in name or 'dt_bias' in name:
                 mamba_scalar_params.append(p)
             elif 'conv1d' in name:
                 mamba_conv_params.append(p)
@@ -470,6 +498,31 @@ class GPTSamba(nn.Module):
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
+
+    def update_moe_balancing(self, coeff=1e-3):
+        """Update expert routing bias for load balancing. Call before optimizer.step()."""
+        for block in self.transformer.h:
+            block.moe.router.update_expert_bias(coeff)
+
+    def get_moe_stats(self):
+        """Collect MoE routing statistics for logging. Call BEFORE update_moe_balancing (which resets counters)."""
+        all_counts = []
+        all_biases = []
+        for block in self.transformer.h:
+            router = block.moe.router
+            all_counts.append(router.tokens_per_expert_counter)
+            all_biases.append(router.expert_bias)
+        counts = torch.stack(all_counts).float()    # (n_layer, num_experts)
+        biases = torch.stack(all_biases).float()    # (n_layer, num_experts)
+        # Load imbalance: coefficient of variation (std/mean) per layer, averaged
+        counts_mean = counts.mean(dim=-1).clamp(min=1)
+        counts_std = counts.std(dim=-1)
+        load_imbalance = (counts_std / counts_mean).mean().item()
+        return {
+            "moe/load_imbalance": load_imbalance,
+            "moe/expert_bias_std": biases.std().item(),
+            "moe/expert_bias_max": biases.abs().max().item(),
+        }
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
@@ -517,7 +570,6 @@ class GPTSamba(nn.Module):
             return loss
         else:
             return logits
-
 
 
     @torch.inference_mode()

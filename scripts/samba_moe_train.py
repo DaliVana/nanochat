@@ -1,14 +1,15 @@
 """
-Train Samba model (Mamba-2 + Sliding Window Attention). From root directory of the project, run as:
+Train Samba + MoE model (Mamba-2 + Sliding Window Attention + Mixture of Experts).
+From root directory of the project, run as:
 
-python -m scripts.samba_train
+python -m scripts.samba_moe_train
 
 or distributed as:
 
-torchrun --nproc_per_node=8 -m scripts.samba_train
+torchrun --nproc_per_node=8 -m scripts.samba_moe_train
 
 If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
-python -m scripts.samba_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
+python -m scripts.samba_moe_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
 """
 
 import os
@@ -24,7 +25,7 @@ from contextlib import nullcontext, contextmanager
 import wandb
 import torch
 
-from nanochat.gpt_samba import GPTSamba as GPT, GPTConfigSamba as GPTConfig
+from nanochat.gpt_samba_moe import GPTSambaMoE as GPT, GPTConfigSambaMoE as GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
 from nanochat.tokenizer import get_o200k_harmony_tokenizer, compute_token_bytes
@@ -37,7 +38,7 @@ print_banner()
 
 # -----------------------------------------------------------------------------
 # CLI arguments
-parser = argparse.ArgumentParser(description="Pretrain Samba model (Mamba-2 + Sliding Window Attention)")
+parser = argparse.ArgumentParser(description="Pretrain Samba + MoE model (Mamba-2 + Sliding Window Attention + Mixture of Experts)")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
@@ -55,11 +56,14 @@ parser.add_argument("--sliding-window", type=int, default=1024, help="sliding wi
 parser.add_argument("--layer-pattern", type=str, default="MA", help="layer pattern: M=Mamba-2, A=Attention (e.g. 'MA', 'MMA', 'MMMA')")
 parser.add_argument("--mamba-d-state", type=int, default=64, help="Mamba-2 SSM state dimension")
 parser.add_argument("--mamba-d-conv", type=int, default=4, help="Mamba-2 causal convolution kernel size")
-parser.add_argument("--mamba-expand", type=int, default=1, help="Mamba-2 expansion factor for inner dim")
+parser.add_argument("--mamba-expand", type=int, default=2, help="Mamba-2 expansion factor for inner dim")
 parser.add_argument("--mamba-ngroups", type=int, default=1, help="Mamba-2 B/C group count (1=max sharing, -1=per-head)")
 parser.add_argument("--mamba-chunk-size", type=int, default=128, help="Mamba-2 chunk size for SSD algorithm")
-parser.add_argument("--mamba-version", type=int, default=2, choices=[2, 3], help="Mamba version: 2=Mamba-2 (SSD), 3=Mamba-3 (trapezoidal SSD + RoPE)")
 parser.add_argument("--gradient-checkpointing", action="store_true", help="recompute forward during backward to save memory (slower but fits longer contexts)")
+# Mixture of Experts (MoE) - expert FFN routing
+parser.add_argument("--num-experts", type=int, default=8, help="Number of routed expert MLPs per layer (default: 8)")
+parser.add_argument("--top-k", type=int, default=2, help="Number of active routed experts per token (default: 2)")
+parser.add_argument("--num-shared-experts", type=int, default=1, help="Number of shared (always-active) expert MLPs (default: 1)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -168,7 +172,9 @@ def build_model_meta(depth):
         mamba_expand=args.mamba_expand,
         mamba_ngroups=mamba_ngroups,
         mamba_chunk_size=args.mamba_chunk_size,
-        mamba_version=args.mamba_version,
+        num_experts=args.num_experts,
+        top_k=args.top_k,
+        num_shared_experts=args.num_shared_experts,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -180,6 +186,7 @@ model_config = model.config
 model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 print0(f"Layer types: {''.join(model.layer_types)}")
+print0(f"MoE: {model_config.num_experts} experts, top-{model_config.top_k}, {model_config.num_shared_experts} shared")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
 if args.gradient_checkpointing:
@@ -188,8 +195,8 @@ if args.gradient_checkpointing:
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
-output_dirname = args.model_tag if args.model_tag else f"samba_d{args.depth}" # e.g. samba_d12
-checkpoint_dir = os.path.join(base_dir, "samba_checkpoints", output_dirname)
+output_dirname = args.model_tag if args.model_tag else f"samba_moe_d{args.depth}" # e.g. samba_moe_d12
+checkpoint_dir = os.path.join(base_dir, "samba_moe_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
@@ -267,9 +274,7 @@ def disable_fp8(model):
 orig_model = model
 torch._dynamo.config.capture_scalar_outputs = True
 # Whole-model compile: SSD forward/backward are registered as custom ops so
-# torch.compile treats them as opaque nodes and fuses surrounding ops. Whole-model
-# (vs per-block) eliminates Python overhead at block boundaries and enables cross-block
-# fusion. dynamic=False because training shapes are fixed within each phase.
+# torch.compile treats them as opaque nodes and fuses surrounding ops.
 # Skip compilation on MPS — Metal shader compiler can't handle large-vocab kernels.
 if device_type == "cuda":
     model = torch.compile(model, dynamic=False)
@@ -287,8 +292,9 @@ num_flops_per_token = model.estimate_flops()
 print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
 def get_scaling_params(m):
+    # For MoE, use active params for scaling laws (inactive experts don't contribute to per-token compute)
     params_counts = m.num_scaling_params()
-    scaling_params = params_counts['transformer_matrices'] + params_counts['lm_head']
+    scaling_params = params_counts['active_transformer_matrices'] + params_counts['lm_head']
     return scaling_params
 num_scaling_params = get_scaling_params(model)
 target_tokens = int(args.target_param_data_ratio * num_scaling_params)
@@ -551,6 +557,10 @@ while True:
         loss = loss / grad_accum_steps
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader)
+    # Collect MoE stats before bias update (which resets counters)
+    moe_stats = model.get_moe_stats()
+    # Update expert routing bias for load balancing (auxiliary-loss-free, DeepSeekV3)
+    model.update_moe_balancing(coeff=1e-3)
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -606,6 +616,9 @@ while True:
             log_data["schedule/phase"] = current_phase_idx
             log_data["schedule/batch_size"] = current_batch_size
             log_data["schedule/seq_len"] = current_seq_len
+        # Add MoE routing statistics
+        if moe_stats:
+            log_data.update(moe_stats)
         wandb_run.log(log_data)
 
     # state update
@@ -627,7 +640,7 @@ if val_bpb is not None:
 
 # Log to report
 from nanochat.report import get_report
-get_report().log(section="Samba model training", data=[
+get_report().log(section="Samba + MoE model training", data=[
     user_config,
     {
         "Number of parameters": num_params,
