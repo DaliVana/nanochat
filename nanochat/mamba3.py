@@ -306,12 +306,8 @@ class Mamba3Layer(nn.Module):
             # SISO + PyTorch: fused path — shared decay + single state propagation
             return self._two_ssd_fused_siso(x_gamma, x_beta, A, B, B_shifted, C, dt)
         else:
-            # MIMO: two separate calls
-            y_gamma = self._ssd_mimo_chunked(x_gamma, A, B, C, dt)
-            del x_gamma
-            y_beta = self._ssd_mimo_chunked(x_beta, A, B_shifted, C, dt)
-            del x_beta, B_shifted
-            return y_gamma + y_beta
+            # MIMO: fused path — shared decay + combined state propagation
+            return self._two_ssd_fused_mimo(x_gamma, x_beta, A, B, B_shifted, C, dt)
 
     def _ssd_dispatch(self, x, A, B, C, dt):
         """Dispatch to MIMO, Triton, or PyTorch SSD (single-call path)."""
@@ -426,6 +422,157 @@ class Mamba3Layer(nn.Module):
 
         y = (y_intra + y_inter).to(x_gamma.dtype)
         y = y.contiguous().view(B_batch, T_padded, n_heads, head_dim)
+        if pad_len > 0:
+            y = y[:, :T]
+        return y
+
+    def _two_ssd_fused_mimo(self, x_g, x_b, A, Bg, Bb, C, dt):
+        """Fused Two-SSD for MIMO: shared decay + combined state propagation.
+
+        Optimizations over two separate _ssd_mimo_chunked calls:
+        1. Decay infrastructure (decay_matrix, cum_log_dA, etc.) computed once
+        2. delta_h combined before state propagation (one sequential loop)
+        3. Broadcasting replaces repeat_interleave for within-chunk scores
+        4. Group-aware einsum avoids B expansion for between-chunk
+        5. x*dt pre-computed once for all ranks
+        """
+        batch_size, T, n_heads, R, head_dim = x_g.shape
+        d_state = C.shape[-1]
+        ngroups = C.shape[-2]
+        scale = self._ssd_scale
+        chunk_size = min(self.chunk_size, T)
+
+        # Pad T to multiple of chunk_size
+        pad_len = 0
+        if T % chunk_size != 0:
+            pad_len = chunk_size - (T % chunk_size)
+            x_g = F.pad(x_g, (0, 0, 0, 0, 0, 0, 0, pad_len))
+            x_b = F.pad(x_b, (0, 0, 0, 0, 0, 0, 0, pad_len))
+            Bg  = F.pad(Bg,  (0, 0, 0, 0, 0, 0, 0, pad_len))
+            Bb  = F.pad(Bb,  (0, 0, 0, 0, 0, 0, 0, pad_len))
+            C   = F.pad(C,   (0, 0, 0, 0, 0, pad_len))
+            dt  = F.pad(dt,  (0, 0, 0, pad_len))
+        T_padded = T + pad_len
+        n_chunks = T_padded // chunk_size
+        L = chunk_size
+
+        # Reshape into chunks
+        x_g = x_g.view(batch_size, n_chunks, L, n_heads, R, head_dim)
+        x_b = x_b.view(batch_size, n_chunks, L, n_heads, R, head_dim)
+        Bg  = Bg.view(batch_size, n_chunks, L, ngroups, R, d_state)
+        Bb  = Bb.view(batch_size, n_chunks, L, ngroups, R, d_state)
+        C_  = C.view(batch_size, n_chunks, L, ngroups, d_state)
+        dt_ = dt.view(batch_size, n_chunks, L, n_heads)
+
+        # === SHARED DECAY (computed once instead of twice) ===
+        log_dA = (A * dt_).float()
+        cum_log_dA = torch.cumsum(log_dA, dim=2)
+
+        log_decay_matrix = cum_log_dA.unsqueeze(3) - cum_log_dA.unsqueeze(2)
+        mask = self._causal_mask[:L, :L].reshape(1, 1, L, L, 1)
+        log_decay_matrix = log_decay_matrix.masked_fill(mask, float('-inf'))
+        decay_matrix = torch.exp(log_decay_matrix)
+        del log_decay_matrix
+
+        # Pre-compute x*dt for all ranks (reused in within-chunk and between-chunk)
+        dt_broad = dt_.unsqueeze(-1).unsqueeze(-1)  # (batch, nc, L, nh, 1, 1)
+        x_dt_g = (x_g * dt_broad).float()
+        x_dt_b = (x_b * dt_broad).float()
+
+        C_f = C_.float()
+
+        # Pre-reshape decay for group broadcasting (avoid repeat_interleave in loop)
+        hpg = n_heads // ngroups
+        if ngroups < n_heads:
+            decay_grouped = decay_matrix.view(
+                batch_size, n_chunks, L, L, ngroups, hpg)
+
+        # === WITHIN-CHUNK: R-loop, both passes share decay_matrix ===
+        y_intra = torch.zeros(batch_size, n_chunks, L, n_heads, head_dim,
+                               device=x_g.device, dtype=torch.float32)
+
+        for r in range(R):
+            Bg_r = Bg[:, :, :, :, r, :].float()
+            Bb_r = Bb[:, :, :, :, r, :].float()
+            scores_g = torch.einsum('bcign, bcjgn -> bcijg', C_f, Bg_r) * scale
+            scores_b = torch.einsum('bcign, bcjgn -> bcijg', C_f, Bb_r) * scale
+
+            # Apply decay via broadcasting (no repeat_interleave allocation)
+            if ngroups < n_heads:
+                scores_g = (scores_g.unsqueeze(-1) * decay_grouped
+                            ).reshape(batch_size, n_chunks, L, L, n_heads)
+                scores_b = (scores_b.unsqueeze(-1) * decay_grouped
+                            ).reshape(batch_size, n_chunks, L, L, n_heads)
+            else:
+                scores_g = scores_g * decay_matrix
+                scores_b = scores_b * decay_matrix
+
+            y_intra = y_intra + (
+                torch.einsum('bcijh, bcjhp -> bcihp',
+                             scores_g, x_dt_g[:, :, :, :, r, :])
+                + torch.einsum('bcijh, bcjhp -> bcihp',
+                               scores_b, x_dt_b[:, :, :, :, r, :]))
+
+        del decay_matrix
+        if ngroups < n_heads:
+            del decay_grouped
+
+        # === BETWEEN-CHUNK: shared decay, combined delta_h ===
+        chunk_decay = torch.exp(cum_log_dA[:, :, -1, :])
+        decay_to_end = torch.exp(cum_log_dA[:, :, -1:, :] - cum_log_dA)
+
+        # Group-aware einsum: keep B in group space, restructure heads as (ngroups, hpg)
+        # This avoids expanding B from ngroups to n_heads entirely.
+        delta_h = torch.zeros(batch_size, n_chunks, n_heads, head_dim, d_state,
+                               device=x_g.device, dtype=torch.float32)
+        if ngroups < n_heads:
+            decay_to_end_g = decay_to_end.view(
+                batch_size, n_chunks, L, ngroups, hpg)
+            for r in range(R):
+                xg_r = x_dt_g[:, :, :, :, r, :].view(
+                    batch_size, n_chunks, L, ngroups, hpg, head_dim)
+                xb_r = x_dt_b[:, :, :, :, r, :].view(
+                    batch_size, n_chunks, L, ngroups, hpg, head_dim)
+                delta_h = delta_h + (
+                    torch.einsum('bclgk, bclgkp, bclgn -> bcgkpn',
+                                 decay_to_end_g, xg_r,
+                                 Bg[:, :, :, :, r, :].float())
+                    + torch.einsum('bclgk, bclgkp, bclgn -> bcgkpn',
+                                   decay_to_end_g, xb_r,
+                                   Bb[:, :, :, :, r, :].float())
+                ).reshape(batch_size, n_chunks, n_heads, head_dim, d_state)
+        else:
+            for r in range(R):
+                delta_h = delta_h + (
+                    torch.einsum('bclh, bclhp, bclhn -> bchpn',
+                                 decay_to_end, x_dt_g[:, :, :, :, r, :],
+                                 Bg[:, :, :, :, r, :].float())
+                    + torch.einsum('bclh, bclhp, bclhn -> bchpn',
+                                   decay_to_end, x_dt_b[:, :, :, :, r, :],
+                                   Bb[:, :, :, :, r, :].float()))
+        del x_dt_g, x_dt_b
+
+        # Single state propagation pass (instead of two)
+        states = delta_h.new_zeros(batch_size, n_heads, head_dim, d_state)
+        all_states = []
+        for c in range(n_chunks):
+            all_states.append(states)
+            states = chunk_decay[:, c, :, None, None] * states + delta_h[:, c]
+        all_states = torch.stack(all_states, dim=1)
+        del delta_h
+
+        # Inter-chunk output
+        if ngroups < n_heads:
+            C_expanded = C_.repeat_interleave(n_heads // ngroups, dim=-2)
+        else:
+            C_expanded = C_
+        decay_from_start = torch.exp(cum_log_dA)
+        state_contribution = torch.einsum('bcihn, bchpn -> bcihp',
+                                           C_expanded.float(), all_states)
+        y_inter = state_contribution * (decay_from_start.unsqueeze(-1) * scale)
+
+        y = (y_intra + y_inter).to(x_g.dtype)
+        y = y.contiguous().view(batch_size, T_padded, n_heads, head_dim)
         if pad_len > 0:
             y = y[:, :T]
         return y
