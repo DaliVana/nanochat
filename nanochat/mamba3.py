@@ -292,16 +292,29 @@ class Mamba3Layer(nn.Module):
             B_shifted = F.pad(B[:, :-1], (0, 0, 0, 0, 1, 0))
         del lam, coeff_beta
 
-        # Both SSD calls reuse the Mamba-2 kernel with the same A and dt
-        y_gamma = self._ssd_dispatch(x_gamma, A, B, C, dt)
-        del x_gamma
-        y_beta = self._ssd_dispatch(x_beta, A, B_shifted, C, dt)
-        del x_beta, B_shifted
-
-        return y_gamma + y_beta
+        # Dispatch to most efficient path
+        R = self.mimo_rank
+        T = x_heads.shape[1]
+        if R == 1 and _HAS_TRITON and x_heads.device.type == 'cuda' and T >= self.chunk_size:
+            # SISO + Triton: two kernel calls (Triton computes decay on-the-fly in registers)
+            y_gamma = self._ssd_triton(x_gamma, A, B, C, dt)
+            del x_gamma
+            y_beta = self._ssd_triton(x_beta, A, B_shifted, C, dt)
+            del x_beta, B_shifted
+            return y_gamma + y_beta
+        elif R == 1:
+            # SISO + PyTorch: fused path — shared decay + single state propagation
+            return self._two_ssd_fused_siso(x_gamma, x_beta, A, B, B_shifted, C, dt)
+        else:
+            # MIMO: two separate calls
+            y_gamma = self._ssd_mimo_chunked(x_gamma, A, B, C, dt)
+            del x_gamma
+            y_beta = self._ssd_mimo_chunked(x_beta, A, B_shifted, C, dt)
+            del x_beta, B_shifted
+            return y_gamma + y_beta
 
     def _ssd_dispatch(self, x, A, B, C, dt):
-        """Dispatch to MIMO, Triton, or PyTorch SSD."""
+        """Dispatch to MIMO, Triton, or PyTorch SSD (single-call path)."""
         if self.mimo_rank > 1:
             # MIMO: always use PyTorch path (can't modify Triton kernel for rank-R)
             return self._ssd_mimo_chunked(x, A, B, C, dt)
@@ -312,6 +325,110 @@ class Mamba3Layer(nn.Module):
             return self._ssd_triton(x, A, B, C, dt)
         else:
             return self._ssd_chunked(x, A, B, C, dt)
+
+    def _two_ssd_fused_siso(self, x_gamma, x_beta, A, B_gamma, B_beta, C, dt):
+        """Fused Two-SSD for SISO PyTorch path.
+
+        Computes decay infrastructure once (instead of twice) and combines
+        delta_h before state propagation (one sequential loop instead of two).
+        """
+        B_batch, T, n_heads, head_dim = x_gamma.shape
+        d_state = C.shape[-1]
+        ngroups = self.ngroups
+        scale = self._ssd_scale
+        chunk_size = min(self.chunk_size, T)
+
+        # Pad to multiple of chunk_size
+        pad_len = 0
+        if T % chunk_size != 0:
+            pad_len = chunk_size - (T % chunk_size)
+            x_gamma = F.pad(x_gamma, (0, 0, 0, 0, 0, pad_len))
+            x_beta  = F.pad(x_beta,  (0, 0, 0, 0, 0, pad_len))
+            B_gamma = F.pad(B_gamma, (0, 0, 0, 0, 0, pad_len))
+            B_beta  = F.pad(B_beta,  (0, 0, 0, 0, 0, pad_len))
+            C       = F.pad(C,       (0, 0, 0, 0, 0, pad_len))
+            dt      = F.pad(dt,      (0, 0, 0, pad_len))
+        T_padded = T + pad_len
+        n_chunks = T_padded // chunk_size
+        L = chunk_size
+
+        # Reshape into chunks
+        x_g = x_gamma.view(B_batch, n_chunks, L, n_heads, head_dim)
+        x_b = x_beta.view(B_batch, n_chunks, L, n_heads, head_dim)
+        Bg  = B_gamma.view(B_batch, n_chunks, L, ngroups, d_state)
+        Bb  = B_beta.view(B_batch, n_chunks, L, ngroups, d_state)
+        C_  = C.view(B_batch, n_chunks, L, ngroups, d_state)
+        dt_ = dt.view(B_batch, n_chunks, L, n_heads)
+
+        # === SHARED DECAY (computed once instead of twice) ===
+        log_dA = (A * dt_).float()
+        cum_log_dA = torch.cumsum(log_dA, dim=2)
+
+        log_decay_matrix = cum_log_dA.unsqueeze(3) - cum_log_dA.unsqueeze(2)
+        mask = self._causal_mask[:L, :L].reshape(1, 1, L, L, 1)
+        log_decay_matrix = log_decay_matrix.masked_fill(mask, float('-inf'))
+        decay_matrix = torch.exp(log_decay_matrix)
+        del log_decay_matrix
+
+        # === WITHIN-CHUNK: both passes share decay_matrix ===
+        C_f = C_.float()
+        scores_g = torch.einsum('bcign, bcjgn -> bcijg', C_f, Bg.float()) * scale
+        scores_b = torch.einsum('bcign, bcjgn -> bcijg', C_f, Bb.float()) * scale
+        if ngroups < n_heads:
+            scores_g = scores_g.repeat_interleave(n_heads // ngroups, dim=-1)
+            scores_b = scores_b.repeat_interleave(n_heads // ngroups, dim=-1)
+        scores_g = scores_g * decay_matrix
+        scores_b = scores_b * decay_matrix
+        del decay_matrix
+
+        x_dt_g = (x_g * dt_.unsqueeze(-1)).float()
+        x_dt_b = (x_b * dt_.unsqueeze(-1)).float()
+        y_intra = (torch.einsum('bcijh, bcjhp -> bcihp', scores_g, x_dt_g)
+                   + torch.einsum('bcijh, bcjhp -> bcihp', scores_b, x_dt_b))
+        del scores_g, scores_b
+
+        # === BETWEEN-CHUNK: shared decay, combined delta_h ===
+        chunk_decay = torch.exp(cum_log_dA[:, :, -1, :])
+        decay_to_end = torch.exp(cum_log_dA[:, :, -1:, :] - cum_log_dA)
+
+        if ngroups < n_heads:
+            Bg_exp = Bg.repeat_interleave(n_heads // ngroups, dim=-2)
+            Bb_exp = Bb.repeat_interleave(n_heads // ngroups, dim=-2)
+        else:
+            Bg_exp, Bb_exp = Bg, Bb
+
+        # Sum delta_h from both passes BEFORE state propagation (linearity of recurrence)
+        delta_h = (torch.einsum('bclh, bclhp, bclhn -> bchpn',
+                                decay_to_end, x_dt_g, Bg_exp.float())
+                   + torch.einsum('bclh, bclhp, bclhn -> bchpn',
+                                  decay_to_end, x_dt_b, Bb_exp.float()))
+        del x_dt_g, x_dt_b
+
+        # Single state propagation pass (instead of two)
+        states = torch.zeros(B_batch, n_heads, head_dim, d_state,
+                             device=x_gamma.device, dtype=torch.float32)
+        all_states = []
+        for c in range(n_chunks):
+            all_states.append(states)
+            states = chunk_decay[:, c, :, None, None] * states + delta_h[:, c]
+        all_states = torch.stack(all_states, dim=1)
+        del delta_h
+
+        # Inter-chunk output
+        if ngroups < n_heads:
+            C_expanded = C_.repeat_interleave(n_heads // ngroups, dim=-2)
+        else:
+            C_expanded = C_
+        decay_from_start = torch.exp(cum_log_dA)
+        state_contribution = torch.einsum('bcihn, bchpn -> bcihp',
+                                           C_expanded.float(), all_states)
+        y_inter = state_contribution * (decay_from_start.unsqueeze(-1) * scale)
+
+        y = (y_intra + y_inter).to(x_gamma.dtype)
+        y = y.contiguous().view(B_batch, T_padded, n_heads, head_dim)
+        if pad_len > 0:
+            y = y[:, :T]
+        return y
 
     def _ssd_triton(self, x, A, B, C, dt):
         """Triton forward (reuses Mamba-2 custom op). SISO only."""
@@ -409,15 +526,18 @@ class Mamba3Layer(nn.Module):
         y_intra = torch.zeros(batch_size, n_chunks, L, n_heads, head_dim,
                                device=x.device, dtype=torch.float32)
 
+        C_f = C_.float()  # cast once, reuse across R iterations
+        dt_exp = dt.unsqueeze(-1)  # pre-expand for x * dt
+
         for r in range(R):
             # Scores for rank r: C @ B_r^T
             scores_r = torch.einsum('bcign, bcjgn -> bcijg',
-                                     C_.float(), B_[:, :, :, :, r, :].float()) * scale
+                                     C_f, B_[:, :, :, :, r, :].float()) * scale
             if ngroups < n_heads:
                 scores_r = scores_r.repeat_interleave(n_heads // ngroups, dim=-1)
             scores_r = scores_r * decay_matrix
 
-            x_dt_r = (x[:, :, :, :, r, :] * dt.unsqueeze(-1)).float()
+            x_dt_r = (x[:, :, :, :, r, :] * dt_exp).float()
             y_intra = y_intra + torch.einsum('bcijh, bcjhp -> bcihp', scores_r, x_dt_r)
 
         del decay_matrix  # free large (batch, nc, L, L, nh) tensor
@@ -436,7 +556,7 @@ class Mamba3Layer(nn.Module):
             B_expanded = B_
 
         for r in range(R):
-            x_dt_r = (x[:, :, :, :, r, :] * dt.unsqueeze(-1)).float()
+            x_dt_r = (x[:, :, :, :, r, :] * dt_exp).float()
             delta_h = delta_h + torch.einsum('bclh, bclhp, bclhn -> bchpn',
                                               decay_to_end, x_dt_r,
                                               B_expanded[:, :, :, :, r, :].float())
