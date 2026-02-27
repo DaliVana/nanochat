@@ -1,12 +1,15 @@
 """
-Correctness tests for Mamba-3 layer.
+Correctness tests for Mamba-3 layer (including MIMO).
 
 Tests:
-1. Two-SSD chunked output matches naive trapezoidal recurrence
-2. Data-dependent RoPE correctness
-3. Gradient flow through all parameters
-4. Output shape compatibility with Mamba-2
-5. Config dispatch (mamba_version=3 creates Mamba3Layer)
+1. Data-dependent RoPE correctness
+2. Gradient flow through all parameters
+3. Output shape compatibility with Mamba-2
+4. Config dispatch (mamba_version=3 creates Mamba3Layer)
+5. Two-SSD chunked output matches naive trapezoidal recurrence
+6. MIMO gradient flow (R=2)
+7. MIMO output shape (R=4)
+8. MIMO recurrent vs chunked (R=2)
 
 Usage:
     uv run python -m scripts.test_mamba3           # CPU tests
@@ -200,6 +203,122 @@ def test_config_dispatch():
     return passed
 
 
+def test_mimo_gradient_flow():
+    """Verify gradients flow through all MIMO Mamba3Layer parameters."""
+    from nanochat.mamba3 import Mamba3Layer
+
+    torch.manual_seed(42)
+    device = "cpu"
+    dtype = torch.float32
+
+    batch, T = 2, 32
+    d_model, d_state, chunk_size = 64, 16, 16
+
+    layer = Mamba3Layer(d_model=d_model, d_state=d_state, expand=2,
+                        chunk_size=chunk_size, mimo_rank=2)
+    layer.to(device=device, dtype=dtype)
+
+    with torch.no_grad():
+        layer.A_log.copy_(torch.log(torch.linspace(0.001, layer.n_heads, layer.n_heads)))
+        torch.nn.init.uniform_(layer.dt_bias, -4.0, -2.0)
+
+    x = torch.randn(batch, T, d_model, device=device, dtype=dtype, requires_grad=True)
+    y, _, _ = layer(x)
+    loss = y.sum()
+    loss.backward()
+
+    all_pass = True
+    for name, p in layer.named_parameters():
+        has_grad = p.grad is not None
+        no_nan = has_grad and not p.grad.isnan().any()
+        no_inf = has_grad and not p.grad.isinf().any()
+        ok = has_grad and no_nan and no_inf
+        if not ok:
+            print(f"  FAIL: {name} grad={'None' if not has_grad else 'has NaN/Inf'}")
+            all_pass = False
+
+    if x.grad is None or x.grad.isnan().any() or x.grad.isinf().any():
+        print(f"  FAIL: input gradient issue")
+        all_pass = False
+
+    print(f"  MIMO gradient flow (R=2): {'PASS' if all_pass else 'FAIL'}")
+    return all_pass
+
+
+def test_mimo_shape():
+    """Verify MIMO Mamba3Layer produces correct output shape."""
+    from nanochat.mamba3 import Mamba3Layer
+
+    torch.manual_seed(42)
+    d_model, d_state, expand, chunk_size = 64, 16, 2, 16
+    batch, T = 2, 32
+
+    m3_siso = Mamba3Layer(d_model=d_model, d_state=d_state, expand=expand,
+                           chunk_size=chunk_size, mimo_rank=1)
+    m3_mimo = Mamba3Layer(d_model=d_model, d_state=d_state, expand=expand,
+                           chunk_size=chunk_size, mimo_rank=4)
+
+    x = torch.randn(batch, T, d_model)
+
+    with torch.no_grad():
+        y_siso, _, _ = m3_siso(x)
+        y_mimo, _, _ = m3_mimo(x)
+
+    shape_ok = y_siso.shape == y_mimo.shape == (batch, T, d_model)
+    print(f"  MIMO shape: siso={y_siso.shape}, mimo_r4={y_mimo.shape} "
+          f"{'PASS' if shape_ok else 'FAIL'}")
+    return shape_ok
+
+
+def test_mimo_recurrent_vs_chunked():
+    """Verify MIMO trapezoidal recurrent matches MIMO Two-SSD chunked."""
+    from nanochat.mamba3 import Mamba3Layer
+
+    torch.manual_seed(42)
+    device = "cpu"
+    dtype = torch.float32
+
+    batch, T = 2, 64
+    d_model, d_state, expand, chunk_size = 64, 16, 2, 16
+    mimo_rank = 2
+
+    layer = Mamba3Layer(d_model=d_model, d_state=d_state, expand=expand,
+                        chunk_size=chunk_size, mimo_rank=mimo_rank)
+    layer.to(device=device, dtype=dtype)
+    layer.eval()
+
+    with torch.no_grad():
+        layer.A_log.copy_(torch.log(torch.linspace(0.001, layer.n_heads, layer.n_heads)))
+        torch.nn.init.uniform_(layer.dt_bias, -4.0, -2.0)
+
+    x = torch.randn(batch, T, d_model, device=device, dtype=dtype)
+
+    # Chunked (training) path
+    with torch.no_grad():
+        y_chunked, _, _ = layer(x, ssm_state=None)
+
+    # Recurrent (inference) path
+    with torch.no_grad():
+        h = torch.zeros(batch, layer.n_heads, layer.head_dim, d_state, device=device, dtype=dtype)
+        prev_Bx = torch.zeros_like(h)
+        ssm_state = {'h': h, 'prev_Bx': prev_Bx}
+        y_recurrent, _ = layer(x, ssm_state=ssm_state)[:2]
+
+    max_diff = (y_chunked - y_recurrent).abs().max().item()
+    rel_diff = max_diff / (y_chunked.abs().max().item() + 1e-8)
+    cos_sim = F.cosine_similarity(
+        y_chunked.reshape(-1).unsqueeze(0),
+        y_recurrent.reshape(-1).unsqueeze(0)
+    ).item()
+
+    print(f"  MIMO recurrent vs chunked (R={mimo_rank}): "
+          f"max_abs={max_diff:.6f}, rel={rel_diff:.6f}, cos_sim={cos_sim:.6f}")
+
+    passed = cos_sim > 0.95 and rel_diff < 0.1
+    print(f"  {'PASS' if passed else 'FAIL'}")
+    return passed
+
+
 def test_triton_dispatch():
     """Test that Mamba-3 correctly dispatches to Triton SSD on CUDA."""
     from nanochat.mamba3 import Mamba3Layer, _HAS_TRITON
@@ -254,9 +373,18 @@ if __name__ == "__main__":
     print("\n5. Trapezoidal vs Recurrent:")
     all_pass &= test_trapezoidal_vs_recurrent()
 
+    print("\n6. MIMO gradient flow:")
+    all_pass &= test_mimo_gradient_flow()
+
+    print("\n7. MIMO shape:")
+    all_pass &= test_mimo_shape()
+
+    print("\n8. MIMO recurrent vs chunked:")
+    all_pass &= test_mimo_recurrent_vs_chunked()
+
     if use_cuda:
         assert torch.cuda.is_available(), "CUDA required for --cuda tests"
-        print("\n6. Triton dispatch (CUDA):")
+        print("\n9. Triton dispatch (CUDA):")
         all_pass &= test_triton_dispatch()
 
     if all_pass:

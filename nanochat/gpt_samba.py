@@ -57,6 +57,7 @@ class GPTConfigSamba:
     mamba_ngroups: int = 1      # B/C group count (1=max sharing, n_heads=per-head like original)
     mamba_chunk_size: int = 256 # chunk size for SSD algorithm
     mamba_version: int = 2      # 2=Mamba-2 (SSD), 3=Mamba-3 (trapezoidal SSD + RoPE)
+    mimo_rank: int = 1          # MIMO rank for Mamba-3 (1=SISO, >1=rank-R shared-state MIMO)
 
 
 def norm(x):
@@ -182,6 +183,7 @@ class MambaBlock(nn.Module):
                 expand=config.mamba_expand,
                 ngroups=config.mamba_ngroups,
                 chunk_size=config.mamba_chunk_size,
+                mimo_rank=config.mimo_rank,
             )
         else:
             self.mamba = Mamba2Layer(
@@ -377,10 +379,11 @@ class GPTSamba(nn.Module):
         chunk_size = self.config.mamba_chunk_size
         n_mamba = sum(1 for lt in self.layer_types if lt == 'M')
         ssd_multiplier = 2 if self.config.mamba_version == 3 else 1  # Two-SSD for Mamba-3
+        mimo_rank = self.config.mimo_rank if self.config.mamba_version == 3 else 1
         ssd_flops = n_mamba * ssd_multiplier * (
-            6 * chunk_size * ngroups * d_state   # CB (C @ B^T within each chunk)
-            + 6 * chunk_size * d_inner            # weighted sum (scores @ x*dt within chunk)
-            + 12 * d_inner * d_state              # state delta + state contribution (between chunks)
+            6 * chunk_size * ngroups * d_state * mimo_rank   # CB scores (R ranks)
+            + 6 * chunk_size * d_inner * mimo_rank            # weighted sum (R ranks)
+            + 12 * d_inner * d_state * mimo_rank              # state delta (rank-R)
         )
 
         num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops + ssd_flops

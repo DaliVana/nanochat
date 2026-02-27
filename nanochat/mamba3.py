@@ -16,6 +16,11 @@ Improvements over Mamba-2:
 4. No conv1d: The trapezoidal rule's dependency on x_{t-1} subsumes
    the role of the short causal convolution from Mamba-2.
 
+5. MIMO (Multi-Input Multi-Output): Rank-R expansion of x and B projections.
+   State update becomes a rank-R matmul instead of rank-1 outer product,
+   increasing arithmetic intensity from ~2.5 to ~2.5R FLOPs/byte.
+   Controlled by mimo_rank parameter (1=SISO, >1=MIMO).
+
 References:
 - Mamba-3: https://openreview.net/forum?id=HwCvaJOiCj
 - Mamba-2: https://arxiv.org/abs/2405.21060
@@ -46,24 +51,27 @@ def _apply_rope_pairs(x, cos, sin):
 
 class Mamba3Layer(nn.Module):
     """
-    Mamba-3 (Trapezoidal SSD) layer.
+    Mamba-3 (Trapezoidal SSD) layer with optional MIMO.
 
     Architecture:
     1. Input projection: x -> (z, x_raw, B, C, dt, lambda, theta)
     2. SiLU on x_raw (no conv1d)
     3. QK-norm on B and C
     4. Data-dependent RoPE on B and C
-    5. Two-SSD scan (gamma-SSD + beta-SSD)
+    5. Two-SSD scan (gamma-SSD + beta-SSD), with MIMO rank-R if mimo_rank > 1
     6. Output gate: y = rms_norm(y) * silu(z)
     7. Output projection
     """
 
-    def __init__(self, d_model, d_state=64, expand=2, n_heads=None, ngroups=1, chunk_size=256):
+    def __init__(self, d_model, d_state=64, expand=2, n_heads=None, ngroups=1,
+                 chunk_size=256, mimo_rank=1):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
         self.chunk_size = chunk_size
+        self.mimo_rank = mimo_rank
         assert d_state % 2 == 0, f"d_state must be even for RoPE, got {d_state}"
+        assert mimo_rank >= 1, f"mimo_rank must be >= 1, got {mimo_rank}"
 
         # Inner dimension (expanded)
         self.d_inner = int(expand * d_model)
@@ -75,12 +83,15 @@ class Mamba3Layer(nn.Module):
         self.ngroups = ngroups
         assert self.n_heads % self.ngroups == 0, f"n_heads ({self.n_heads}) must be divisible by ngroups ({self.ngroups})"
 
-        # Input projection: z + x + B + C + dt + lambda + theta
+        # Input projection: z + x*R + B*R + C + dt + lambda + theta
+        R = mimo_rank
         self.bc_dim = self.ngroups * self.d_state
-        d_proj = (2 * self.d_inner          # z + x
-                  + 2 * self.bc_dim         # B + C
-                  + 2 * self.n_heads        # dt + lambda
-                  + self.d_state // 2)      # theta (RoPE frequencies)
+        d_proj = (self.d_inner                    # z (gate, single rank)
+                  + self.d_inner * R              # x (R copies for MIMO)
+                  + self.bc_dim * R               # B (R copies for MIMO)
+                  + self.bc_dim                   # C (single rank output)
+                  + 2 * self.n_heads              # dt + lambda
+                  + self.d_state // 2)            # theta (RoPE frequencies)
         self.in_proj = nn.Linear(d_model, d_proj, bias=False)
 
         # No conv1d in Mamba-3 (trapezoidal rule subsumes it)
@@ -105,11 +116,11 @@ class Mamba3Layer(nn.Module):
             persistent=False,
         )
 
-    def _expand_groups(self, x):
-        """Expand grouped B/C from (*, ngroups, d_state) to (*, n_heads, d_state)."""
+    def _expand_groups(self, x, groups_dim=-2):
+        """Expand grouped B/C from (*, ngroups, ...) to (*, n_heads, ...) along groups_dim."""
         if self.ngroups == self.n_heads:
             return x
-        return x.repeat_interleave(self.n_heads // self.ngroups, dim=-2)
+        return x.repeat_interleave(self.n_heads // self.ngroups, dim=groups_dim)
 
     def forward(self, x, ssm_state=None):
         """
@@ -122,16 +133,23 @@ class Mamba3Layer(nn.Module):
             None: placeholder for conv_state compatibility
         """
         B, T, _ = x.shape
+        R = self.mimo_rank
 
         # 1. Input projection
         proj = self.in_proj(x)  # (B, T, d_proj)
         z, x_raw, B_mat, C_mat, dt_raw, lambda_raw, theta_raw = self._split_projection(proj)
 
         # 2. SiLU activation (replaces conv1d + SiLU from Mamba-2)
+        # x_raw is flat: (B, T, d_inner*R) — SiLU is element-wise
         x_raw = F.silu(x_raw)
 
         # 3. QK-normalization on B and C
-        B_mat = F.rms_norm(B_mat, (self.d_state,)) * self.B_norm_bias
+        if R > 1:
+            # B: (B, T, ngroups, R, d_state) — norm over d_state, bias broadcasts over R
+            B_mat = F.rms_norm(B_mat, (self.d_state,)) * self.B_norm_bias.unsqueeze(-2)
+        else:
+            # B: (B, T, ngroups, d_state)
+            B_mat = F.rms_norm(B_mat, (self.d_state,)) * self.B_norm_bias
         C_mat = F.rms_norm(C_mat, (self.d_state,)) * self.C_norm_bias
 
         # 4. Discretize dt
@@ -142,8 +160,11 @@ class Mamba3Layer(nn.Module):
         # 5. Data-dependent RoPE on B and C
         B_mat, C_mat = self._apply_data_dependent_rope(B_mat, C_mat, dt, theta_raw)
 
-        # 6. Reshape x to multi-head
-        x_heads = x_raw.view(B, T, self.n_heads, self.head_dim)
+        # 6. Reshape x to multi-head (with optional R dimension)
+        if R > 1:
+            x_heads = x_raw.view(B, T, self.n_heads, R, self.head_dim)
+        else:
+            x_heads = x_raw.view(B, T, self.n_heads, self.head_dim)
 
         # 7. SSD computation
         if ssm_state is None:
@@ -166,19 +187,28 @@ class Mamba3Layer(nn.Module):
     def _split_projection(self, proj):
         """Split the input projection into its components."""
         d = self.d_inner
+        R = self.mimo_rank
         bc = self.bc_dim
         nh = self.n_heads
-        half_d = self.d_state // 2
 
         z          = proj[..., :d]                                  # (B, T, d_inner)
-        x_raw      = proj[..., d:2*d]                              # (B, T, d_inner)
-        B_mat      = proj[..., 2*d:2*d+bc]                         # (B, T, ngroups*d_state)
-        C_mat      = proj[..., 2*d+bc:2*d+2*bc]                    # (B, T, ngroups*d_state)
-        dt_raw     = proj[..., 2*d+2*bc:2*d+2*bc+nh]               # (B, T, n_heads)
-        lambda_raw = proj[..., 2*d+2*bc+nh:2*d+2*bc+2*nh]          # (B, T, n_heads)
-        theta_raw  = proj[..., 2*d+2*bc+2*nh:]                     # (B, T, d_state//2)
+        offset = d
+        x_raw      = proj[..., offset:offset + d * R]              # (B, T, d_inner*R)
+        offset += d * R
+        B_mat      = proj[..., offset:offset + bc * R]             # (B, T, bc_dim*R)
+        offset += bc * R
+        C_mat      = proj[..., offset:offset + bc]                 # (B, T, bc_dim)
+        offset += bc
+        dt_raw     = proj[..., offset:offset + nh]                 # (B, T, n_heads)
+        offset += nh
+        lambda_raw = proj[..., offset:offset + nh]                 # (B, T, n_heads)
+        offset += nh
+        theta_raw  = proj[..., offset:]                            # (B, T, d_state//2)
 
-        B_mat = B_mat.view(*B_mat.shape[:-1], self.ngroups, self.d_state)
+        if R > 1:
+            B_mat = B_mat.view(*B_mat.shape[:-1], self.ngroups, R, self.d_state)
+        else:
+            B_mat = B_mat.view(*B_mat.shape[:-1], self.ngroups, self.d_state)
         C_mat = C_mat.view(*C_mat.shape[:-1], self.ngroups, self.d_state)
 
         return z, x_raw, B_mat, C_mat, dt_raw, lambda_raw, theta_raw
@@ -187,7 +217,7 @@ class Mamba3Layer(nn.Module):
         """Apply data-dependent RoPE to B and C.
 
         Args:
-            B:         (batch, T, ngroups, d_state)
+            B:         (batch, T, ngroups, [R,] d_state)
             C:         (batch, T, ngroups, d_state)
             dt:        (batch, T, n_heads)
             theta_raw: (batch, T, d_state//2)
@@ -203,11 +233,19 @@ class Mamba3Layer(nn.Module):
         # Cumulative angles over the full sequence (computed before chunking)
         cum_angles = -torch.cumsum(raw_angles.float(), dim=1)
 
+        # cos/sin for C (always single-rank): broadcast over ngroups
         cos_a = torch.cos(cum_angles).unsqueeze(2)  # (batch, T, 1, d_state//2)
-        sin_a = torch.sin(cum_angles).unsqueeze(2)  # (batch, T, 1, d_state//2)
+        sin_a = torch.sin(cum_angles).unsqueeze(2)
 
-        B_rotated = _apply_rope_pairs(B, cos_a, sin_a)
         C_rotated = _apply_rope_pairs(C, cos_a, sin_a)
+
+        # cos/sin for B: needs extra unsqueeze when MIMO to broadcast over R
+        if self.mimo_rank > 1:
+            cos_a_B = cos_a.unsqueeze(3)  # (batch, T, 1, 1, d_state//2)
+            sin_a_B = sin_a.unsqueeze(3)
+            B_rotated = _apply_rope_pairs(B, cos_a_B, sin_a_B)
+        else:
+            B_rotated = _apply_rope_pairs(B, cos_a, sin_a)
 
         return B_rotated, C_rotated
 
@@ -226,9 +264,9 @@ class Mamba3Layer(nn.Module):
           (x*(1-lam)*alpha)*dt = x*beta
 
         Args:
-            x_heads:    (B, T, n_heads, head_dim)
+            x_heads:    (B, T, n_heads, [R,] head_dim)
             A:          (n_heads,)
-            B:          (B, T, ngroups, d_state) — after QK-norm and RoPE
+            B:          (B, T, ngroups, [R,] d_state) — after QK-norm and RoPE
             C:          (B, T, ngroups, d_state) — after QK-norm and RoPE
             dt:         (B, T, n_heads)
             lambda_raw: (B, T, n_heads)
@@ -237,15 +275,23 @@ class Mamba3Layer(nn.Module):
         """
         lam = torch.sigmoid(lambda_raw)       # (B, T, n_heads) in (0, 1)
         alpha = torch.exp(A * dt)             # (B, T, n_heads) decay
+        coeff_beta = (1 - lam) * alpha        # pre-compute for clarity
 
-        # gamma-SSD: pre-weight x by lam so kernel's x*dt gives x*lam*dt = x*gamma
-        x_gamma = x_heads * lam.unsqueeze(-1)
+        if self.mimo_rank > 1:
+            # MIMO: x is (B, T, nh, R, hd), need extra unsqueezes
+            lam_x = lam.unsqueeze(-1).unsqueeze(-1)           # (B, T, nh, 1, 1)
+            coeff_beta_x = coeff_beta.unsqueeze(-1).unsqueeze(-1)
 
-        # beta-SSD: pre-weight shifted x by (1-lam)*alpha so kernel's x*dt gives x*beta
-        x_shifted = F.pad(x_heads[:, :-1], (0, 0, 0, 0, 1, 0))
-        x_beta = x_shifted * ((1 - lam) * alpha).unsqueeze(-1)
-
-        B_shifted = F.pad(B[:, :-1], (0, 0, 0, 0, 1, 0))
+            x_gamma = x_heads * lam_x
+            x_shifted = F.pad(x_heads[:, :-1], (0, 0, 0, 0, 0, 0, 1, 0))
+            x_beta = x_shifted * coeff_beta_x
+            B_shifted = F.pad(B[:, :-1], (0, 0, 0, 0, 0, 0, 1, 0))
+        else:
+            # SISO: x is (B, T, nh, hd)
+            x_gamma = x_heads * lam.unsqueeze(-1)
+            x_shifted = F.pad(x_heads[:, :-1], (0, 0, 0, 0, 1, 0))
+            x_beta = x_shifted * coeff_beta.unsqueeze(-1)
+            B_shifted = F.pad(B[:, :-1], (0, 0, 0, 0, 1, 0))
 
         # Both SSD calls reuse the Mamba-2 kernel with the same A and dt
         y_gamma = self._ssd_dispatch(x_gamma, A, B, C, dt)
@@ -254,7 +300,12 @@ class Mamba3Layer(nn.Module):
         return y_gamma + y_beta
 
     def _ssd_dispatch(self, x, A, B, C, dt):
-        """Dispatch to Triton or PyTorch SSD (reuses Mamba-2 infrastructure)."""
+        """Dispatch to MIMO, Triton, or PyTorch SSD."""
+        if self.mimo_rank > 1:
+            # MIMO: always use PyTorch path (can't modify Triton kernel for rank-R)
+            return self._ssd_mimo_chunked(x, A, B, C, dt)
+
+        # SISO: use Triton on CUDA, PyTorch fallback otherwise
         B_batch, T, n_heads, head_dim = x.shape
         if _HAS_TRITON and x.device.type == 'cuda' and T >= self.chunk_size:
             return self._ssd_triton(x, A, B, C, dt)
@@ -262,7 +313,7 @@ class Mamba3Layer(nn.Module):
             return self._ssd_chunked(x, A, B, C, dt)
 
     def _ssd_triton(self, x, A, B, C, dt):
-        """Triton forward (reuses Mamba-2 custom op)."""
+        """Triton forward (reuses Mamba-2 custom op). SISO only."""
         B_batch, T, n_heads, head_dim = x.shape
         chunk_size = min(self.chunk_size, T)
 
@@ -281,7 +332,7 @@ class Mamba3Layer(nn.Module):
         return y
 
     def _ssd_chunked(self, x, A, B, C, dt):
-        """PyTorch chunked SSD (reuses Mamba-2 standalone function)."""
+        """PyTorch chunked SSD (reuses Mamba-2 standalone function). SISO only."""
         B_batch, T, n_heads, head_dim = x.shape
         chunk_size = min(self.chunk_size, T)
 
@@ -300,15 +351,128 @@ class Mamba3Layer(nn.Module):
             y = y[:, :T, :, :]
         return y
 
+    def _ssd_mimo_chunked(self, x, A, B, C, dt):
+        """MIMO SSD: loop over R ranks for within-chunk, contract R for between-chunk.
+
+        The key insight: within-chunk quadratic computation is already compute-bound,
+        so we loop over R to keep memory constant. Between-chunk state updates sum
+        over R (rank-R matmul), which is where the arithmetic intensity benefit lives.
+
+        Args:
+            x:  (batch, T, n_heads, R, head_dim)
+            A:  (n_heads,)
+            B:  (batch, T, ngroups, R, d_state)
+            C:  (batch, T, ngroups, d_state)  — single-rank output
+            dt: (batch, T, n_heads)
+        Returns:
+            y:  (batch, T, n_heads, head_dim)
+        """
+        batch_size, T, n_heads, R, head_dim = x.shape
+        d_state = C.shape[-1]
+        ngroups = C.shape[-2]
+        chunk_size = min(self.chunk_size, T)
+        scale = self._ssd_scale
+
+        # Pad T to multiple of chunk_size
+        pad_len = 0
+        if T % chunk_size != 0:
+            pad_len = chunk_size - (T % chunk_size)
+            x = F.pad(x, (0, 0, 0, 0, 0, 0, 0, pad_len))      # 5D: pad T
+            B = F.pad(B, (0, 0, 0, 0, 0, 0, 0, pad_len))       # 5D: pad T
+            C = F.pad(C, (0, 0, 0, 0, 0, pad_len))              # 4D: pad T
+            dt = F.pad(dt, (0, 0, 0, pad_len))                   # 3D: pad T
+            T_padded = T + pad_len
+        else:
+            T_padded = T
+
+        n_chunks = T_padded // chunk_size
+        L = chunk_size
+
+        # Reshape into chunks
+        x  = x.view(batch_size, n_chunks, L, n_heads, R, head_dim)
+        B_ = B.view(batch_size, n_chunks, L, ngroups, R, d_state)
+        C_ = C.view(batch_size, n_chunks, L, ngroups, d_state)
+        dt = dt.view(batch_size, n_chunks, L, n_heads)
+
+        # Decay computation (same as SISO — doesn't depend on R)
+        log_dA = (A * dt).float()
+        cum_log_dA = torch.cumsum(log_dA, dim=2)  # (batch, nc, L, nh)
+
+        # Within-chunk decay matrix
+        log_decay_matrix = cum_log_dA.unsqueeze(3) - cum_log_dA.unsqueeze(2)
+        mask = self._causal_mask[:L, :L].reshape(1, 1, L, L, 1)
+        log_decay_matrix = log_decay_matrix.masked_fill(mask, float('-inf'))
+        decay_matrix = torch.exp(log_decay_matrix)  # (batch, nc, L, L, nh)
+
+        # === WITHIN-CHUNK: loop over R for memory efficiency ===
+        y_intra = torch.zeros(batch_size, n_chunks, L, n_heads, head_dim,
+                               device=x.device, dtype=torch.float32)
+
+        for r in range(R):
+            # Scores for rank r: C @ B_r^T
+            scores_r = torch.einsum('bcign, bcjgn -> bcijg',
+                                     C_.float(), B_[:, :, :, :, r, :].float()) * scale
+            if ngroups < n_heads:
+                scores_r = scores_r.repeat_interleave(n_heads // ngroups, dim=-1)
+            scores_r = scores_r * decay_matrix
+
+            x_dt_r = (x[:, :, :, :, r, :] * dt.unsqueeze(-1)).float()
+            y_intra = y_intra + torch.einsum('bcijh, bcjhp -> bcihp', scores_r, x_dt_r)
+
+        # === BETWEEN-CHUNK: contract over R for shared-state rank-R update ===
+        chunk_decay = torch.exp(cum_log_dA[:, :, -1, :])  # (batch, nc, nh)
+        decay_to_end = torch.exp(cum_log_dA[:, :, -1:, :] - cum_log_dA)  # (batch, nc, L, nh)
+
+        delta_h = torch.zeros(batch_size, n_chunks, n_heads, head_dim, d_state,
+                               device=x.device, dtype=torch.float32)
+
+        for r in range(R):
+            x_dt_r = (x[:, :, :, :, r, :] * dt.unsqueeze(-1)).float()
+
+            if ngroups < n_heads:
+                B_exp_r = B_[:, :, :, :, r, :].repeat_interleave(
+                    n_heads // ngroups, dim=-2)
+            else:
+                B_exp_r = B_[:, :, :, :, r, :]
+
+            delta_h = delta_h + torch.einsum('bclh, bclhp, bclhn -> bchpn',
+                                              decay_to_end, x_dt_r, B_exp_r.float())
+
+        # State propagation — shared state (same as SISO)
+        states = torch.zeros(batch_size, n_heads, head_dim, d_state,
+                              device=x.device, dtype=torch.float32)
+        all_states = []
+        for c in range(n_chunks):
+            all_states.append(states)
+            states = chunk_decay[:, c, :, None, None] * states + delta_h[:, c]
+        all_states = torch.stack(all_states, dim=1)  # (batch, nc, nh, hd, ds)
+
+        # Inter-chunk output — same as SISO (single-rank C)
+        if ngroups < n_heads:
+            C_expanded = C_.repeat_interleave(n_heads // ngroups, dim=-2)
+        else:
+            C_expanded = C_
+        decay_from_start = torch.exp(cum_log_dA)
+        state_contribution = torch.einsum('bcihn, bchpn -> bcihp',
+                                           C_expanded.float(), all_states)
+        y_inter = state_contribution * (decay_from_start.unsqueeze(-1) * scale)
+
+        y = (y_intra + y_inter).to(x.dtype)
+        y = y.contiguous().view(batch_size, T_padded, n_heads, head_dim)
+        if pad_len > 0:
+            y = y[:, :T, :, :]
+        return y
+
     def _trapezoidal_recurrent(self, x, A, B, C, dt, lambda_raw, ssm_state):
         """Trapezoidal recurrent computation for inference.
 
-        State carries both h (SSM state) and prev_Bx (previous B*x outer product).
+        State carries both h (SSM state) and prev_Bx (previous B*x product).
+        With MIMO, the B*x product is a rank-R matmul instead of rank-1 outer product.
 
         Args:
-            x:          (B, T, n_heads, head_dim) — typically T=1
+            x:          (B, T, n_heads, [R,] head_dim) — typically T=1
             A:          (n_heads,)
-            B:          (B, T, ngroups, d_state) — after QK-norm and RoPE
+            B:          (B, T, ngroups, [R,] d_state) — after QK-norm and RoPE
             C:          (B, T, ngroups, d_state) — after QK-norm and RoPE
             dt:         (B, T, n_heads)
             lambda_raw: (B, T, n_heads)
@@ -317,10 +481,19 @@ class Mamba3Layer(nn.Module):
             y: (B, T, n_heads, head_dim)
             new_state: updated dict
         """
-        B_batch, T, n_heads, head_dim = x.shape
+        R = self.mimo_rank
 
-        B_exp = self._expand_groups(B)  # (B, T, n_heads, d_state)
-        C_exp = self._expand_groups(C)
+        if R > 1:
+            B_batch, T, n_heads, _, head_dim = x.shape
+        else:
+            B_batch, T, n_heads, head_dim = x.shape
+
+        # Expand B groups to heads
+        if R > 1:
+            B_exp = self._expand_groups(B, groups_dim=-3)  # (B, T, n_heads, R, d_state)
+        else:
+            B_exp = self._expand_groups(B)                  # (B, T, n_heads, d_state)
+        C_exp = self._expand_groups(C)                       # (B, T, n_heads, d_state)
 
         lam = torch.sigmoid(lambda_raw)
 
@@ -329,8 +502,6 @@ class Mamba3Layer(nn.Module):
 
         outputs = []
         for t in range(T):
-            x_t = x[:, t]        # (B, n_heads, head_dim)
-            B_t = B_exp[:, t]    # (B, n_heads, d_state)
             C_t = C_exp[:, t]    # (B, n_heads, d_state)
             dt_t = dt[:, t]      # (B, n_heads)
             lam_t = lam[:, t]    # (B, n_heads)
@@ -339,8 +510,15 @@ class Mamba3Layer(nn.Module):
             beta_t = (1 - lam_t) * dt_t * alpha_t
             gamma_t = lam_t * dt_t
 
-            # Current outer product: B_t * x_t
-            Bx_t = torch.einsum('bhi, bhj -> bhij', x_t, B_t)  # (B, nh, hd, d_state)
+            # Current B*x product (rank-R matmul for MIMO, rank-1 outer product for SISO)
+            if R > 1:
+                x_t = x[:, t]        # (B, n_heads, R, head_dim)
+                B_t = B_exp[:, t]    # (B, n_heads, R, d_state)
+                Bx_t = torch.einsum('bhri, bhrj -> bhij', x_t, B_t)  # rank-R matmul
+            else:
+                x_t = x[:, t]        # (B, n_heads, head_dim)
+                B_t = B_exp[:, t]    # (B, n_heads, d_state)
+                Bx_t = torch.einsum('bhi, bhj -> bhij', x_t, B_t)    # rank-1 outer product
 
             # Trapezoidal state update
             h = (alpha_t[:, :, None, None] * h
@@ -349,7 +527,7 @@ class Mamba3Layer(nn.Module):
 
             prev_Bx = Bx_t
 
-            # Output
+            # Output (same for SISO and MIMO — C is single-rank)
             y_t = torch.einsum('bhn, bhpn -> bhp', C_t, h) * self._ssd_scale
             outputs.append(y_t)
 
