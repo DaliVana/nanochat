@@ -233,17 +233,17 @@ class Mamba3Layer(nn.Module):
         # Cumulative angles over the full sequence (computed before chunking)
         cum_angles = -torch.cumsum(raw_angles.float(), dim=1)
 
-        # cos/sin for C (always single-rank): broadcast over ngroups
-        cos_a = torch.cos(cum_angles).unsqueeze(2)  # (batch, T, 1, d_state//2)
-        sin_a = torch.sin(cum_angles).unsqueeze(2)
+        # cos/sin — compute in fp32, cast to input dtype to free fp32 copies
+        input_dtype = B.dtype
+        cos_a = torch.cos(cum_angles).to(input_dtype).unsqueeze(2)  # (batch, T, 1, d_state//2)
+        sin_a = torch.sin(cum_angles).to(input_dtype).unsqueeze(2)
+        del cum_angles
 
         C_rotated = _apply_rope_pairs(C, cos_a, sin_a)
 
         # cos/sin for B: needs extra unsqueeze when MIMO to broadcast over R
         if self.mimo_rank > 1:
-            cos_a_B = cos_a.unsqueeze(3)  # (batch, T, 1, 1, d_state//2)
-            sin_a_B = sin_a.unsqueeze(3)
-            B_rotated = _apply_rope_pairs(B, cos_a_B, sin_a_B)
+            B_rotated = _apply_rope_pairs(B, cos_a.unsqueeze(3), sin_a.unsqueeze(3))
         else:
             B_rotated = _apply_rope_pairs(B, cos_a, sin_a)
 
@@ -283,19 +283,20 @@ class Mamba3Layer(nn.Module):
             coeff_beta_x = coeff_beta.unsqueeze(-1).unsqueeze(-1)
 
             x_gamma = x_heads * lam_x
-            x_shifted = F.pad(x_heads[:, :-1], (0, 0, 0, 0, 0, 0, 1, 0))
-            x_beta = x_shifted * coeff_beta_x
+            x_beta = F.pad(x_heads[:, :-1], (0, 0, 0, 0, 0, 0, 1, 0)) * coeff_beta_x
             B_shifted = F.pad(B[:, :-1], (0, 0, 0, 0, 0, 0, 1, 0))
         else:
             # SISO: x is (B, T, nh, hd)
             x_gamma = x_heads * lam.unsqueeze(-1)
-            x_shifted = F.pad(x_heads[:, :-1], (0, 0, 0, 0, 1, 0))
-            x_beta = x_shifted * coeff_beta.unsqueeze(-1)
+            x_beta = F.pad(x_heads[:, :-1], (0, 0, 0, 0, 1, 0)) * coeff_beta.unsqueeze(-1)
             B_shifted = F.pad(B[:, :-1], (0, 0, 0, 0, 1, 0))
+        del lam, coeff_beta
 
         # Both SSD calls reuse the Mamba-2 kernel with the same A and dt
         y_gamma = self._ssd_dispatch(x_gamma, A, B, C, dt)
+        del x_gamma
         y_beta = self._ssd_dispatch(x_beta, A, B_shifted, C, dt)
+        del x_beta, B_shifted
 
         return y_gamma + y_beta
 
@@ -419,6 +420,8 @@ class Mamba3Layer(nn.Module):
             x_dt_r = (x[:, :, :, :, r, :] * dt.unsqueeze(-1)).float()
             y_intra = y_intra + torch.einsum('bcijh, bcjhp -> bcihp', scores_r, x_dt_r)
 
+        del decay_matrix  # free large (batch, nc, L, L, nh) tensor
+
         # === BETWEEN-CHUNK: contract over R for shared-state rank-R update ===
         chunk_decay = torch.exp(cum_log_dA[:, :, -1, :])  # (batch, nc, nh)
         decay_to_end = torch.exp(cum_log_dA[:, :, -1:, :] - cum_log_dA)  # (batch, nc, L, nh)
@@ -426,26 +429,29 @@ class Mamba3Layer(nn.Module):
         delta_h = torch.zeros(batch_size, n_chunks, n_heads, head_dim, d_state,
                                device=x.device, dtype=torch.float32)
 
+        # Pre-expand B groups once (avoid repeat_interleave per rank)
+        if ngroups < n_heads:
+            B_expanded = B_.repeat_interleave(n_heads // ngroups, dim=-3)
+        else:
+            B_expanded = B_
+
         for r in range(R):
             x_dt_r = (x[:, :, :, :, r, :] * dt.unsqueeze(-1)).float()
-
-            if ngroups < n_heads:
-                B_exp_r = B_[:, :, :, :, r, :].repeat_interleave(
-                    n_heads // ngroups, dim=-2)
-            else:
-                B_exp_r = B_[:, :, :, :, r, :]
-
             delta_h = delta_h + torch.einsum('bclh, bclhp, bclhn -> bchpn',
-                                              decay_to_end, x_dt_r, B_exp_r.float())
+                                              decay_to_end, x_dt_r,
+                                              B_expanded[:, :, :, :, r, :].float())
+
+        del B_expanded  # free expanded B
 
         # State propagation — shared state (same as SISO)
-        states = torch.zeros(batch_size, n_heads, head_dim, d_state,
-                              device=x.device, dtype=torch.float32)
+        # NOTE: must use list+stack (not in-place assignment) to preserve autograd
+        states = delta_h.new_zeros(batch_size, n_heads, head_dim, d_state)
         all_states = []
         for c in range(n_chunks):
             all_states.append(states)
             states = chunk_decay[:, c, :, None, None] * states + delta_h[:, c]
         all_states = torch.stack(all_states, dim=1)  # (batch, nc, nh, hd, ds)
+        del delta_h
 
         # Inter-chunk output — same as SISO (single-rank C)
         if ngroups < n_heads:
@@ -534,8 +540,7 @@ class Mamba3Layer(nn.Module):
         y = torch.stack(outputs, dim=1)
         return y, {'h': h, 'prev_Bx': prev_Bx}
 
-    @torch.compile
     def _fused_norm_gate(self, y_raw, z):
-        """Fused RMSNorm and SiLU gate via torch.compile."""
+        """RMSNorm and SiLU gate (fused by whole-model torch.compile)."""
         y_norm = F.rms_norm(y_raw, (y_raw.size(-1),))
         return y_norm * F.silu(z)
