@@ -220,30 +220,46 @@ def _mamba3_chunk_scan_fwd_kernel(
              mask=(offs_m[:, None] < chunk_size) & (offs_n[None, :] < headdim))
 
 
-def _sram_estimate(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_DSTATE, dstate):
-    """Estimate peak SRAM usage in bytes for the mamba3 kernel."""
-    return (BLOCK_M * BLOCK_N * 4             # acc (float32)
-            + 2 * BLOCK_M * BLOCK_K * 4      # cb_g, cb_b (float32)
-            + BLOCK_M * BLOCK_K * 4           # decay (float32)
-            + BLOCK_M * dstate * 2            # c_cache (BF16)
-            + 4 * BLOCK_K * BLOCK_DSTATE * 2  # bg, bb x2 tiles (BF16)
-            + 2 * BLOCK_K * BLOCK_N * 2       # xg, xb (BF16)
+def _sram_estimate(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_DSTATE, dstate, num_stages=1):
+    """Estimate peak SRAM usage in bytes for the mamba3 kernel.
+
+    Separates fixed allocations from loop-body loads that Triton
+    double-buffers when num_stages > 1.
+    """
+    # Fixed: not affected by pipeline staging
+    fixed = (BLOCK_M * BLOCK_N * 4             # acc (float32)
+            + 2 * BLOCK_M * BLOCK_K * 4       # cb_g, cb_b (float32)
+            + BLOCK_M * BLOCK_K * 4            # decay (float32)
+            + BLOCK_M * dstate * 2             # c_cache (BF16)
             )
+    # Staged: loop-body global loads, multiplied by num_stages
+    staged = (4 * BLOCK_K * BLOCK_DSTATE * 2   # bg, bb x2 d-tiles (BF16)
+            + 2 * BLOCK_K * BLOCK_N * 2        # xg, xb (BF16)
+            )
+    return fixed + staged * num_stages
 
 
-def _select_block_sizes(L, headdim, dstate):
-    """Select block sizes for the mamba3 kernel.
+def _select_block_sizes(L, headdim, dstate, device=None):
+    """Select block sizes and num_stages for the mamba3 kernel.
 
-    On H100 (228 KB SRAM), larger blocks improve utilization:
-    - BLOCK_M=128 with chunk_size=128 covers the entire chunk in one tile
-    - BLOCK_N=128 with headdim=128 eliminates N-dimension grid splits
-    - BLOCK_DSTATE=64 is always sufficient (dstate inner loop is small)
+    Queries the actual device shared-memory limit (falls back to a
+    conservative 228 KB if unavailable) and tries block-size / num_stages
+    combinations in priority order until one fits.
 
-    Tries candidates in priority order (most SRAM → least) until one fits.
+    Returns (BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_DSTATE, num_stages).
     """
     BLOCK_DSTATE = max(16, min(64, triton.next_power_of_2(dstate)))
     BLOCK_K = max(16, min(64, triton.next_power_of_2(L)))
-    H100_SRAM = 228 * 1024  # 228 KB
+
+    # Query actual device shared memory limit
+    if device is not None:
+        props = torch.cuda.get_device_properties(device)
+        sram_limit = getattr(props, 'max_shared_memory_per_block_optin',
+                             props.max_shared_memory_per_block)
+        if sram_limit == 0:
+            sram_limit = props.max_shared_memory_per_block
+    else:
+        sram_limit = 228 * 1024  # Conservative H100 default
 
     # Priority: BLOCK_M=128 is most impactful (covers full chunk),
     # BLOCK_N=128 is secondary (covers full headdim).
@@ -252,17 +268,21 @@ def _select_block_sizes(L, headdim, dstate):
     BM_64 = max(16, min(64, triton.next_power_of_2(L)))
     BN_64 = max(16, min(64, triton.next_power_of_2(headdim)))
 
-    candidates = [
+    block_candidates = [
         (BM_max, BN_max),    # Best: full chunk + full headdim
         (BM_max, BN_64),     # Good: full chunk, split headdim
         (BM_64, BN_max),     # OK: split chunk, full headdim
         (BM_64, BN_64),      # Conservative fallback
     ]
-    for BLOCK_M, BLOCK_N in candidates:
-        if _sram_estimate(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_DSTATE, dstate) <= H100_SRAM:
-            return BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_DSTATE
+    # Prefer num_stages=2 (better latency hiding), fall back to 1
+    for num_stages in (2, 1):
+        for BLOCK_M, BLOCK_N in block_candidates:
+            est = _sram_estimate(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_DSTATE,
+                                 dstate, num_stages)
+            if est <= sram_limit:
+                return BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_DSTATE, num_stages
 
-    return BM_64, BN_64, BLOCK_K, BLOCK_DSTATE
+    return BM_64, BN_64, BLOCK_K, BLOCK_DSTATE, 1
 
 
 def mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, scale, chunk_size, mimo_rank):
@@ -292,7 +312,8 @@ def mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, scale, chunk_siz
     y_intra = torch.empty(batch, nchunks, L, nheads, headdim,
                            device=x_dt_g.device, dtype=torch.float32)
 
-    BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_DSTATE = _select_block_sizes(L, headdim, dstate)
+    BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_DSTATE, num_stages = _select_block_sizes(
+        L, headdim, dstate, device=x_dt_g.device)
     assert dstate <= 2 * BLOCK_DSTATE, (
         f"dstate={dstate} exceeds 2*BLOCK_DSTATE={2*BLOCK_DSTATE}. "
         f"C tile pre-loading supports at most 2 tiles. "
@@ -315,6 +336,6 @@ def mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, scale, chunk_siz
         nchunks=nchunks, mimo_rank=R, scale=scale,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_DSTATE=BLOCK_DSTATE,
         num_warps=8,
-        num_stages=2,
+        num_stages=num_stages,
     )
     return y_intra
