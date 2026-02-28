@@ -419,21 +419,26 @@ class GPTSamba(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5, mamba_matrix_lr=None, mamba_scalar_lr=None):
+        mamba_matrix_lr = mamba_matrix_lr if mamba_matrix_lr is not None else matrix_lr
+        mamba_scalar_lr = mamba_scalar_lr if mamba_scalar_lr is not None else scalar_lr * 0.1
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
-        # Separate Mamba 1D params (A_log, dt_bias, norm biases) and conv1d from matrix params
+        # Separate Mamba params from Attention params
         mamba_scalar_params = []
         mamba_conv_params = []
-        matrix_params = []
+        mamba_matrix_params = []
+        attn_matrix_params = []
         for name, p in self.transformer.h.named_parameters():
             if 'A_log' in name or 'dt_bias' in name or 'B_norm_bias' in name or 'C_norm_bias' in name:
                 mamba_scalar_params.append(p)
             elif 'conv1d' in name:
                 mamba_conv_params.append(p)
+            elif 'mamba.' in name:
+                mamba_matrix_params.append(p)
             else:
-                matrix_params.append(p)
+                attn_matrix_params.append(p)
 
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
@@ -443,7 +448,7 @@ class GPTSamba(nn.Module):
 
         # Verify all params accounted for
         all_params = len(list(self.parameters()))
-        grouped = (len(matrix_params) + len(mamba_scalar_params) + len(mamba_conv_params) + len(embedding_params) +
+        grouped = (len(attn_matrix_params) + len(mamba_matrix_params) + len(mamba_scalar_params) + len(mamba_conv_params) + len(embedding_params) +
                    len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
         assert all_params == grouped, f"Parameter count mismatch: {all_params} != {grouped}"
 
@@ -456,14 +461,21 @@ class GPTSamba(nn.Module):
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=mamba_scalar_params, lr=scalar_lr * 0.1, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=mamba_conv_params, lr=scalar_lr * 0.1, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=mamba_scalar_params, lr=mamba_scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=mamba_conv_params, lr=mamba_scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),
         ]
-        # Muon groups (matrix params, grouped by shape for stacking)
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
+        # Muon groups for attention matrix params (grouped by shape for stacking)
+        for shape in sorted({p.shape for p in attn_matrix_params}):
+            group_params = [p for p in attn_matrix_params if p.shape == shape]
             param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
+                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+            ))
+        # Muon groups for mamba matrix params (separate LR)
+        for shape in sorted({p.shape for p in mamba_matrix_params}):
+            group_params = [p for p in mamba_matrix_params if p.shape == shape]
+            param_groups.append(dict(
+                kind='muon', params=group_params, lr=mamba_matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
             ))
 

@@ -73,6 +73,8 @@ parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learnin
 parser.add_argument("--weight-decay", type=float, default=0.2, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
+parser.add_argument("--mamba-matrix-lr", type=float, default=-1, help="learning rate for Mamba matrix parameters (Muon). -1 = use --matrix-lr")
+parser.add_argument("--mamba-scalar-lr", type=float, default=-1, help="learning rate for Mamba scalar parameters (A_log, dt_bias, norm biases). -1 = use scalar-lr * 0.1")
 parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 for embedding/unembedding")
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
@@ -318,12 +320,16 @@ if weight_decay_scaled != args.weight_decay:
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer
+mamba_matrix_lr = args.mamba_matrix_lr if args.mamba_matrix_lr > 0 else args.matrix_lr
+mamba_scalar_lr = args.mamba_scalar_lr * batch_lr_scale if args.mamba_scalar_lr > 0 else None
 optimizer = model.setup_optimizer(
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
     scalar_lr=args.scalar_lr * batch_lr_scale,
     adam_betas=(args.adam_beta1, args.adam_beta2),
     matrix_lr=args.matrix_lr * batch_lr_scale,
+    mamba_matrix_lr=mamba_matrix_lr * batch_lr_scale,
+    mamba_scalar_lr=mamba_scalar_lr,
     weight_decay=weight_decay_scaled,
 )
 
