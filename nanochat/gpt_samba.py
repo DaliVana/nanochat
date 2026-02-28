@@ -420,7 +420,7 @@ class GPTSamba(nn.Module):
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5, mamba_matrix_lr=None, mamba_scalar_lr=None):
-        mamba_matrix_lr = mamba_matrix_lr if mamba_matrix_lr is not None else matrix_lr
+        mamba_matrix_lr = mamba_matrix_lr if mamba_matrix_lr is not None else unembedding_lr
         mamba_scalar_lr = mamba_scalar_lr if mamba_scalar_lr is not None else scalar_lr * 0.1
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
@@ -471,13 +471,11 @@ class GPTSamba(nn.Module):
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
             ))
-        # Muon groups for mamba matrix params (separate LR)
-        for shape in sorted({p.shape for p in mamba_matrix_params}):
-            group_params = [p for p in mamba_matrix_params if p.shape == shape]
-            param_groups.append(dict(
-                kind='muon', params=group_params, lr=mamba_matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
-            ))
+        # Adam for mamba matrix params (Muon is a poor fit for heterogeneous in_proj)
+        param_groups.append(dict(
+            kind='adamw', params=mamba_matrix_params, lr=mamba_matrix_lr * dmodel_lr_scale,
+            betas=adam_betas, eps=1e-10, weight_decay=0.0,
+        ))
 
         Factory = DistMuonAdamW if ddp else MuonAdamW
         optimizer = Factory(param_groups)
