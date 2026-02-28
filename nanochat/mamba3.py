@@ -109,7 +109,9 @@ class Mamba3Layer(nn.Module):
         # Output projection
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
 
-        self._ssd_scale = d_state ** -0.5
+        # Scale normalizes both the C·B dot product (1/√d_state) and the
+        # MIMO rank summation (1/R) so total output magnitude matches SISO.
+        self._ssd_scale = d_state ** -0.5 / mimo_rank
         self.register_buffer(
             '_causal_mask',
             torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool), diagonal=1),
