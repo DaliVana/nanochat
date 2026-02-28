@@ -93,7 +93,7 @@ def _mamba3_chunk_scan_fwd_kernel(
     # Avoids reloading C in every (k, r, d) iteration.
     # We store tiles as a flat register "array" indexed by d_start // BLOCK_DSTATE.
     # For typical configs (dstate <= 2*BLOCK_DSTATE), we unroll manually.
-    C_TILES: tl.constexpr = tl.cdiv(dstate, BLOCK_DSTATE)
+    C_TILES: tl.constexpr = (dstate + BLOCK_DSTATE - 1) // BLOCK_DSTATE
 
     # Tile 0 (always present)
     c_d0_offs = tl.arange(0, BLOCK_DSTATE)
