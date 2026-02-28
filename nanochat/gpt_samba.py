@@ -1,7 +1,7 @@
 """
-Samba model variant: Mamba-2 (SSD) + Sliding Window Attention.
+Samba model variant: Mamba-3 (SSD) + Sliding Window Attention.
 
-Inspired by Microsoft's Samba architecture, this variant interleaves Mamba-2 layers
+Inspired by Microsoft's Samba architecture, this variant interleaves Mamba-3 layers
 with sliding window attention layers. Mamba layers handle long-range dependencies via
 compressed recurrent state; attention layers (with RoPE + sliding window) handle precise
 local retrieval.
@@ -31,7 +31,6 @@ from torch.utils.checkpoint import checkpoint
 from nanochat.common import get_dist_info, print0
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 from nanochat.flash_attention import flash_attn
-from nanochat.mamba2 import Mamba2Layer
 from nanochat.mamba3 import Mamba3Layer
 
 from nanochat.fused_rope import apply_rotary_emb_triton
@@ -47,17 +46,15 @@ class GPTConfigSamba:
     n_embd: int = 768
     # Sliding window size for all attention layers (Mamba handles long-range)
     sliding_window: int = 1024
-    # Layer pattern: M=Mamba-2, A=Attention, tiled across layers
+    # Layer pattern: M=Mamba-3, A=Attention, tiled across layers
     # Examples: "MA"=alternating, "MMA"=two Mamba per one Attn, "MMMA"=three Mamba per one Attn
     layer_pattern: str = "MA"
-    # Mamba-2 parameters
+    # Mamba-3 parameters
     mamba_d_state: int = 64     # SSM state dimension
-    mamba_d_conv: int = 4       # causal convolution kernel size
     mamba_expand: int = 1       # expansion factor for inner dim
     mamba_ngroups: int = 1      # B/C group count (1=max sharing, n_heads=per-head like original)
     mamba_chunk_size: int = 256 # chunk size for SSD algorithm
-    mamba_version: int = 2      # 2=Mamba-2 (SSD), 3=Mamba-3 (trapezoidal SSD + RoPE)
-    mimo_rank: int = 1          # MIMO rank for Mamba-3 (1=SISO, >1=rank-R shared-state MIMO)
+    mimo_rank: int = 1          # MIMO rank (1=SISO, >1=rank-R shared-state MIMO)
 
 
 def norm(x):
@@ -173,31 +170,21 @@ class AttentionBlock(nn.Module):
 
 
 class MambaBlock(nn.Module):
-    """Mamba block: Mamba2Layer or Mamba3Layer, pre-norm residual.
+    """Mamba block: Mamba3Layer, pre-norm residual.
 
     No separate MLP — the Mamba layer's expand-then-gate (z * y) already
     provides channel mixing, similar to a gated MLP (Jamba-style).
     """
     def __init__(self, config):
         super().__init__()
-        if config.mamba_version == 3:
-            self.mamba = Mamba3Layer(
-                d_model=config.n_embd,
-                d_state=config.mamba_d_state,
-                expand=config.mamba_expand,
-                ngroups=config.mamba_ngroups,
-                chunk_size=config.mamba_chunk_size,
-                mimo_rank=config.mimo_rank,
-            )
-        else:
-            self.mamba = Mamba2Layer(
-                d_model=config.n_embd,
-                d_state=config.mamba_d_state,
-                d_conv=config.mamba_d_conv,
-                expand=config.mamba_expand,
-                ngroups=config.mamba_ngroups,
-                chunk_size=config.mamba_chunk_size,
-            )
+        self.mamba = Mamba3Layer(
+            d_model=config.n_embd,
+            d_state=config.mamba_d_state,
+            expand=config.mamba_expand,
+            ngroups=config.mamba_ngroups,
+            chunk_size=config.mamba_chunk_size,
+            mimo_rank=config.mimo_rank,
+        )
 
     def forward(self, x):
         mamba_out, _, _ = self.mamba(norm(x))
@@ -287,19 +274,16 @@ class GPTSamba(nn.Module):
                 torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
                 torch.nn.init.zeros_(block.mlp.c_proj.weight)
             else:
-                # Mamba block (v2 or v3)
+                # Mamba block
                 mamba = block.mamba
                 torch.nn.init.uniform_(mamba.in_proj.weight, -s, s)
-                if self.config.mamba_version == 2:
-                    torch.nn.init.kaiming_uniform_(mamba.conv1d.weight, a=math.sqrt(5))
                 # A_log: log(1..n_heads) for diverse timescales
                 mamba.A_log.copy_(torch.log(torch.linspace(0.001, mamba.n_heads, mamba.n_heads, dtype=torch.float32, device=mamba.A_log.device)))
                 # dt_bias: softplus(-4..-2) gives ~0.02-0.13
                 torch.nn.init.uniform_(mamba.dt_bias, -4.0, -2.0)
                 torch.nn.init.zeros_(mamba.out_proj.weight)
-                if self.config.mamba_version == 3:
-                    mamba.B_norm_bias.fill_(1.0)
-                    mamba.C_norm_bias.fill_(1.0)
+                mamba.B_norm_bias.fill_(1.0)
+                mamba.C_norm_bias.fill_(1.0)
                 # Re-initialize causal mask buffer (was garbage after to_empty from meta device)
                 mamba._causal_mask.copy_(torch.triu(torch.ones(mamba.chunk_size, mamba.chunk_size, dtype=torch.bool, device=mamba._causal_mask.device), diagonal=1))
 
@@ -380,8 +364,8 @@ class GPTSamba(nn.Module):
         ngroups = self.config.mamba_ngroups
         chunk_size = self.config.mamba_chunk_size
         n_mamba = sum(1 for lt in self.layer_types if lt == 'M')
-        ssd_multiplier = 2 if self.config.mamba_version == 3 else 1  # Two-SSD for Mamba-3
-        mimo_rank = self.config.mimo_rank if self.config.mamba_version == 3 else 1
+        ssd_multiplier = 2  # Two-SSD for Mamba-3
+        mimo_rank = self.config.mimo_rank
         ssd_flops = n_mamba * ssd_multiplier * (
             6 * chunk_size * ngroups * d_state * mimo_rank   # CB scores (R ranks)
             + 6 * chunk_size * d_inner * mimo_rank            # weighted sum (R ranks)
@@ -430,14 +414,11 @@ class GPTSamba(nn.Module):
 
         # Separate Mamba params from Attention params
         mamba_scalar_params = []
-        mamba_conv_params = []
         mamba_matrix_params = []
         attn_matrix_params = []
         for name, p in self.transformer.h.named_parameters():
             if 'A_log' in name or 'dt_bias' in name or 'B_norm_bias' in name or 'C_norm_bias' in name:
                 mamba_scalar_params.append(p)
-            elif 'conv1d' in name:
-                mamba_conv_params.append(p)
             elif 'mamba.' in name:
                 mamba_matrix_params.append(p)
             else:
@@ -451,7 +432,7 @@ class GPTSamba(nn.Module):
 
         # Verify all params accounted for
         all_params = len(list(self.parameters()))
-        grouped = (len(attn_matrix_params) + len(mamba_matrix_params) + len(mamba_scalar_params) + len(mamba_conv_params) + len(embedding_params) +
+        grouped = (len(attn_matrix_params) + len(mamba_matrix_params) + len(mamba_scalar_params) + len(embedding_params) +
                    len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
         assert all_params == grouped, f"Parameter count mismatch: {all_params} != {grouped}"
 
@@ -465,7 +446,6 @@ class GPTSamba(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=mamba_scalar_params, lr=mamba_scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=mamba_conv_params, lr=mamba_scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0),
         ]
         # Muon groups for attention matrix params (grouped by shape for stacking)
         for shape in sorted({p.shape for p in attn_matrix_params}):

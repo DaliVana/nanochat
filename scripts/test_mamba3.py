@@ -4,12 +4,11 @@ Correctness tests for Mamba-3 layer (including MIMO).
 Tests:
 1. Data-dependent RoPE correctness
 2. Gradient flow through all parameters
-3. Output shape compatibility with Mamba-2
-4. Config dispatch (mamba_version=3 creates Mamba3Layer)
-5. Two-SSD chunked output matches naive trapezoidal recurrence
-6. MIMO gradient flow (R=2)
-7. MIMO output shape (R=4)
-8. MIMO recurrent vs chunked (R=2)
+3. Output shape
+4. Two-SSD chunked output matches naive trapezoidal recurrence
+5. MIMO gradient flow (R=2)
+6. MIMO output shape (R=4)
+7. MIMO recurrent vs chunked (R=2)
 
 Usage:
     uv run python -m scripts.test_mamba3           # CPU tests
@@ -151,54 +150,24 @@ def test_gradient_flow():
     return all_pass
 
 
-def test_shape_compatibility():
-    """Verify Mamba3Layer produces same output shape as Mamba2Layer."""
-    from nanochat.mamba2 import Mamba2Layer
+def test_output_shape():
+    """Verify Mamba3Layer produces correct output shape."""
     from nanochat.mamba3 import Mamba3Layer
 
     torch.manual_seed(42)
     d_model, d_state, expand, chunk_size = 64, 16, 2, 16
     batch, T = 2, 32
 
-    m2 = Mamba2Layer(d_model=d_model, d_state=d_state, expand=expand, chunk_size=chunk_size)
     m3 = Mamba3Layer(d_model=d_model, d_state=d_state, expand=expand, chunk_size=chunk_size)
 
     x = torch.randn(batch, T, d_model)
 
     with torch.no_grad():
-        y2, _, _ = m2(x)
         y3, _, _ = m3(x)
 
-    shape_ok = y2.shape == y3.shape == (batch, T, d_model)
-    print(f"  Shape compatibility: m2={y2.shape}, m3={y3.shape} {'PASS' if shape_ok else 'FAIL'}")
+    shape_ok = y3.shape == (batch, T, d_model)
+    print(f"  Output shape: {y3.shape} {'PASS' if shape_ok else 'FAIL'}")
     return shape_ok
-
-
-def test_config_dispatch():
-    """Verify GPTConfigSamba with mamba_version=3 creates Mamba3Layer blocks."""
-    from nanochat.mamba3 import Mamba3Layer
-    from nanochat.mamba2 import Mamba2Layer
-    try:
-        from nanochat.gpt_samba import GPTConfigSamba, MambaBlock
-    except ImportError as e:
-        print(f"  Config dispatch: SKIP ({e})")
-        return True
-
-    config_v2 = GPTConfigSamba(n_embd=64, n_layer=2, n_head=4, n_kv_head=4,
-                                mamba_d_state=16, mamba_expand=2, mamba_version=2)
-    config_v3 = GPTConfigSamba(n_embd=64, n_layer=2, n_head=4, n_kv_head=4,
-                                mamba_d_state=16, mamba_expand=2, mamba_version=3)
-
-    block_v2 = MambaBlock(config_v2)
-    block_v3 = MambaBlock(config_v3)
-
-    is_v2 = isinstance(block_v2.mamba, Mamba2Layer)
-    is_v3 = isinstance(block_v3.mamba, Mamba3Layer)
-
-    passed = is_v2 and is_v3
-    print(f"  Config dispatch: v2={type(block_v2.mamba).__name__}, v3={type(block_v3.mamba).__name__} "
-          f"{'PASS' if passed else 'FAIL'}")
-    return passed
 
 
 def test_mimo_gradient_flow():
@@ -542,42 +511,39 @@ if __name__ == "__main__":
     print("\n2. Gradient flow:")
     all_pass &= test_gradient_flow()
 
-    print("\n3. Shape compatibility:")
-    all_pass &= test_shape_compatibility()
+    print("\n3. Output shape:")
+    all_pass &= test_output_shape()
 
-    print("\n4. Config dispatch:")
-    all_pass &= test_config_dispatch()
-
-    print("\n5. Trapezoidal vs Recurrent:")
+    print("\n4. Trapezoidal vs Recurrent:")
     all_pass &= test_trapezoidal_vs_recurrent()
 
-    print("\n6. MIMO gradient flow:")
+    print("\n5. MIMO gradient flow:")
     all_pass &= test_mimo_gradient_flow()
 
-    print("\n7. MIMO shape:")
+    print("\n6. MIMO shape:")
     all_pass &= test_mimo_shape()
 
-    print("\n8. MIMO recurrent vs chunked:")
+    print("\n7. MIMO recurrent vs chunked:")
     all_pass &= test_mimo_recurrent_vs_chunked()
 
-    print("\n9. MIMO param count:")
+    print("\n8. MIMO param count:")
     all_pass &= test_mimo_param_count()
 
-    print("\n10. MIMO differentiation:")
+    print("\n9. MIMO differentiation:")
     all_pass &= test_mimo_differentiation()
 
     if use_cuda:
         assert torch.cuda.is_available(), "CUDA required for --cuda tests"
-        print("\n11. CUDA forward+backward:")
+        print("\n10. CUDA forward+backward:")
         all_pass &= test_cuda_forward_backward()
 
-        print("\n12. Triton intra-chunk vs PyTorch (R=2):")
+        print("\n11. Triton intra-chunk vs PyTorch (R=2):")
         all_pass &= test_triton_intra_vs_pytorch()
 
-        print("\n13. Triton intra-chunk vs PyTorch (R=4):")
+        print("\n12. Triton intra-chunk vs PyTorch (R=4):")
         all_pass &= test_triton_intra_r4()
 
-        print("\n14. Triton full-layer gradient flow:")
+        print("\n13. Triton full-layer gradient flow:")
         all_pass &= test_triton_full_layer_gradient()
 
     if all_pass:

@@ -1,5 +1,5 @@
 """
-Train Samba model (Mamba-2 + Sliding Window Attention). From root directory of the project, run as:
+Train Samba model (Mamba-3 + Sliding Window Attention). From root directory of the project, run as:
 
 python -m scripts.samba_train
 
@@ -37,7 +37,7 @@ print_banner()
 
 # -----------------------------------------------------------------------------
 # CLI arguments
-parser = argparse.ArgumentParser(description="Pretrain Samba model (Mamba-2 + Sliding Window Attention)")
+parser = argparse.ArgumentParser(description="Pretrain Samba model (Mamba-3 + Sliding Window Attention)")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
@@ -52,14 +52,12 @@ parser.add_argument("--head-dim", type=int, default=128, help="target head dimen
 parser.add_argument("--max-seq-len", type=int, default=32768, help="max context length")
 parser.add_argument("--sliding-window", type=int, default=1024, help="sliding window size for all attention layers (Mamba handles long-range)")
 # Samba-specific
-parser.add_argument("--layer-pattern", type=str, default="MA", help="layer pattern: M=Mamba-2, A=Attention (e.g. 'MA', 'MMA', 'MMMA')")
-parser.add_argument("--mamba-d-state", type=int, default=64, help="Mamba-2 SSM state dimension")
-parser.add_argument("--mamba-d-conv", type=int, default=4, help="Mamba-2 causal convolution kernel size")
-parser.add_argument("--mamba-expand", type=int, default=1, help="Mamba-2 expansion factor for inner dim")
-parser.add_argument("--mamba-ngroups", type=int, default=1, help="Mamba-2 B/C group count (1=max sharing, -1=per-head)")
-parser.add_argument("--mamba-chunk-size", type=int, default=128, help="Mamba-2 chunk size for SSD algorithm")
-parser.add_argument("--mamba-version", type=int, default=2, choices=[2, 3], help="Mamba version: 2=Mamba-2 (SSD), 3=Mamba-3 (trapezoidal SSD + RoPE)")
-parser.add_argument("--mimo-rank", type=int, default=1, help="MIMO rank for Mamba-3 (1=SISO, 2-4=rank-R shared-state MIMO, higher=more FLOPs/byte)")
+parser.add_argument("--layer-pattern", type=str, default="MA", help="layer pattern: M=Mamba-3, A=Attention (e.g. 'MA', 'MMA', 'MMMA')")
+parser.add_argument("--mamba-d-state", type=int, default=64, help="Mamba-3 SSM state dimension")
+parser.add_argument("--mamba-expand", type=int, default=1, help="Mamba-3 expansion factor for inner dim")
+parser.add_argument("--mamba-ngroups", type=int, default=1, help="Mamba-3 B/C group count (1=max sharing, -1=per-head)")
+parser.add_argument("--mamba-chunk-size", type=int, default=128, help="Mamba-3 chunk size for SSD algorithm")
+parser.add_argument("--mimo-rank", type=int, default=1, help="MIMO rank (1=SISO, 2-4=rank-R shared-state MIMO, higher=more FLOPs/byte)")
 parser.add_argument("--gradient-checkpointing", action="store_true", help="recompute forward during backward to save memory (slower but fits longer contexts)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
@@ -167,11 +165,9 @@ def build_model_meta(depth):
         sliding_window=args.sliding_window,
         layer_pattern=args.layer_pattern,
         mamba_d_state=args.mamba_d_state,
-        mamba_d_conv=args.mamba_d_conv,
         mamba_expand=args.mamba_expand,
         mamba_ngroups=mamba_ngroups,
         mamba_chunk_size=args.mamba_chunk_size,
-        mamba_version=args.mamba_version,
         mimo_rank=args.mimo_rank,
     )
     with torch.device("meta"):
