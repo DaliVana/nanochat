@@ -22,7 +22,7 @@ import triton.language as tl
 def _mamba3_chunk_scan_fwd_kernel(
     # Input tensors
     Bg_ptr, Bb_ptr,            # (batch, nc, L, ngroups, R, dstate)
-    x_dt_g_ptr, x_dt_b_ptr,   # (batch, nc, L, nheads, R, headdim) float32
+    x_dt_g_ptr, x_dt_b_ptr,   # (batch, nc, L, nheads, R, headdim) native dtype
     dA_cumsum_ptr,             # (batch, nc, L, nheads) float32
     C_ptr,                     # (batch, nc, L, ngroups, dstate)
     out_ptr,                   # (batch, nc, L, nheads, headdim) float32
@@ -87,9 +87,42 @@ def _mamba3_chunk_scan_fwd_kernel(
     # Output accumulator
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
+    # === PRE-LOAD C tiles into registers (independent of k and r) ===
+    # C is indexed by (m, group, d) — no k or r dependency.
+    # With d_state=128, BLOCK_DSTATE=64: 2 cached tiles; d_state=64: 1 tile.
+    # Avoids reloading C in every (k, r, d) iteration.
+    # We store tiles as a flat register "array" indexed by d_start // BLOCK_DSTATE.
+    # For typical configs (dstate <= 2*BLOCK_DSTATE), we unroll manually.
+    C_TILES: tl.constexpr = tl.cdiv(dstate, BLOCK_DSTATE)
+
+    # Tile 0 (always present)
+    c_d0_offs = tl.arange(0, BLOCK_DSTATE)
+    c_d0_mask = c_d0_offs < dstate
+    # C tiles stay in native dtype (BF16 on H100) for BF16 tensor core dot products.
+    # The CB accumulator (cb_g, cb_b) is float32, so dot results are promoted on +=.
+    c_tile_0 = tl.load(
+        C_ptr + off_bc_C
+        + offs_m[:, None] * stride_C_seqlen
+        + c_d0_offs[None, :] * stride_C_dstate,
+        mask=(offs_m[:, None] < chunk_size) & c_d0_mask[None, :],
+        other=0.0)
+
+    # Tile 1 (when dstate > BLOCK_DSTATE, e.g. dstate=128)
+    if C_TILES > 1:
+        c_d1_offs = BLOCK_DSTATE + tl.arange(0, BLOCK_DSTATE)
+        c_d1_mask = c_d1_offs < dstate
+        c_tile_1 = tl.load(
+            C_ptr + off_bc_C
+            + offs_m[:, None] * stride_C_seqlen
+            + c_d1_offs[None, :] * stride_C_dstate,
+            mask=(offs_m[:, None] < chunk_size) & c_d1_mask[None, :],
+            other=0.0)
+
     # --- Intra-chunk: tile-by-tile over k positions ---
-    # Loop bound must be constexpr; the causal mask zeros out k > m tiles.
-    for k_start in range(0, chunk_size, BLOCK_K):
+    # Causal cutoff: skip k-blocks where all k > max(m) in this tile.
+    # pid_m is runtime, so k_max is non-constexpr (Triton uses while-loop).
+    k_max = tl.minimum((pid_m + 1) * BLOCK_M, chunk_size)
+    for k_start in range(0, k_max, BLOCK_K):
         k_offs = k_start + tl.arange(0, BLOCK_K)
         k_mask = k_offs < chunk_size
 
@@ -102,50 +135,56 @@ def _mamba3_chunk_scan_fwd_kernel(
         causal = offs_m[:, None] >= k_offs[None, :]
         decay = tl.where(causal, decay, 0.0)  # (BLOCK_M, BLOCK_K)
 
-        # R-loop: compile-time unrolled (mimo_rank is tl.constexpr)
+        # C tiles pre-loaded into registers before the k and r loops.
+        # Each rank reuses the cached C tiles, avoiding redundant global loads.
+        # With R=4, this eliminates 75% of C loads vs loading per (r, d) iteration.
         for r in range(mimo_rank):
-            # Compute CB_g = C[m] @ Bg[k,r]^T and CB_b = C[m] @ Bb[k,r]^T
             cb_g = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
             cb_b = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
 
-            for d_start in range(0, dstate, BLOCK_DSTATE):
-                d_offs = d_start + tl.arange(0, BLOCK_DSTATE)
-                d_mask = d_offs < dstate
+            # d-tile 0: use cached c_tile_0
+            # Bg/Bb stay in native dtype (matching C) for BF16 tensor core dot products.
+            bg_vals = tl.load(
+                Bg_ptr + off_bc_Bg
+                + k_offs[:, None] * stride_Bg_seqlen
+                + r * stride_Bg_rank
+                + c_d0_offs[None, :] * stride_Bg_dstate,
+                mask=(k_offs[:, None] < chunk_size) & c_d0_mask[None, :],
+                other=0.0)
+            bb_vals = tl.load(
+                Bb_ptr + off_bc_Bb
+                + k_offs[:, None] * stride_Bb_seqlen
+                + r * stride_Bb_rank
+                + c_d0_offs[None, :] * stride_Bb_dstate,
+                mask=(k_offs[:, None] < chunk_size) & c_d0_mask[None, :],
+                other=0.0)
+            cb_g += tl.dot(c_tile_0, tl.trans(bg_vals))
+            cb_b += tl.dot(c_tile_0, tl.trans(bb_vals))
 
-                # C[m, g, d]: (BLOCK_M, BLOCK_DSTATE)
-                c_vals = tl.load(
-                    C_ptr + off_bc_C
-                    + offs_m[:, None] * stride_C_seqlen
-                    + d_offs[None, :] * stride_C_dstate,
-                    mask=(offs_m[:, None] < chunk_size) & d_mask[None, :],
-                    other=0.0).to(tl.float32)
-
-                # Bg[k, g, r, d]: (BLOCK_K, BLOCK_DSTATE)
+            # d-tile 1 (when dstate > BLOCK_DSTATE)
+            if C_TILES > 1:
                 bg_vals = tl.load(
                     Bg_ptr + off_bc_Bg
                     + k_offs[:, None] * stride_Bg_seqlen
                     + r * stride_Bg_rank
-                    + d_offs[None, :] * stride_Bg_dstate,
-                    mask=(k_offs[:, None] < chunk_size) & d_mask[None, :],
-                    other=0.0).to(tl.float32)
-
-                # Bb[k, g, r, d]: (BLOCK_K, BLOCK_DSTATE)
+                    + c_d1_offs[None, :] * stride_Bg_dstate,
+                    mask=(k_offs[:, None] < chunk_size) & c_d1_mask[None, :],
+                    other=0.0)
                 bb_vals = tl.load(
                     Bb_ptr + off_bc_Bb
                     + k_offs[:, None] * stride_Bb_seqlen
                     + r * stride_Bb_rank
-                    + d_offs[None, :] * stride_Bb_dstate,
-                    mask=(k_offs[:, None] < chunk_size) & d_mask[None, :],
-                    other=0.0).to(tl.float32)
-
-                cb_g += tl.dot(c_vals, tl.trans(bg_vals))
-                cb_b += tl.dot(c_vals, tl.trans(bb_vals))
+                    + c_d1_offs[None, :] * stride_Bb_dstate,
+                    mask=(k_offs[:, None] < chunk_size) & c_d1_mask[None, :],
+                    other=0.0)
+                cb_g += tl.dot(c_tile_1, tl.trans(bg_vals))
+                cb_b += tl.dot(c_tile_1, tl.trans(bb_vals))
 
             # Apply decay and scale: (BLOCK_M, BLOCK_K)
             scores_g = cb_g * decay * scale
             scores_b = cb_b * decay * scale
 
-            # x_dt_g[k, h, r, p]: (BLOCK_K, BLOCK_N)
+            # x_dt_g[k, h, r, p]: (BLOCK_K, BLOCK_N) — native dtype for BF16 tensor core dots
             xg_vals = tl.load(
                 x_dt_g_ptr + off_bc_xg
                 + k_offs[:, None] * stride_xg_seqlen
@@ -153,9 +192,9 @@ def _mamba3_chunk_scan_fwd_kernel(
                 + r * stride_xg_rank
                 + offs_n[None, :] * stride_xg_hdim,
                 mask=k_mask[:, None] & (offs_n[None, :] < headdim),
-                other=0.0).to(tl.float32)
+                other=0.0)
 
-            # x_dt_b[k, h, r, p]: (BLOCK_K, BLOCK_N)
+            # x_dt_b[k, h, r, p]: (BLOCK_K, BLOCK_N) — native dtype for BF16 tensor core dots
             xb_vals = tl.load(
                 x_dt_b_ptr + off_bc_xb
                 + k_offs[:, None] * stride_xb_seqlen
@@ -163,11 +202,13 @@ def _mamba3_chunk_scan_fwd_kernel(
                 + r * stride_xb_rank
                 + offs_n[None, :] * stride_xb_hdim,
                 mask=k_mask[:, None] & (offs_n[None, :] < headdim),
-                other=0.0).to(tl.float32)
+                other=0.0)
 
             # (BLOCK_M, BLOCK_K) @ (BLOCK_K, BLOCK_N) -> (BLOCK_M, BLOCK_N)
-            acc += tl.dot(scores_g, xg_vals)
-            acc += tl.dot(scores_b, xb_vals)
+            # Cast scores to x_dt dtype: enables BF16 tensor cores when x_dt is BF16.
+            # H100 BF16 HMMA: 1,979 TFLOPS vs 989 TFLOPS for FP32.
+            acc += tl.dot(scores_g.to(xg_vals.dtype), xg_vals)
+            acc += tl.dot(scores_b.to(xb_vals.dtype), xb_vals)
 
     # Store output
     off_bc_out = pid_b * stride_out_batch + pid_c * stride_out_chunk
@@ -177,6 +218,51 @@ def _mamba3_chunk_scan_fwd_kernel(
              + offs_n[None, :] * stride_out_hdim,
              acc,
              mask=(offs_m[:, None] < chunk_size) & (offs_n[None, :] < headdim))
+
+
+def _sram_estimate(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_DSTATE, dstate):
+    """Estimate peak SRAM usage in bytes for the mamba3 kernel."""
+    return (BLOCK_M * BLOCK_N * 4             # acc (float32)
+            + 2 * BLOCK_M * BLOCK_K * 4      # cb_g, cb_b (float32)
+            + BLOCK_M * BLOCK_K * 4           # decay (float32)
+            + BLOCK_M * dstate * 2            # c_cache (BF16)
+            + 4 * BLOCK_K * BLOCK_DSTATE * 2  # bg, bb x2 tiles (BF16)
+            + 2 * BLOCK_K * BLOCK_N * 2       # xg, xb (BF16)
+            )
+
+
+def _select_block_sizes(L, headdim, dstate):
+    """Select block sizes for the mamba3 kernel.
+
+    On H100 (228 KB SRAM), larger blocks improve utilization:
+    - BLOCK_M=128 with chunk_size=128 covers the entire chunk in one tile
+    - BLOCK_N=128 with headdim=128 eliminates N-dimension grid splits
+    - BLOCK_DSTATE=64 is always sufficient (dstate inner loop is small)
+
+    Tries candidates in priority order (most SRAM → least) until one fits.
+    """
+    BLOCK_DSTATE = max(16, min(64, triton.next_power_of_2(dstate)))
+    BLOCK_K = max(16, min(64, triton.next_power_of_2(L)))
+    H100_SRAM = 228 * 1024  # 228 KB
+
+    # Priority: BLOCK_M=128 is most impactful (covers full chunk),
+    # BLOCK_N=128 is secondary (covers full headdim).
+    BM_max = max(16, min(128, triton.next_power_of_2(L)))
+    BN_max = max(16, min(128, triton.next_power_of_2(headdim)))
+    BM_64 = max(16, min(64, triton.next_power_of_2(L)))
+    BN_64 = max(16, min(64, triton.next_power_of_2(headdim)))
+
+    candidates = [
+        (BM_max, BN_max),    # Best: full chunk + full headdim
+        (BM_max, BN_64),     # Good: full chunk, split headdim
+        (BM_64, BN_max),     # OK: split chunk, full headdim
+        (BM_64, BN_64),      # Conservative fallback
+    ]
+    for BLOCK_M, BLOCK_N in candidates:
+        if _sram_estimate(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_DSTATE, dstate) <= H100_SRAM:
+            return BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_DSTATE
+
+    return BM_64, BN_64, BLOCK_K, BLOCK_DSTATE
 
 
 def mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, scale, chunk_size, mimo_rank):
@@ -206,11 +292,12 @@ def mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, scale, chunk_siz
     y_intra = torch.empty(batch, nchunks, L, nheads, headdim,
                            device=x_dt_g.device, dtype=torch.float32)
 
-    # Minimum 16 for tl.dot compatibility on all architectures
-    BLOCK_M = max(16, min(64, triton.next_power_of_2(L)))
-    BLOCK_N = max(16, min(64, triton.next_power_of_2(headdim)))
-    BLOCK_K = max(16, min(64, triton.next_power_of_2(L)))
-    BLOCK_DSTATE = max(16, min(64, triton.next_power_of_2(dstate)))
+    BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_DSTATE = _select_block_sizes(L, headdim, dstate)
+    assert dstate <= 2 * BLOCK_DSTATE, (
+        f"dstate={dstate} exceeds 2*BLOCK_DSTATE={2*BLOCK_DSTATE}. "
+        f"C tile pre-loading supports at most 2 tiles. "
+        f"Increase BLOCK_DSTATE or extend kernel for more tiles."
+    )
     grid = (triton.cdiv(L, BLOCK_M) * triton.cdiv(headdim, BLOCK_N),
             batch * nchunks, nheads)
 

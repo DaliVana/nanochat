@@ -297,12 +297,14 @@ if _HAS_TRITON:
         causal_mask = torch.triu(torch.ones(L, L, dtype=torch.bool, device=Bg.device), diagonal=1)
 
         with torch.enable_grad():
-            Bg_ = Bg.detach().requires_grad_()
-            Bb_ = Bb.detach().requires_grad_()
-            x_dt_g_ = x_dt_g.detach().requires_grad_()
-            x_dt_b_ = x_dt_b.detach().requires_grad_()
+            # Cast to float32: saved tensors may be BF16 (forward keeps native
+            # dtype for Triton tensor cores), but backward needs float32 precision.
+            Bg_ = Bg.float().detach().requires_grad_()
+            Bb_ = Bb.float().detach().requires_grad_()
+            x_dt_g_ = x_dt_g.float().detach().requires_grad_()
+            x_dt_b_ = x_dt_b.float().detach().requires_grad_()
             dA_cumsum_ = dA_cumsum.detach().requires_grad_()
-            C_ = C.detach().requires_grad_()
+            C_ = C.float().detach().requires_grad_()
 
             y_intra = _mamba3_intra_pytorch(Bg_, Bb_, x_dt_g_, x_dt_b_,
                                              dA_cumsum_, C_, scale, R, causal_mask)
@@ -601,20 +603,23 @@ class Mamba3Layer(nn.Module):
 
         # Pre-compute x*dt for all ranks (reused in within-chunk and between-chunk)
         dt_broad = dt_.unsqueeze(-1).unsqueeze(-1)  # (batch, nc, L, nh, 1, 1)
-        x_dt_g = (x_g * dt_broad).float()
-        x_dt_b = (x_b * dt_broad).float()
-
-        C_f = C_.float()
+        # Keep x_dt in model dtype (BF16 on H100) — the Triton kernel uses BF16
+        # tensor cores for score@x dots, and HBM loads are 2x faster in BF16.
+        # Multiply is computed in float32 (dt is float32) then rounded to model dtype.
+        x_dt_g = (x_g * dt_broad).to(x_g.dtype)
+        x_dt_b = (x_b * dt_broad).to(x_b.dtype)
 
         # === WITHIN-CHUNK: Triton on CUDA (L never materialized), PyTorch fallback ===
         hpg = n_heads // ngroups
         if _HAS_TRITON and x_gamma.device.type == 'cuda':
+            # Pass C, Bg, Bb in native dtype (BF16 on H100) — the Triton kernel
+            # uses BF16 tensor cores for C @ B^T dots with FP32 accumulation.
             y_intra = _mamba3_intra_fwd_op(
-                Bg, Bb, x_dt_g, x_dt_b, cum_log_dA, C_f,
+                Bg, Bb, x_dt_g, x_dt_b, cum_log_dA, C_,
                 scale, L, R)
         else:
             y_intra = _mamba3_intra_pytorch(
-                Bg.float(), Bb.float(), x_dt_g, x_dt_b, cum_log_dA, C_f,
+                Bg.float(), Bb.float(), x_dt_g, x_dt_b, cum_log_dA, C_.float(),
                 scale, R, self._causal_mask)
 
         # === BETWEEN-CHUNK: shared decay, combined delta_h ===
@@ -660,14 +665,21 @@ class Mamba3Layer(nn.Module):
         all_states = torch.stack(all_states, dim=1)
         del delta_h
 
-        # Inter-chunk output
-        if ngroups < n_heads:
-            C_expanded = C_.repeat_interleave(n_heads // ngroups, dim=-2)
-        else:
-            C_expanded = C_
+        # Inter-chunk output — group-aware einsum avoids repeat_interleave.
+        # For ngroups=1: saves 268 MB (no C expansion) and uses 1 large matmul
+        # instead of n_heads small ones.
         decay_from_start = torch.exp(cum_log_dA)
-        state_contribution = torch.einsum('bcihn, bchpn -> bcihp',
-                                           C_expanded.float(), all_states)
+        if ngroups < n_heads:
+            # all_states: (B, nc, nheads, headdim, dstate) -> (B, nc, ngroups, hpg, headdim, dstate)
+            all_states_g = all_states.view(
+                batch_size, n_chunks, ngroups, hpg, head_dim, d_state)
+            state_contribution = torch.einsum(
+                'bcign, bcgkpn -> bcigkp', C_.float(), all_states_g)
+            state_contribution = state_contribution.reshape(
+                batch_size, n_chunks, L, n_heads, head_dim)
+        else:
+            state_contribution = torch.einsum(
+                'bcihn, bchpn -> bcihp', C_.float(), all_states)
         y_inter = state_contribution * (decay_from_start.unsqueeze(-1) * scale)
 
         y = (y_intra + y_inter).to(x_gamma.dtype)
