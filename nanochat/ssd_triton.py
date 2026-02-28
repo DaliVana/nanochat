@@ -254,10 +254,13 @@ def _select_block_sizes(L, headdim, dstate, device=None):
     # Query actual device shared memory limit
     if device is not None:
         props = torch.cuda.get_device_properties(device)
-        sram_limit = getattr(props, 'max_shared_memory_per_block_optin',
-                             props.max_shared_memory_per_block)
-        if sram_limit == 0:
-            sram_limit = props.max_shared_memory_per_block
+        # Try opt-in limit first (Triton can request extended SRAM on Hopper+),
+        # then fall back to the base per-block limit.
+        sram_limit = getattr(props, 'max_shared_memory_per_block_optin', 0)
+        if not sram_limit:
+            sram_limit = getattr(props, 'shared_memory_per_block', 0)
+        if not sram_limit:
+            sram_limit = 228 * 1024
     else:
         sram_limit = 228 * 1024  # Conservative H100 default
 
