@@ -202,6 +202,125 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Triton kernels for CUDA (optional — falls back to PyTorch on CPU/MPS)
+_HAS_TRITON = False
+try:
+    from nanochat.ssd_triton import mamba3_chunk_scan_fwd
+    _HAS_TRITON = True
+except ImportError:
+    pass
+
+
+def _mamba3_intra_pytorch(Bg, Bb, x_dt_g, x_dt_b, cum_log_dA, C, scale, R, causal_mask):
+    """Pure PyTorch within-chunk computation (materializes L). Used as CPU fallback
+    and for backward recomputation.
+
+    Args:
+        Bg:          (batch, nc, L, ngroups, R, dstate) float32
+        Bb:          (batch, nc, L, ngroups, R, dstate) float32
+        x_dt_g:      (batch, nc, L, nheads, R, headdim) float32
+        x_dt_b:      (batch, nc, L, nheads, R, headdim) float32
+        cum_log_dA:  (batch, nc, L, nheads) float32
+        C:           (batch, nc, L, ngroups, dstate) float32
+        scale:       float
+        R:           int (mimo_rank)
+        causal_mask: (L, L) bool upper-triangular mask
+    Returns:
+        y_intra: (batch, nc, L, nheads, headdim) float32
+    """
+    batch_size, n_chunks, L, ngroups, _, dstate = Bg.shape
+    n_heads = cum_log_dA.shape[-1]
+    headdim = x_dt_g.shape[-1]
+
+    log_decay_matrix = cum_log_dA.unsqueeze(3) - cum_log_dA.unsqueeze(2)
+    mask = causal_mask[:L, :L].reshape(1, 1, L, L, 1)
+    log_decay_matrix = log_decay_matrix.masked_fill(mask, float('-inf'))
+    decay_matrix = torch.exp(log_decay_matrix)
+    del log_decay_matrix
+
+    hpg = n_heads // ngroups
+    y_intra = torch.zeros(batch_size, n_chunks, L, n_heads, headdim,
+                           device=Bg.device, dtype=torch.float32)
+
+    for r in range(R):
+        Bg_r = Bg[:, :, :, :, r, :]
+        Bb_r = Bb[:, :, :, :, r, :]
+        scores_g = torch.einsum('bcign, bcjgn -> bcijg', C, Bg_r) * scale
+        scores_b = torch.einsum('bcign, bcjgn -> bcijg', C, Bb_r) * scale
+
+        if ngroups < n_heads:
+            decay_grouped = decay_matrix.view(
+                batch_size, n_chunks, L, L, ngroups, hpg)
+            scores_g = (scores_g.unsqueeze(-1) * decay_grouped
+                        ).reshape(batch_size, n_chunks, L, L, n_heads)
+            scores_b = (scores_b.unsqueeze(-1) * decay_grouped
+                        ).reshape(batch_size, n_chunks, L, L, n_heads)
+        else:
+            scores_g = scores_g * decay_matrix
+            scores_b = scores_b * decay_matrix
+
+        y_intra = y_intra + (
+            torch.einsum('bcijh, bcjhp -> bcihp',
+                         scores_g, x_dt_g[:, :, :, :, r, :])
+            + torch.einsum('bcijh, bcjhp -> bcihp',
+                           scores_b, x_dt_b[:, :, :, :, r, :]))
+
+    return y_intra
+
+
+# ---- Custom ops for torch.compile compatibility (Triton path) ----
+if _HAS_TRITON:
+    @torch.library.custom_op("nanochat::mamba3_intra_fwd", mutates_args=())
+    def _mamba3_intra_fwd_op(
+        Bg: torch.Tensor, Bb: torch.Tensor,
+        x_dt_g: torch.Tensor, x_dt_b: torch.Tensor,
+        dA_cumsum: torch.Tensor, C: torch.Tensor,
+        scale: float, chunk_size: int, mimo_rank: int,
+    ) -> torch.Tensor:
+        return mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
+                                     scale, chunk_size, mimo_rank)
+
+    @_mamba3_intra_fwd_op.register_fake
+    def _mamba3_intra_fwd_fake(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
+                                scale, chunk_size, mimo_rank):
+        batch, nchunks, L, nheads, R, headdim = x_dt_g.shape
+        return x_dt_g.new_empty(batch, nchunks, L, nheads, headdim, dtype=torch.float32)
+
+    def _mamba3_intra_autograd_bwd(ctx, dy_intra):
+        """Backward for within-chunk: fall back to PyTorch (materializes L)."""
+        Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C = ctx.saved_tensors
+        scale = ctx.scale
+        R = ctx.mimo_rank
+        L = ctx.chunk_size
+
+        # Build causal mask for PyTorch path
+        causal_mask = torch.triu(torch.ones(L, L, dtype=torch.bool, device=Bg.device), diagonal=1)
+
+        with torch.enable_grad():
+            Bg_ = Bg.detach().requires_grad_()
+            Bb_ = Bb.detach().requires_grad_()
+            x_dt_g_ = x_dt_g.detach().requires_grad_()
+            x_dt_b_ = x_dt_b.detach().requires_grad_()
+            dA_cumsum_ = dA_cumsum.detach().requires_grad_()
+            C_ = C.detach().requires_grad_()
+
+            y_intra = _mamba3_intra_pytorch(Bg_, Bb_, x_dt_g_, x_dt_b_,
+                                             dA_cumsum_, C_, scale, R, causal_mask)
+            y_intra.backward(dy_intra)
+
+        return (Bg_.grad, Bb_.grad, x_dt_g_.grad, x_dt_b_.grad,
+                dA_cumsum_.grad, C_.grad, None, None, None)
+
+    def _mamba3_intra_setup_context(ctx, inputs, output):
+        Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, scale, chunk_size, mimo_rank = inputs
+        ctx.save_for_backward(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C)
+        ctx.scale = scale
+        ctx.chunk_size = chunk_size
+        ctx.mimo_rank = mimo_rank
+
+    _mamba3_intra_fwd_op.register_autograd(
+        _mamba3_intra_autograd_bwd, setup_context=_mamba3_intra_setup_context)
+
 
 def _apply_rope_pairs(x, cos, sin):
     """Apply RoPE rotation to tensor with paired dimensions.
@@ -480,12 +599,6 @@ class Mamba3Layer(nn.Module):
         log_dA = (A * dt_).float()
         cum_log_dA = torch.cumsum(log_dA, dim=2)
 
-        log_decay_matrix = cum_log_dA.unsqueeze(3) - cum_log_dA.unsqueeze(2)
-        mask = self._causal_mask[:L, :L].reshape(1, 1, L, L, 1)
-        log_decay_matrix = log_decay_matrix.masked_fill(mask, float('-inf'))
-        decay_matrix = torch.exp(log_decay_matrix)
-        del log_decay_matrix
-
         # Pre-compute x*dt for all ranks (reused in within-chunk and between-chunk)
         dt_broad = dt_.unsqueeze(-1).unsqueeze(-1)  # (batch, nc, L, nh, 1, 1)
         x_dt_g = (x_g * dt_broad).float()
@@ -493,41 +606,16 @@ class Mamba3Layer(nn.Module):
 
         C_f = C_.float()
 
-        # Pre-reshape decay for group broadcasting (avoid repeat_interleave in loop)
+        # === WITHIN-CHUNK: Triton on CUDA (L never materialized), PyTorch fallback ===
         hpg = n_heads // ngroups
-        if ngroups < n_heads:
-            decay_grouped = decay_matrix.view(
-                batch_size, n_chunks, L, L, ngroups, hpg)
-
-        # === WITHIN-CHUNK: R-loop, both passes share decay_matrix ===
-        y_intra = torch.zeros(batch_size, n_chunks, L, n_heads, head_dim,
-                               device=x_gamma.device, dtype=torch.float32)
-
-        for r in range(R):
-            Bg_r = Bg[:, :, :, :, r, :].float()
-            Bb_r = Bb[:, :, :, :, r, :].float()
-            scores_g = torch.einsum('bcign, bcjgn -> bcijg', C_f, Bg_r) * scale
-            scores_b = torch.einsum('bcign, bcjgn -> bcijg', C_f, Bb_r) * scale
-
-            # Apply decay via broadcasting (no repeat_interleave allocation)
-            if ngroups < n_heads:
-                scores_g = (scores_g.unsqueeze(-1) * decay_grouped
-                            ).reshape(batch_size, n_chunks, L, L, n_heads)
-                scores_b = (scores_b.unsqueeze(-1) * decay_grouped
-                            ).reshape(batch_size, n_chunks, L, L, n_heads)
-            else:
-                scores_g = scores_g * decay_matrix
-                scores_b = scores_b * decay_matrix
-
-            y_intra = y_intra + (
-                torch.einsum('bcijh, bcjhp -> bcihp',
-                             scores_g, x_dt_g[:, :, :, :, r, :])
-                + torch.einsum('bcijh, bcjhp -> bcihp',
-                               scores_b, x_dt_b[:, :, :, :, r, :]))
-
-        del decay_matrix
-        if ngroups < n_heads:
-            del decay_grouped
+        if _HAS_TRITON and x_gamma.device.type == 'cuda':
+            y_intra = _mamba3_intra_fwd_op(
+                Bg, Bb, x_dt_g, x_dt_b, cum_log_dA, C_f,
+                scale, L, R)
+        else:
+            y_intra = _mamba3_intra_pytorch(
+                Bg.float(), Bb.float(), x_dt_g, x_dt_b, cum_log_dA, C_f,
+                scale, R, self._causal_mask)
 
         # === BETWEEN-CHUNK: shared decay, combined delta_h ===
         chunk_decay = torch.exp(cum_log_dA[:, :, -1, :])
@@ -646,7 +734,8 @@ class Mamba3Layer(nn.Module):
         y = torch.stack(outputs, dim=1)
         return y, {'h': h, 'prev_Bx': prev_Bx}
 
+    @torch.compile
     def _fused_norm_gate(self, y_raw, z):
-        """RMSNorm and SiLU gate (fused by whole-model torch.compile)."""
+        """RMSNorm and SiLU gate (fused by torch.compile into a single GPU kernel)."""
         y_norm = F.rms_norm(y_raw, (y_raw.size(-1),))
         return y_norm * F.silu(z)

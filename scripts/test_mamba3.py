@@ -415,6 +415,120 @@ def test_cuda_forward_backward():
     return has_grad
 
 
+def test_triton_intra_vs_pytorch():
+    """Verify Triton within-chunk kernel matches PyTorch materialized-L computation."""
+    from nanochat.mamba3 import _mamba3_intra_pytorch
+    from nanochat.ssd_triton import mamba3_chunk_scan_fwd
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    batch, nc, L, ngroups, R, dstate = 2, 4, 64, 1, 2, 64
+    nheads = 4
+    headdim = 64
+    scale = (dstate * R) ** -0.5
+
+    Bg = torch.randn(batch, nc, L, ngroups, R, dstate, device=device, dtype=torch.float32)
+    Bb = torch.randn(batch, nc, L, ngroups, R, dstate, device=device, dtype=torch.float32)
+    x_dt_g = torch.randn(batch, nc, L, nheads, R, headdim, device=device, dtype=torch.float32)
+    x_dt_b = torch.randn(batch, nc, L, nheads, R, headdim, device=device, dtype=torch.float32)
+    # Use realistic cumulative decay values
+    dA_cumsum = (torch.randn(batch, nc, L, nheads, device=device, dtype=torch.float32) * 0.1).cumsum(dim=2)
+    C = torch.randn(batch, nc, L, ngroups, dstate, device=device, dtype=torch.float32)
+
+    # Triton path
+    y_triton = mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, scale, L, R)
+
+    # PyTorch path
+    causal_mask = torch.triu(torch.ones(L, L, dtype=torch.bool, device=device), diagonal=1)
+    y_pytorch = _mamba3_intra_pytorch(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, scale, R, causal_mask)
+
+    max_diff = (y_triton - y_pytorch).abs().max().item()
+    scale_val = y_pytorch.abs().max().item() + 1e-8
+    rel_diff = max_diff / scale_val
+
+    passed = rel_diff < 0.01
+    print(f"  Triton vs PyTorch intra (R=2): max_abs={max_diff:.6f}, "
+          f"rel={rel_diff:.6f} {'PASS' if passed else 'FAIL'}")
+    return passed
+
+
+def test_triton_intra_r4():
+    """Verify Triton kernel works for MIMO R=4."""
+    from nanochat.mamba3 import _mamba3_intra_pytorch
+    from nanochat.ssd_triton import mamba3_chunk_scan_fwd
+
+    torch.manual_seed(123)
+    device = "cuda"
+
+    batch, nc, L, ngroups, R, dstate = 2, 2, 32, 1, 4, 32
+    nheads = 4
+    headdim = 32
+    scale = (dstate * R) ** -0.5
+
+    Bg = torch.randn(batch, nc, L, ngroups, R, dstate, device=device, dtype=torch.float32)
+    Bb = torch.randn(batch, nc, L, ngroups, R, dstate, device=device, dtype=torch.float32)
+    x_dt_g = torch.randn(batch, nc, L, nheads, R, headdim, device=device, dtype=torch.float32)
+    x_dt_b = torch.randn(batch, nc, L, nheads, R, headdim, device=device, dtype=torch.float32)
+    dA_cumsum = (torch.randn(batch, nc, L, nheads, device=device, dtype=torch.float32) * 0.1).cumsum(dim=2)
+    C = torch.randn(batch, nc, L, ngroups, dstate, device=device, dtype=torch.float32)
+
+    y_triton = mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, scale, L, R)
+
+    causal_mask = torch.triu(torch.ones(L, L, dtype=torch.bool, device=device), diagonal=1)
+    y_pytorch = _mamba3_intra_pytorch(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, scale, R, causal_mask)
+
+    max_diff = (y_triton - y_pytorch).abs().max().item()
+    scale_val = y_pytorch.abs().max().item() + 1e-8
+    rel_diff = max_diff / scale_val
+
+    passed = rel_diff < 0.01
+    print(f"  Triton vs PyTorch intra (R=4): max_abs={max_diff:.6f}, "
+          f"rel={rel_diff:.6f} {'PASS' if passed else 'FAIL'}")
+    return passed
+
+
+def test_triton_full_layer_gradient():
+    """Verify gradients flow through Triton forward + PyTorch backward path."""
+    from nanochat.mamba3 import Mamba3Layer
+
+    torch.manual_seed(42)
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    batch, T = 2, 128
+    d_model, d_state, expand, chunk_size = 128, 32, 2, 64
+
+    layer = Mamba3Layer(d_model=d_model, d_state=d_state, expand=expand,
+                        chunk_size=chunk_size, mimo_rank=2)
+    layer.to(device=device, dtype=dtype)
+
+    with torch.no_grad():
+        layer.A_log.copy_(torch.log(torch.linspace(0.001, layer.n_heads, layer.n_heads)))
+        torch.nn.init.uniform_(layer.dt_bias, -4.0, -2.0)
+
+    x = torch.randn(batch, T, d_model, device=device, dtype=dtype, requires_grad=True)
+    y, _, _ = layer(x)
+    loss = y.sum()
+    loss.backward()
+
+    # Check gradients on all parameters
+    all_ok = True
+    for name, p in layer.named_parameters():
+        if p.grad is None:
+            print(f"  WARNING: {name} has no gradient")
+            all_ok = False
+        elif p.grad.isnan().any():
+            print(f"  WARNING: {name} has NaN gradient")
+            all_ok = False
+
+    has_input_grad = x.grad is not None and not x.grad.isnan().any()
+    all_ok = all_ok and has_input_grad
+
+    print(f"  Triton full-layer gradient flow: {'PASS' if all_ok else 'FAIL'}")
+    return all_ok
+
+
 if __name__ == "__main__":
     use_cuda = "--cuda" in sys.argv
 
@@ -456,6 +570,15 @@ if __name__ == "__main__":
         assert torch.cuda.is_available(), "CUDA required for --cuda tests"
         print("\n11. CUDA forward+backward:")
         all_pass &= test_cuda_forward_backward()
+
+        print("\n12. Triton intra-chunk vs PyTorch (R=2):")
+        all_pass &= test_triton_intra_vs_pytorch()
+
+        print("\n13. Triton intra-chunk vs PyTorch (R=4):")
+        all_pass &= test_triton_intra_r4()
+
+        print("\n14. Triton full-layer gradient flow:")
+        all_pass &= test_triton_full_layer_gradient()
 
     if all_pass:
         print("\nAll tests PASSED!")
