@@ -317,6 +317,75 @@ def test_mimo_recurrent_vs_chunked():
     return passed
 
 
+def test_mimo_param_count():
+    """Verify MIMO has more parameters than SISO."""
+    from nanochat.mamba3 import Mamba3Layer
+
+    d_model, d_state, expand, chunk_size = 64, 16, 2, 16
+
+    p1 = sum(p.numel() for p in Mamba3Layer(d_model=d_model, d_state=d_state, expand=expand, chunk_size=chunk_size, mimo_rank=1).parameters())
+    p2 = sum(p.numel() for p in Mamba3Layer(d_model=d_model, d_state=d_state, expand=expand, chunk_size=chunk_size, mimo_rank=2).parameters())
+    p4 = sum(p.numel() for p in Mamba3Layer(d_model=d_model, d_state=d_state, expand=expand, chunk_size=chunk_size, mimo_rank=4).parameters())
+
+    passed = p1 < p2 < p4
+    print(f"  MIMO param count: R=1: {p1}, R=2: {p2}, R=4: {p4} {'PASS' if passed else 'FAIL'}")
+    return passed
+
+
+def test_mimo_differentiation():
+    """Verify MIMO gradient magnitudes are not dampened relative to SISO."""
+    from nanochat.mamba3 import Mamba3Layer
+
+    torch.manual_seed(42)
+    device = "cpu"
+    dtype = torch.float32
+
+    batch, T = 2, 32
+    d_model, d_state, chunk_size = 64, 16, 16
+
+    layer_siso = Mamba3Layer(d_model=d_model, d_state=d_state, expand=2,
+                              chunk_size=chunk_size, mimo_rank=1)
+    layer_mimo = Mamba3Layer(d_model=d_model, d_state=d_state, expand=2,
+                              chunk_size=chunk_size, mimo_rank=2)
+
+    for layer in [layer_siso, layer_mimo]:
+        layer.to(device=device, dtype=dtype)
+        with torch.no_grad():
+            layer.A_log.copy_(torch.log(torch.linspace(0.001, layer.n_heads, layer.n_heads)))
+            torch.nn.init.uniform_(layer.dt_bias, -4.0, -2.0)
+
+    x = torch.randn(batch, T, d_model, device=device, dtype=dtype)
+
+    x_siso = x.clone().requires_grad_(True)
+    x_mimo = x.clone().requires_grad_(True)
+    y_siso, _, _ = layer_siso(x_siso)
+    y_mimo, _, _ = layer_mimo(x_mimo)
+
+    # Outputs should differ (different parameter counts)
+    cos_sim = F.cosine_similarity(
+        y_siso.reshape(-1).unsqueeze(0),
+        y_mimo.reshape(-1).unsqueeze(0)).item()
+    outputs_differ = cos_sim < 0.99
+
+    # Gradient magnitudes should be comparable (not dampened by 1/sqrt(R))
+    y_siso.sum().backward()
+    y_mimo.sum().backward()
+
+    grad_ratio = x_mimo.grad.abs().mean().item() / (x_siso.grad.abs().mean().item() + 1e-12)
+    grads_comparable = 0.3 < grad_ratio < 3.0
+
+    siso_proj_grad = layer_siso.in_proj.weight.grad.abs().mean().item()
+    mimo_proj_grad = layer_mimo.in_proj.weight.grad.abs().mean().item()
+    proj_ratio = mimo_proj_grad / (siso_proj_grad + 1e-12)
+    proj_grads_ok = 0.3 < proj_ratio < 3.0
+
+    passed = outputs_differ and grads_comparable and proj_grads_ok
+    print(f"  MIMO differentiation: cos_sim={cos_sim:.4f}, "
+          f"grad_ratio={grad_ratio:.4f}, proj_grad_ratio={proj_ratio:.4f} "
+          f"{'PASS' if passed else 'FAIL'}")
+    return passed
+
+
 def test_triton_dispatch():
     """Test that Mamba-3 correctly dispatches to Triton SSD on CUDA."""
     from nanochat.mamba3 import Mamba3Layer, _HAS_TRITON
@@ -380,9 +449,15 @@ if __name__ == "__main__":
     print("\n8. MIMO recurrent vs chunked:")
     all_pass &= test_mimo_recurrent_vs_chunked()
 
+    print("\n9. MIMO param count:")
+    all_pass &= test_mimo_param_count()
+
+    print("\n10. MIMO differentiation:")
+    all_pass &= test_mimo_differentiation()
+
     if use_cuda:
         assert torch.cuda.is_available(), "CUDA required for --cuda tests"
-        print("\n9. Triton dispatch (CUDA):")
+        print("\n11. Triton dispatch (CUDA):")
         all_pass &= test_triton_dispatch()
 
     if all_pass:

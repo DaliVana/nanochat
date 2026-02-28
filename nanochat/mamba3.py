@@ -1,17 +1,35 @@
 """
 Mamba-3 (Trapezoidal SSD) layer for nanochat.
 
-Improvements over Mamba-2:
+================================================================================
+Architecture Overview
+================================================================================
+
+Mamba-3 extends Mamba-2's Structured State Space Duality (SSD) with three key
+improvements that close the gap with Transformers on state-tracking tasks while
+preserving linear-time inference:
+
 1. Trapezoidal discretization (2nd-order) via Two-SSD decomposition:
    h_t = alpha_t * h_{t-1} + beta_t * B_{t-1} * x_{t-1} + gamma_t * B_t * x_t
-   Implemented by calling the standard SSD kernel twice with shifted inputs.
+   Mamba-2 uses Euler discretization (1st-order): h_t = alpha * h_{t-1} + B_t * x_t,
+   which only looks at the current input x_t when updating state. The trapezoidal
+   rule adds a dependency on the *previous* input x_{t-1} via B_{t-1}, giving the
+   model a two-point stencil — it can reason about how the input changed between
+   consecutive timesteps, not just its current value. This is implemented
+   efficiently by running the standard SSD kernel twice with shifted inputs
+   (gamma-SSD for current, beta-SSD for previous) and summing the results.
 
 2. Data-dependent RoPE on B and C projections:
    Cumulative rotation angles derived from input, enabling state-tracking
    capabilities (e.g. parity, modular arithmetic) that Mamba-2 cannot learn.
+   The rotation angle at each position is a function of the input (via learned
+   theta frequencies modulated by dt), and angles accumulate via cumsum. The
+   dot product C_t @ B_s then encodes a relative-position-like signal based on
+   the angular distance sum(s..t), analogous to RoPE in attention.
 
 3. QK-normalization on B and C (RMSNorm + learnable bias):
-   Stabilizes training, analogous to QK-norm in attention.
+   Stabilizes training, analogous to QK-norm in attention. B and C are
+   normalized to unit RMS then scaled by a learnable per-group bias vector.
 
 4. No conv1d: The trapezoidal rule's dependency on x_{t-1} subsumes
    the role of the short causal convolution from Mamba-2.
@@ -20,6 +38,160 @@ Improvements over Mamba-2:
    State update becomes a rank-R matmul instead of rank-1 outer product,
    increasing arithmetic intensity from ~2.5 to ~2.5R FLOPs/byte.
    Controlled by mimo_rank parameter (1=SISO, >1=MIMO).
+
+================================================================================
+Data Flow (per layer)
+================================================================================
+
+  input x: (B, T, d_model)
+      |
+      v
+  in_proj ──> z (gate), x_raw (R copies), B (R copies), C, dt, lambda, theta
+      |
+      v
+  SiLU(x_raw)                          -- nonlinear activation (replaces conv1d)
+      |
+      v
+  QK-norm on B, C                      -- RMSNorm + learnable bias
+      |
+      v
+  Data-dependent RoPE on B, C          -- cumulative rotary encoding
+      |
+      v
+  Two-SSD scan                         -- gamma-SSD + beta-SSD (trapezoidal)
+      |                                   with MIMO rank-R if mimo_rank > 1
+      v
+  RMSNorm(y) * SiLU(z)                 -- output gate (like GLU)
+      |
+      v
+  out_proj ──> output: (B, T, d_model)
+
+================================================================================
+Key Parameters
+================================================================================
+
+d_model (int):
+    Model embedding dimension. This is the input and output width of the layer.
+    The Mamba layer reads d_model-wide vectors, processes them in an expanded
+    internal space, and projects back to d_model.
+
+expand (int, default=2):
+    Expansion factor for the inner working dimension. Sets d_inner = expand * d_model.
+    This controls how much wider the SSM computation is compared to the residual
+    stream, analogous to the 4x expansion in a Transformer MLP.
+
+    The inner dimension d_inner is divided into n_heads, each of width head_dim.
+    A larger expand increases capacity per layer at the cost of more parameters
+    and compute in the input/output projections.
+
+    NOTE: In the Samba config, expand=1 is used because the Mamba layer already
+    acts as both the "attention" and "MLP" (the z-gate provides channel mixing),
+    so there is no separate MLP block after Mamba. In a pure Mamba stack you'd
+    typically use expand=2 to match the parameter count of attn+MLP.
+
+d_state (int, default=64):
+    SSM state dimension per head. Each of the n_heads heads maintains a hidden
+    state matrix h of shape (head_dim, d_state). This is the "memory" of the
+    recurrence — at each timestep, the state is updated via:
+        h_t = decay * h_{t-1} + B_t (x) x_t    (outer product, rank-1 or rank-R)
+    and the output is read via:
+        y_t = C_t @ h_t
+
+    Larger d_state = more expressive state (more information retained across
+    time), but costs O(d_state) per head in both the B/C projections and the
+    state update. The total recurrent state size is n_heads * head_dim * d_state.
+
+    d_state also determines the RoPE dimensionality (must be even). In the SSD
+    algorithm, d_state controls the size of the C @ B^T attention-like score
+    matrix within each chunk (L x L x ngroups, contracted over d_state).
+
+    Typical values: 64 (default), 128 for higher capacity. Diminishing returns
+    beyond ~128 since the state is low-rank updated (rank-1 or rank-R per step).
+
+ngroups (int, default=1):
+    Number of B/C groups, analogous to Grouped Query Attention (GQA) in
+    Transformers. Controls how B and C projection matrices are shared across
+    heads:
+
+    - ngroups=1: All heads share one (B, C) pair. Maximum parameter sharing,
+      minimum projection cost. Each B/C vector has d_state dimensions.
+      Total B/C projection size = 1 * d_state (+ R copies for MIMO B).
+
+    - ngroups=n_heads: Each head gets its own (B, C) — "multi-head" SSM,
+      analogous to MHA. Maximum expressiveness, but B/C projections scale
+      with n_heads.
+
+    - 1 < ngroups < n_heads: Intermediate sharing. Each group of
+      (n_heads / ngroups) heads shares one (B, C) pair, like GQA.
+
+    The B/C projection width is ngroups * d_state. Within the SSD algorithm,
+    grouped B/C are expanded to per-head via repeat_interleave before the
+    score computation. Using ngroups=1 is the most parameter-efficient and is
+    recommended unless you have evidence that per-head B/C helps.
+
+mimo_rank (int, default=1):
+    MIMO (Multi-Input Multi-Output) rank. Controls the rank of the state
+    update at each timestep:
+
+    - mimo_rank=1 (SISO): Standard Mamba. The state update is a rank-1 outer
+      product: delta_h = x_t (x) B_t (head_dim x d_state, rank 1). This means
+      each timestep can only write a rank-1 "slice" of information into the
+      state matrix. The input x and B projection are single vectors.
+
+    - mimo_rank=R > 1 (MIMO): The input x is projected to R copies
+      (d_inner * R total), and B is also projected to R copies (ngroups * d_state * R).
+      The state update becomes a rank-R matmul:
+          delta_h = sum_{r=1}^{R} x_t^r (x) B_t^r    (rank-R update)
+      This allows R times more information to be written into state per timestep.
+
+      The output C remains single-rank (not replicated), so MIMO is
+      "multi-input, single-output" for the read side.
+
+    Why MIMO matters — arithmetic intensity:
+      In SISO, the state update is memory-bandwidth-bound: each timestep reads
+      x (head_dim) and B (d_state) to produce a (head_dim x d_state) outer
+      product — only ~2.5 FLOPs per byte loaded. With MIMO rank R, the same
+      state matrix receives R outer products, giving ~2.5R FLOPs per byte.
+      This makes the between-chunk state propagation compute-bound rather than
+      memory-bound on modern GPUs, improving hardware utilization.
+
+    Cost: MIMO adds R copies of x and B in the input projection, increasing
+    projection parameters by roughly (d_inner + ngroups * d_state) * (R - 1).
+    The SSD score scale is 1/sqrt(d_state), same for all ranks. Output
+    variance is normalized by the post-SSD RMSNorm gate.
+
+    Typical values: 1 (SISO, default), 2-4 for improved state capacity.
+
+chunk_size (int, default=256):
+    Chunk size for the SSD (Structured State Space Duality) algorithm. The SSD
+    algorithm splits the sequence into non-overlapping chunks of this size and
+    computes:
+    1. Within-chunk: quadratic attention-like scores (O(L^2) per chunk)
+    2. Between-chunk: linear recurrent state propagation across chunks
+
+    Larger chunk_size = more work done in the efficient quadratic path (better
+    GPU utilization via large matmuls) but more memory for the L x L score
+    matrix. Smaller chunk_size = less memory but more sequential state
+    propagation steps. 256 is a good default for most sequence lengths.
+
+================================================================================
+Derived Dimensions
+================================================================================
+
+    d_inner   = expand * d_model      -- inner working dimension
+    n_heads   = d_inner / d_state     -- number of SSM heads (if n_heads not given)
+    head_dim  = d_inner / n_heads     -- per-head dimension
+    bc_dim    = ngroups * d_state      -- total B or C projection width
+
+    Input projection output size:
+        d_inner                       -- z (output gate)
+      + d_inner * R                   -- x (R copies for MIMO)
+      + bc_dim * R                    -- B (R copies for MIMO)
+      + bc_dim                        -- C (single rank)
+      + 2 * n_heads                   -- dt + lambda (per-head scalars)
+      + d_state // 2                  -- theta (RoPE frequencies)
+
+    Recurrent state per layer: n_heads * head_dim * d_state floats
 
 References:
 - Mamba-3: https://openreview.net/forum?id=HwCvaJOiCj
@@ -50,17 +222,18 @@ def _apply_rope_pairs(x, cos, sin):
 
 
 class Mamba3Layer(nn.Module):
-    """
-    Mamba-3 (Trapezoidal SSD) layer with optional MIMO.
+    """Mamba-3 (Trapezoidal SSD) layer with optional MIMO.
 
-    Architecture:
-    1. Input projection: x -> (z, x_raw, B, C, dt, lambda, theta)
-    2. SiLU on x_raw (no conv1d)
-    3. QK-norm on B and C
-    4. Data-dependent RoPE on B and C
-    5. Two-SSD scan (gamma-SSD + beta-SSD), with MIMO rank-R if mimo_rank > 1
-    6. Output gate: y = rms_norm(y) * silu(z)
-    7. Output projection
+    See module docstring for full architecture description and parameter guide.
+
+    Args:
+        d_model:    Model dimension (input/output width).
+        d_state:    SSM state dimension per head. Must be even (for RoPE).
+        expand:     Expansion factor: d_inner = expand * d_model.
+        n_heads:    Number of SSM heads. Default: d_inner // d_state.
+        ngroups:    B/C group count (1=shared, n_heads=per-head, like GQA).
+        chunk_size: SSD chunk size for quadratic/linear decomposition.
+        mimo_rank:  MIMO rank (1=SISO, >1=rank-R state updates).
     """
 
     def __init__(self, d_model, d_state=64, expand=2, n_heads=None, ngroups=1,
@@ -109,9 +282,9 @@ class Mamba3Layer(nn.Module):
         # Output projection
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
 
-        # Scale normalizes both the C·B dot product (1/√d_state) and the
-        # MIMO rank summation (1/√R) so total output variance matches SISO.
-        self._ssd_scale = (d_state * mimo_rank) ** -0.5
+        # Scale for C·B dot product: 1/√d_state (analogous to 1/√d_k in attention).
+        # No rank-dependent factor needed — the output RMSNorm handles magnitude.
+        self._ssd_scale = d_state ** -0.5
         self.register_buffer(
             '_causal_mask',
             torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool), diagonal=1),
