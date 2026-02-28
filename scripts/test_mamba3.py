@@ -386,13 +386,9 @@ def test_mimo_differentiation():
     return passed
 
 
-def test_triton_dispatch():
-    """Test that Mamba-3 correctly dispatches to Triton SSD on CUDA."""
-    from nanochat.mamba3 import Mamba3Layer, _HAS_TRITON
-
-    if not _HAS_TRITON:
-        print("  Triton dispatch: SKIP (Triton not available)")
-        return True
+def test_cuda_forward_backward():
+    """Test that Mamba-3 MIMO runs correctly on CUDA."""
+    from nanochat.mamba3 import Mamba3Layer
 
     torch.manual_seed(42)
     device = "cuda"
@@ -401,7 +397,8 @@ def test_triton_dispatch():
     batch, T = 2, 128
     d_model, d_state, chunk_size = 128, 64, 64
 
-    layer = Mamba3Layer(d_model=d_model, d_state=d_state, expand=2, chunk_size=chunk_size)
+    layer = Mamba3Layer(d_model=d_model, d_state=d_state, expand=2,
+                        chunk_size=chunk_size, mimo_rank=2)
     layer.to(device=device, dtype=dtype)
 
     with torch.no_grad():
@@ -414,7 +411,7 @@ def test_triton_dispatch():
     loss.backward()
 
     has_grad = x.grad is not None and not x.grad.isnan().any()
-    print(f"  Triton dispatch (CUDA): {'PASS' if has_grad else 'FAIL'}")
+    print(f"  CUDA forward+backward (MIMO R=2): {'PASS' if has_grad else 'FAIL'}")
     return has_grad
 
 
@@ -457,8 +454,8 @@ if __name__ == "__main__":
 
     if use_cuda:
         assert torch.cuda.is_available(), "CUDA required for --cuda tests"
-        print("\n11. Triton dispatch (CUDA):")
-        all_pass &= test_triton_dispatch()
+        print("\n11. CUDA forward+backward:")
+        all_pass &= test_cuda_forward_backward()
 
     if all_pass:
         print("\nAll tests PASSED!")
