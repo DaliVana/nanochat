@@ -297,14 +297,14 @@ if _HAS_TRITON:
         causal_mask = torch.triu(torch.ones(L, L, dtype=torch.bool, device=Bg.device), diagonal=1)
 
         with torch.enable_grad():
-            # Cast to float32: saved tensors may be BF16 (forward keeps native
-            # dtype for Triton tensor cores), but backward needs float32 precision.
+            # Bg/Bb are BF16 (model dtype) — cast to float32 for backward precision.
+            # x_dt, C, dA_cumsum are already float32.
             Bg_ = Bg.float().detach().requires_grad_()
             Bb_ = Bb.float().detach().requires_grad_()
-            x_dt_g_ = x_dt_g.float().detach().requires_grad_()
-            x_dt_b_ = x_dt_b.float().detach().requires_grad_()
+            x_dt_g_ = x_dt_g.detach().requires_grad_()
+            x_dt_b_ = x_dt_b.detach().requires_grad_()
             dA_cumsum_ = dA_cumsum.detach().requires_grad_()
-            C_ = C.float().detach().requires_grad_()
+            C_ = C.detach().requires_grad_()
 
             y_intra = _mamba3_intra_pytorch(Bg_, Bb_, x_dt_g_, x_dt_b_,
                                              dA_cumsum_, C_, scale, R, causal_mask)
@@ -603,23 +603,19 @@ class Mamba3Layer(nn.Module):
 
         # Pre-compute x*dt for all ranks (reused in within-chunk and between-chunk)
         dt_broad = dt_.unsqueeze(-1).unsqueeze(-1)  # (batch, nc, L, nh, 1, 1)
-        # Keep x_dt in model dtype (BF16 on H100) — the Triton kernel uses BF16
-        # tensor cores for score@x dots, and HBM loads are 2x faster in BF16.
-        # Multiply is computed in float32 (dt is float32) then rounded to model dtype.
-        x_dt_g = (x_g * dt_broad).to(x_g.dtype)
-        x_dt_b = (x_b * dt_broad).to(x_b.dtype)
+        x_dt_g = (x_g * dt_broad).float()
+        x_dt_b = (x_b * dt_broad).float()
 
         # === WITHIN-CHUNK: Triton on CUDA (L never materialized), PyTorch fallback ===
         hpg = n_heads // ngroups
+        C_f = C_.float()
         if _HAS_TRITON and x_gamma.device.type == 'cuda':
-            # Pass C, Bg, Bb in native dtype (BF16 on H100) — the Triton kernel
-            # uses BF16 tensor cores for C @ B^T dots with FP32 accumulation.
             y_intra = _mamba3_intra_fwd_op(
-                Bg, Bb, x_dt_g, x_dt_b, cum_log_dA, C_,
+                Bg, Bb, x_dt_g, x_dt_b, cum_log_dA, C_f,
                 scale, L, R)
         else:
             y_intra = _mamba3_intra_pytorch(
-                Bg.float(), Bb.float(), x_dt_g, x_dt_b, cum_log_dA, C_.float(),
+                Bg.float(), Bb.float(), x_dt_g, x_dt_b, cum_log_dA, C_f,
                 scale, R, self._causal_mask)
 
         # === BETWEEN-CHUNK: shared decay, combined delta_h ===

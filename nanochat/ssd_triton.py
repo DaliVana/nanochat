@@ -98,8 +98,8 @@ def _mamba3_chunk_scan_fwd_kernel(
     # Tile 0 (always present)
     c_d0_offs = tl.arange(0, BLOCK_DSTATE)
     c_d0_mask = c_d0_offs < dstate
-    # C tiles stay in native dtype (BF16 on H100) for BF16 tensor core dot products.
-    # The CB accumulator (cb_g, cb_b) is float32, so dot results are promoted on +=.
+    # C and x_dt are float32 for numerical stability (BF16 truncation caused loss
+    # spikes in training). Bg/Bb remain in native dtype (BF16).
     c_tile_0 = tl.load(
         C_ptr + off_bc_C
         + offs_m[:, None] * stride_C_seqlen
@@ -205,8 +205,7 @@ def _mamba3_chunk_scan_fwd_kernel(
                 other=0.0)
 
             # (BLOCK_M, BLOCK_K) @ (BLOCK_K, BLOCK_N) -> (BLOCK_M, BLOCK_N)
-            # Cast scores to x_dt dtype: enables BF16 tensor cores when x_dt is BF16.
-            # H100 BF16 HMMA: 1,979 TFLOPS vs 989 TFLOPS for FP32.
+            # scores and x_dt are both float32 — FP32 dot for numerical stability.
             acc += tl.dot(scores_g.to(xg_vals.dtype), xg_vals)
             acc += tl.dot(scores_b.to(xb_vals.dtype), xb_vals)
 
@@ -230,11 +229,11 @@ def _sram_estimate(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_DSTATE, dstate, num_stages=1
     fixed = (BLOCK_M * BLOCK_N * 4             # acc (float32)
             + 2 * BLOCK_M * BLOCK_K * 4       # cb_g, cb_b (float32)
             + BLOCK_M * BLOCK_K * 4            # decay (float32)
-            + BLOCK_M * dstate * 2             # c_cache (BF16)
+            + BLOCK_M * dstate * 4             # c_cache (float32)
             )
     # Staged: loop-body global loads, multiplied by num_stages
     staged = (4 * BLOCK_K * BLOCK_DSTATE * 2   # bg, bb x2 d-tiles (BF16)
-            + 2 * BLOCK_K * BLOCK_N * 2        # xg, xb (BF16)
+            + 2 * BLOCK_K * BLOCK_N * 4        # xg, xb (float32)
             )
     return fixed + staged * num_stages
 
