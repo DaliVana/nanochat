@@ -1365,8 +1365,8 @@ def _mamba3_chunk_scan_fwd_kernel(
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     # --- Intra-chunk: tile-by-tile over k positions ---
-    k_max = tl.minimum((pid_m + 1) * BLOCK_M, chunk_size)
-    for k_start in range(0, k_max, BLOCK_K):
+    # Loop bound must be constexpr; the causal mask zeros out k > m tiles.
+    for k_start in range(0, chunk_size, BLOCK_K):
         k_offs = k_start + tl.arange(0, BLOCK_K)
         k_mask = k_offs < chunk_size
 
@@ -1379,8 +1379,8 @@ def _mamba3_chunk_scan_fwd_kernel(
         causal = offs_m[:, None] >= k_offs[None, :]
         decay = tl.where(causal, decay, 0.0)  # (BLOCK_M, BLOCK_K)
 
-        # R-loop: compile-time unrolled
-        for r in tl.static_range(mimo_rank):
+        # R-loop: compile-time unrolled (mimo_rank is tl.constexpr)
+        for r in range(mimo_rank):
             # Compute CB_g = C[m] @ Bg[k,r]^T and CB_b = C[m] @ Bb[k,r]^T
             cb_g = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
             cb_b = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
@@ -1443,8 +1443,8 @@ def _mamba3_chunk_scan_fwd_kernel(
                 other=0.0).to(tl.float32)
 
             # (BLOCK_M, BLOCK_K) @ (BLOCK_K, BLOCK_N) -> (BLOCK_M, BLOCK_N)
-            acc += tl.dot(scores_g.to(tl.float32), xg_vals)
-            acc += tl.dot(scores_b.to(tl.float32), xb_vals)
+            acc += tl.dot(scores_g, xg_vals)
+            acc += tl.dot(scores_b, xb_vals)
 
     # Store output
     off_bc_out = pid_b * stride_out_batch + pid_c * stride_out_chunk
@@ -1483,10 +1483,11 @@ def mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, scale, chunk_siz
     y_intra = torch.empty(batch, nchunks, L, nheads, headdim,
                            device=x_dt_g.device, dtype=torch.float32)
 
-    BLOCK_M = min(64, triton.next_power_of_2(L))
-    BLOCK_N = min(64, triton.next_power_of_2(headdim))
-    BLOCK_K = min(64, triton.next_power_of_2(L))
-    BLOCK_DSTATE = min(64, triton.next_power_of_2(dstate))
+    # Minimum 16 for tl.dot compatibility on all architectures
+    BLOCK_M = max(16, min(64, triton.next_power_of_2(L)))
+    BLOCK_N = max(16, min(64, triton.next_power_of_2(headdim)))
+    BLOCK_K = max(16, min(64, triton.next_power_of_2(L)))
+    BLOCK_DSTATE = max(16, min(64, triton.next_power_of_2(dstate)))
     grid = (triton.cdiv(L, BLOCK_M) * triton.cdiv(headdim, BLOCK_N),
             batch * nchunks, nheads)
 

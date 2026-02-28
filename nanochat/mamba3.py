@@ -734,8 +734,7 @@ class Mamba3Layer(nn.Module):
         y = torch.stack(outputs, dim=1)
         return y, {'h': h, 'prev_Bx': prev_Bx}
 
-    @torch.compile
     def _fused_norm_gate(self, y_raw, z):
-        """RMSNorm and SiLU gate (fused by torch.compile into a single GPU kernel)."""
+        """RMSNorm and SiLU gate (fused by whole-model torch.compile)."""
         y_norm = F.rms_norm(y_raw, (y_raw.size(-1),))
         return y_norm * F.silu(z)
