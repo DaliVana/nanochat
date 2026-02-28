@@ -1505,6 +1505,6 @@ def mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, scale, chunk_siz
         nchunks=nchunks, mimo_rank=R, scale=scale,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_DSTATE=BLOCK_DSTATE,
         num_warps=8,
-        num_stages=4,
+        num_stages=2,
     )
     return y_intra
