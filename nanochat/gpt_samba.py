@@ -297,6 +297,9 @@ class GPTSamba(nn.Module):
                 # dt_bias: softplus(-4..-2) gives ~0.02-0.13
                 torch.nn.init.uniform_(mamba.dt_bias, -4.0, -2.0)
                 torch.nn.init.zeros_(mamba.out_proj.weight)
+                if self.config.mamba_version == 3:
+                    mamba.B_norm_bias.fill_(1.0)
+                    mamba.C_norm_bias.fill_(1.0)
                 # Re-initialize causal mask buffer (was garbage after to_empty from meta device)
                 mamba._causal_mask.copy_(torch.triu(torch.ones(mamba.chunk_size, mamba.chunk_size, dtype=torch.bool, device=mamba._causal_mask.device), diagonal=1))
 
