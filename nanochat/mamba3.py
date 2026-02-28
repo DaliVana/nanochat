@@ -110,8 +110,8 @@ class Mamba3Layer(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
 
         # Scale normalizes both the C·B dot product (1/√d_state) and the
-        # MIMO rank summation (1/R) so total output magnitude matches SISO.
-        self._ssd_scale = d_state ** -0.5 / mimo_rank
+        # MIMO rank summation (1/√R) so total output variance matches SISO.
+        self._ssd_scale = (d_state * mimo_rank) ** -0.5
         self.register_buffer(
             '_causal_mask',
             torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool), diagonal=1),
@@ -232,7 +232,8 @@ class Mamba3Layer(nn.Module):
         # raw_angles: (batch, T, d_state//2)
         raw_angles = dt_mean * theta_raw
 
-        # Cumulative angles over the full sequence (computed before chunking)
+        # Negative cumsum: B at time s rotates by -sum(0..s), C at time t by -sum(0..t),
+        # so C_t @ B_s encodes positional distance via angle difference sum(s..t).
         cum_angles = -torch.cumsum(raw_angles.float(), dim=1)
 
         # cos/sin — compute in fp32, cast to input dtype to free fp32 copies
@@ -782,6 +783,8 @@ class Mamba3Layer(nn.Module):
             lam_t = lam[:, t]    # (B, n_heads)
 
             alpha_t = torch.exp(A * dt_t)            # (B, n_heads)
+            # Note: dt is included in beta/gamma (not in Bx below), matching the forward
+            # path where x is pre-weighted by (1-lam)*alpha and the SSD kernel applies dt.
             beta_t = (1 - lam_t) * dt_t * alpha_t
             gamma_t = lam_t * dt_t
 

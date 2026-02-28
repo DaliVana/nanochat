@@ -65,10 +65,8 @@ def test_trapezoidal_vs_recurrent():
 
     print(f"  Trapezoidal vs Recurrent: max_abs={max_diff:.6f}, rel={rel_diff:.6f}, cos_sim={cos_sim:.6f}")
 
-    # The two paths won't be exactly identical because the chunked path uses SSD
-    # (which includes within-chunk quadratic approximation) while recurrent is exact.
-    # But they should be very close for small dt values.
-    passed = cos_sim > 0.95 and rel_diff < 0.1
+    # Both paths are mathematically equivalent — differences are from float precision only.
+    passed = cos_sim > 0.999 and rel_diff < 0.01
     print(f"  {'PASS' if passed else 'FAIL'}")
     return passed
 
@@ -314,7 +312,7 @@ def test_mimo_recurrent_vs_chunked():
     print(f"  MIMO recurrent vs chunked (R={mimo_rank}): "
           f"max_abs={max_diff:.6f}, rel={rel_diff:.6f}, cos_sim={cos_sim:.6f}")
 
-    passed = cos_sim > 0.95 and rel_diff < 0.1
+    passed = cos_sim > 0.999 and rel_diff < 0.01
     print(f"  {'PASS' if passed else 'FAIL'}")
     return passed
 

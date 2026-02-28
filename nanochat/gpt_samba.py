@@ -173,7 +173,11 @@ class AttentionBlock(nn.Module):
 
 
 class MambaBlock(nn.Module):
-    """Mamba block: Mamba2Layer or Mamba3Layer + MLP, pre-norm residual."""
+    """Mamba block: Mamba2Layer or Mamba3Layer, pre-norm residual.
+
+    No separate MLP — the Mamba layer's expand-then-gate (z * y) already
+    provides channel mixing, similar to a gated MLP (Jamba-style).
+    """
     def __init__(self, config):
         super().__init__()
         if config.mamba_version == 3:
@@ -194,12 +198,10 @@ class MambaBlock(nn.Module):
                 ngroups=config.mamba_ngroups,
                 chunk_size=config.mamba_chunk_size,
             )
-        self.mlp = MLP(config)
 
     def forward(self, x):
         mamba_out, _, _ = self.mamba(norm(x))
         x = x + mamba_out
-        x = x + self.mlp(norm(x))
         return x
 
 
@@ -297,9 +299,6 @@ class GPTSamba(nn.Module):
                 torch.nn.init.zeros_(mamba.out_proj.weight)
                 # Re-initialize causal mask buffer (was garbage after to_empty from meta device)
                 mamba._causal_mask.copy_(torch.triu(torch.ones(mamba.chunk_size, mamba.chunk_size, dtype=torch.bool, device=mamba._causal_mask.device), diagonal=1))
-                # MLP in Mamba block: same as base
-                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-                torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
