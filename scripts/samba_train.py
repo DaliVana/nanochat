@@ -28,7 +28,7 @@ from nanochat.gpt_samba import GPTSamba as GPT, GPTConfigSamba as GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
 from nanochat.tokenizer import get_o200k_harmony_tokenizer, compute_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
+from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, find_last_step
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
@@ -91,6 +91,10 @@ parser.add_argument("--seq-len-schedule", type=str, default=None, help="comma-se
 parser.add_argument("--batch-size-schedule", type=str, default=None, help="comma-separated batch sizes for progressive training (e.g. '32,16,8,4,2,1')")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+# Continue-training (context extension, etc.)
+parser.add_argument("--continue-from", type=str, default=None, help="checkpoint directory to load model weights from (fresh optimizer/schedule)")
+parser.add_argument("--continue-from-step", type=int, default=-1, help="step within --continue-from checkpoint (-1 = auto-detect last step)")
+parser.add_argument("--min-doc-tokens", type=int, default=0, help="skip documents shorter than this many tokens (0 = no filter)")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 
@@ -196,6 +200,18 @@ if resuming:
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
+
+# Continue-training: load only model weights (fresh optimizer, fresh schedule, step=0)
+continuing = args.continue_from is not None
+if continuing:
+    assert not resuming, "--continue-from and --resume-from-step are mutually exclusive"
+    cont_step = args.continue_from_step
+    if cont_step == -1:
+        cont_step = find_last_step(args.continue_from)
+    print0(f"Continue-training: loading model weights from {args.continue_from} step {cont_step}")
+    model_data, _, _ = load_checkpoint(args.continue_from, cont_step, device, load_optimizer=False)
+    model.load_state_dict(model_data, strict=True, assign=True)
+    del model_data
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
@@ -338,7 +354,8 @@ if resuming:
 
 def create_train_loader(batch_size, seq_len, resume_state=None):
     return tokenizing_distributed_data_loader_with_state_bos_bestfit(
-        tokenizer, batch_size, seq_len, split="train", device=device, resume_state_dict=resume_state)
+        tokenizer, batch_size, seq_len, split="train", device=device,
+        resume_state_dict=resume_state, min_doc_tokens=args.min_doc_tokens)
 
 def create_val_loader(batch_size, seq_len):
     return tokenizing_distributed_data_loader_bos_bestfit(
