@@ -93,7 +93,7 @@ d_state (int, default=64):
     SSM state dimension per head. Each of the n_heads heads maintains a hidden
     state matrix h of shape (head_dim, d_state). This is the "memory" of the
     recurrence — at each timestep, the state is updated via:
-        h_t = decay * h_{t-1} + B_t (x) x_t    (outer product, rank-1 or rank-R)
+        h_t = decay * h_{t-1} + x_t ⊗ B_t    (outer product, rank-1 or rank-R)
     and the output is read via:
         y_t = C_t @ h_t
 
@@ -101,9 +101,10 @@ d_state (int, default=64):
     time), but costs O(d_state) per head in both the B/C projections and the
     state update. The total recurrent state size is n_heads * head_dim * d_state.
 
-    d_state also determines the RoPE dimensionality (must be even). In the SSD
-    algorithm, d_state controls the size of the C @ B^T attention-like score
-    matrix within each chunk (L x L x ngroups, contracted over d_state).
+    d_state also determines the RoPE dimensionality (must be even for the
+    paired rotation). In the SSD algorithm, d_state controls the size of the
+    C @ B^T attention-like score matrix within each chunk (L x L x ngroups,
+    contracted over d_state).
 
     Typical values: 64 (default), 128 for higher capacity. Diminishing returns
     beyond ~128 since the state is low-rank updated (rank-1 or rank-R per step).
@@ -134,14 +135,14 @@ mimo_rank (int, default=1):
     update at each timestep:
 
     - mimo_rank=1 (SISO): Standard Mamba. The state update is a rank-1 outer
-      product: delta_h = x_t (x) B_t (head_dim x d_state, rank 1). This means
+      product: delta_h = x_t ⊗ B_t (head_dim x d_state, rank 1). This means
       each timestep can only write a rank-1 "slice" of information into the
       state matrix. The input x and B projection are single vectors.
 
     - mimo_rank=R > 1 (MIMO): The input x is projected to R copies
       (d_inner * R total), and B is also projected to R copies (ngroups * d_state * R).
       The state update becomes a rank-R matmul:
-          delta_h = sum_{r=1}^{R} x_t^r (x) B_t^r    (rank-R update)
+          delta_h = sum_{r=1}^{R} x_t^r ⊗ B_t^r    (rank-R update)
       This allows R times more information to be written into state per timestep.
 
       The output C remains single-rank (not replicated), so MIMO is
@@ -194,8 +195,8 @@ Derived Dimensions
     Recurrent state per layer: n_heads * head_dim * d_state floats
 
 References:
-- Mamba-3: https://openreview.net/forum?id=HwCvaJOiCj
-- Mamba-2: https://arxiv.org/abs/2405.21060
+- Mamba-3 (Trapezoidal SSD): https://openreview.net/forum?id=HwCvaJOiCj
+- Mamba-2 (SSD): https://arxiv.org/abs/2405.21060
 """
 
 import torch
@@ -275,16 +276,17 @@ if _HAS_TRITON:
         Bg: torch.Tensor, Bb: torch.Tensor,
         x_dt_g: torch.Tensor, x_dt_b: torch.Tensor,
         dA_cumsum: torch.Tensor, C: torch.Tensor,
-        cum_angles: torch.Tensor, cum_angles_shifted: torch.Tensor,
+        cos_ang: torch.Tensor, sin_ang: torch.Tensor,
+        cos_angs: torch.Tensor, sin_angs: torch.Tensor,
         scale: float, chunk_size: int, mimo_rank: int,
     ) -> torch.Tensor:
         return mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
-                                     cum_angles, cum_angles_shifted,
+                                     cos_ang, sin_ang, cos_angs, sin_angs,
                                      scale, chunk_size, mimo_rank)
 
     @_mamba3_intra_fwd_op.register_fake
     def _mamba3_intra_fwd_fake(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
-                                cum_angles, cum_angles_shifted,
+                                cos_ang, sin_ang, cos_angs, sin_angs,
                                 scale, chunk_size, mimo_rank):
         batch, nchunks, L, nheads, R, headdim = x_dt_g.shape
         return x_dt_g.new_empty(batch, nchunks, L, nheads, headdim, dtype=torch.float32)
@@ -292,20 +294,21 @@ if _HAS_TRITON:
     def _mamba3_intra_autograd_bwd(ctx, dy_intra):
         """Backward for within-chunk: PyTorch autograd (materializes L).
         cuBLAS batched GEMMs outperform hand-written Triton tiling for these shapes.
-        Reconstructs rotated B/C from saved raw tensors + cum_angles, then
-        inverse-rotates gradients back to raw B/C space."""
-        Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, cum_angles, cum_angles_shifted = ctx.saved_tensors
+        Reconstructs rotated B/C from saved cos/sin, then inverse-rotates
+        gradients back to raw B/C space."""
+        (Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
+         cos_ang, sin_ang, cos_angs, sin_angs) = ctx.saved_tensors
         scale = ctx.scale
         R = ctx.mimo_rank
         L = ctx.chunk_size
 
-        # Reconstruct rotated B/C for PyTorch backward
-        fused = cum_angles.numel() > 0
+        # Reconstruct rotated B/C from saved cos/sin (no trig recomputation)
+        fused = cos_ang.numel() > 0
         if fused:
-            cos_a = torch.cos(cum_angles).unsqueeze(3)    # (batch, nc, L, 1, half_d)
-            sin_a = torch.sin(cum_angles).unsqueeze(3)
-            cos_s = torch.cos(cum_angles_shifted).unsqueeze(3)
-            sin_s = torch.sin(cum_angles_shifted).unsqueeze(3)
+            cos_a = cos_ang.unsqueeze(3)    # (batch, nc, L, 1, half_d)
+            sin_a = sin_ang.unsqueeze(3)
+            cos_s = cos_angs.unsqueeze(3)
+            sin_s = sin_angs.unsqueeze(3)
             C_rot = _apply_rope_pairs(C, cos_a, sin_a).float()
             Bg_rot = _apply_rope_pairs(Bg, cos_a.unsqueeze(4), sin_a.unsqueeze(4))
             Bb_rot = _apply_rope_pairs(Bb, cos_s.unsqueeze(4), sin_s.unsqueeze(4))
@@ -338,13 +341,13 @@ if _HAS_TRITON:
             dC = C_.grad
 
         return (dBg, dBb, x_dt_g_.grad, x_dt_b_.grad,
-                dA_cumsum_.grad, dC, None, None, None, None, None)
+                dA_cumsum_.grad, dC, None, None, None, None, None, None, None)
 
     def _mamba3_intra_setup_context(ctx, inputs, output):
         (Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
-         cum_angles, cum_angles_shifted, scale, chunk_size, mimo_rank) = inputs
+         cos_ang, sin_ang, cos_angs, sin_angs, scale, chunk_size, mimo_rank) = inputs
         ctx.save_for_backward(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
-                              cum_angles, cum_angles_shifted)
+                              cos_ang, sin_ang, cos_angs, sin_angs)
         ctx.scale = scale
         ctx.chunk_size = chunk_size
         ctx.mimo_rank = mimo_rank
@@ -659,6 +662,12 @@ class Mamba3Layer(nn.Module):
             angles_chunked = cum_angles.view(batch_size, n_chunks, L, half_d)
             angles_shifted_chunked = cum_angles_shifted.view(
                 batch_size, n_chunks, L, half_d)
+            # Pre-compute cos/sin once — shared by both within-chunk kernel and
+            # between-chunk rotation. Eliminates trig from Triton kernel.
+            cos_a_f32 = torch.cos(angles_chunked)   # (batch, nc, L, half_d) float32
+            sin_a_f32 = torch.sin(angles_chunked)
+            cos_s_f32 = torch.cos(angles_shifted_chunked)
+            sin_s_f32 = torch.sin(angles_shifted_chunked)
 
         # === SHARED DECAY (computed once instead of twice) ===
         log_dA = (A * dt_).float()
@@ -676,7 +685,7 @@ class Mamba3Layer(nn.Module):
             assert fused_rope, "Triton path requires fused RoPE (cum_angles must be provided)"
             y_intra = _mamba3_intra_fwd_op(
                 Bg, Bb, x_dt_g, x_dt_b, cum_log_dA, C_f,
-                angles_chunked, angles_shifted_chunked,
+                cos_a_f32, sin_a_f32, cos_s_f32, sin_s_f32,
                 scale, L, R)
         else:
             y_intra = _mamba3_intra_pytorch(
@@ -684,19 +693,20 @@ class Mamba3Layer(nn.Module):
                 scale, R, self._causal_mask)
 
         # === BETWEEN-CHUNK: shared decay, combined delta_h ===
-        # Between-chunk needs rotated B/C — compute lazily from raw + angles
+        # Between-chunk needs rotated B/C — reuse pre-computed cos/sin
         if fused_rope:
             input_dtype = Bg.dtype
-            cos_a = torch.cos(angles_chunked).to(input_dtype)
-            sin_a = torch.sin(angles_chunked).to(input_dtype)
-            cos_s = torch.cos(angles_shifted_chunked).to(input_dtype)
-            sin_s = torch.sin(angles_shifted_chunked).to(input_dtype)
-            # Rotate C: (batch, nc, L, ngroups, d_state) with angles (batch, nc, L, half_d)
+            cos_a = cos_a_f32.to(input_dtype)
+            sin_a = sin_a_f32.to(input_dtype)
+            cos_s = cos_s_f32.to(input_dtype)
+            sin_s = sin_s_f32.to(input_dtype)
+            del cos_a_f32, sin_a_f32, cos_s_f32, sin_s_f32
+            # Rotate C: (batch, nc, L, ngroups, d_state) with cos/sin (batch, nc, L, half_d)
             C_rot = _apply_rope_pairs(C_, cos_a.unsqueeze(3), sin_a.unsqueeze(3))
-            # Rotate Bg: (batch, nc, L, ngroups, R, d_state) with angles
+            # Rotate Bg: (batch, nc, L, ngroups, R, d_state) with cos/sin
             Bg_rot = _apply_rope_pairs(Bg, cos_a.unsqueeze(3).unsqueeze(4),
                                        sin_a.unsqueeze(3).unsqueeze(4))
-            # Rotate Bb with shifted angles (position t-1)
+            # Rotate Bb with shifted cos/sin (position t-1)
             Bb_rot = _apply_rope_pairs(Bb, cos_s.unsqueeze(3).unsqueeze(4),
                                        sin_s.unsqueeze(3).unsqueeze(4))
             del cos_a, sin_a, cos_s, sin_s

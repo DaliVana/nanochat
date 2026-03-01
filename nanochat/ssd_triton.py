@@ -1,9 +1,16 @@
 """
 Triton kernels for Mamba-3 SSD (Structured State Space Duality).
 
-Fused within-chunk kernel for Two-SSD with MIMO. The decay matrix L is NEVER
-materialized — computed tile-by-tile in registers. The R-loop (MIMO rank) is
-fused inside the kernel.
+Forward kernel: fused within-chunk computation for Two-SSD with MIMO. The decay
+matrix L is NEVER materialized — computed tile-by-tile in registers. The R-loop
+(MIMO rank) is fused inside the kernel. RoPE rotation is applied inline from
+pre-computed cos/sin, avoiding both HBM round-trips for pre-rotated B/C and
+expensive trig (SFU) ops inside the kernel.
+
+Backward kernels (two-kernel decomposition):
+  Kernel 1 (_bwd_dC): computes dC and ddA_cumsum (m-side). Grid over (m, group).
+  Kernel 2 (_bwd_dx): computes dx_dt, dBg/dBb (atomic), ddA_cumsum (k-side).
+    Grid over (k, head). Uses pre-rotated B/C from the forward pass.
 """
 
 import torch
@@ -12,11 +19,8 @@ import triton.language as tl
 
 
 # =============================================================================
-# Mamba-3: Fused within-chunk kernel (Two-SSD with MIMO)
+# Forward kernel
 # =============================================================================
-# Replaces the PyTorch within-chunk computation in Mamba3Layer._two_ssd_forward.
-# The decay matrix L is NEVER materialized — computed tile-by-tile in registers.
-# The R-loop (MIMO rank) is fused inside the kernel.
 
 @triton.jit
 def _mamba3_chunk_scan_fwd_kernel(
@@ -25,9 +29,9 @@ def _mamba3_chunk_scan_fwd_kernel(
     x_dt_g_ptr, x_dt_b_ptr,   # (batch, nc, L, nheads, R, headdim) native dtype
     dA_cumsum_ptr,             # (batch, nc, L, nheads) float32
     C_ptr,                     # (batch, nc, L, ngroups, dstate)
-    # RoPE angles (fused rotation): (batch, nc, L, half_dstate) float32
-    cum_angles_ptr,            # angles for Bg and C
-    cum_angles_shifted_ptr,    # shifted angles for Bb (position t-1)
+    # Pre-computed cos/sin for RoPE: (batch, nc, L, half_dstate) float32
+    cos_ang_ptr, sin_ang_ptr,      # cos/sin of cum_angles (for Bg and C)
+    cos_angs_ptr, sin_angs_ptr,    # cos/sin of cum_angles_shifted (for Bb)
     out_ptr,                   # (batch, nc, L, nheads, headdim) float32
     # Strides for Bg/Bb (6D): batch, chunk, seqlen, group, rank, dstate
     stride_Bg_batch, stride_Bg_chunk, stride_Bg_seqlen, stride_Bg_group, stride_Bg_rank, stride_Bg_dstate,
@@ -39,9 +43,9 @@ def _mamba3_chunk_scan_fwd_kernel(
     stride_dA_batch, stride_dA_chunk, stride_dA_seqlen, stride_dA_head,
     # Strides for C (5D): batch, chunk, seqlen, group, dstate
     stride_C_batch, stride_C_chunk, stride_C_seqlen, stride_C_group, stride_C_dstate,
-    # Strides for cum_angles (4D): batch, chunk, seqlen, half_dstate
+    # Strides for cos/sin (4D): batch, chunk, seqlen, half_dstate
+    # cos_ang and sin_ang share strides; cos_angs and sin_angs share strides
     stride_ang_batch, stride_ang_chunk, stride_ang_seqlen, stride_ang_hdstate,
-    # Strides for cum_angles_shifted (4D): same layout
     stride_angs_batch, stride_angs_chunk, stride_angs_seqlen, stride_angs_hdstate,
     # Strides for out (5D): batch, chunk, seqlen, head, headdim
     stride_out_batch, stride_out_chunk, stride_out_seqlen, stride_out_head, stride_out_hdim,
@@ -56,8 +60,8 @@ def _mamba3_chunk_scan_fwd_kernel(
     Fused within-chunk computation for Mamba-3 Two-SSD with MIMO and fused RoPE.
 
     RoPE is applied inline: raw (unrotated) B and C are passed in, and rotation
-    is computed from cum_angles in registers. This avoids materializing rotated
-    B/C to HBM.
+    is computed from pre-computed cos/sin in registers. Trig (SFU) ops are done
+    outside the kernel to avoid expensive per-tile cos/sin in the hot loop.
 
     With dstate=128 and BLOCK_DSTATE=64, the two C/B tiles map exactly to the
     two halves for RoPE: tile 0 = first half (x1), tile 1 = second half (x2).
@@ -135,16 +139,19 @@ def _mamba3_chunk_scan_fwd_kernel(
         mask=(offs_m[:, None] < chunk_size) & c_d1_mask[None, :],
         other=0.0).to(tl.float32)
 
-    # Load cum_angles for m-positions: (BLOCK_M, BLOCK_DSTATE) float32
+    # Load pre-computed cos/sin for m-positions: (BLOCK_M, BLOCK_DSTATE) float32
     ang_d_offs = tl.arange(0, BLOCK_DSTATE)
-    ang_m = tl.load(
-        cum_angles_ptr + off_bc_ang
+    cs_m_mask = (offs_m[:, None] < chunk_size) & (ang_d_offs[None, :] < half_dstate)
+    cos_m = tl.load(
+        cos_ang_ptr + off_bc_ang
         + offs_m[:, None] * stride_ang_seqlen
         + ang_d_offs[None, :] * stride_ang_hdstate,
-        mask=(offs_m[:, None] < chunk_size) & (ang_d_offs[None, :] < half_dstate),
-        other=0.0).to(tl.float32)
-    cos_m = tl.cos(ang_m)  # (BLOCK_M, BLOCK_DSTATE)
-    sin_m = tl.sin(ang_m)
+        mask=cs_m_mask, other=0.0)
+    sin_m = tl.load(
+        sin_ang_ptr + off_bc_ang
+        + offs_m[:, None] * stride_ang_seqlen
+        + ang_d_offs[None, :] * stride_ang_hdstate,
+        mask=cs_m_mask, other=0.0)
 
     # Apply RoPE to C tiles: rot_0 = half_0*cos - half_1*sin, rot_1 = half_0*sin + half_1*cos
     c_tile_0 = c_half_0 * cos_m - c_half_1 * sin_m
@@ -167,25 +174,31 @@ def _mamba3_chunk_scan_fwd_kernel(
         causal = offs_m[:, None] >= k_offs[None, :]
         decay = tl.where(causal, decay, 0.0)  # (BLOCK_M, BLOCK_K)
 
-        # Load cum_angles for k-positions (shared across all R ranks)
-        # Bg uses cum_angles[k], Bb uses cum_angles_shifted[k]
-        ang_k = tl.load(
-            cum_angles_ptr + off_bc_ang
+        # Load pre-computed cos/sin for k-positions (shared across all R ranks)
+        # Bg uses cos/sin from cum_angles[k], Bb uses cos/sin from cum_angles_shifted[k]
+        cs_k_mask = k_mask[:, None] & (ang_d_offs[None, :] < half_dstate)
+        cos_k = tl.load(
+            cos_ang_ptr + off_bc_ang
             + k_offs[:, None] * stride_ang_seqlen
             + ang_d_offs[None, :] * stride_ang_hdstate,
-            mask=k_mask[:, None] & (ang_d_offs[None, :] < half_dstate),
-            other=0.0).to(tl.float32)
-        cos_k = tl.cos(ang_k)   # (BLOCK_K, BLOCK_DSTATE)
-        sin_k = tl.sin(ang_k)
+            mask=cs_k_mask, other=0.0)
+        sin_k = tl.load(
+            sin_ang_ptr + off_bc_ang
+            + k_offs[:, None] * stride_ang_seqlen
+            + ang_d_offs[None, :] * stride_ang_hdstate,
+            mask=cs_k_mask, other=0.0)
 
-        ang_k_s = tl.load(
-            cum_angles_shifted_ptr + off_bc_angs
+        cs_ks_mask = k_mask[:, None] & (ang_d_offs[None, :] < half_dstate)
+        cos_k_s = tl.load(
+            cos_angs_ptr + off_bc_angs
             + k_offs[:, None] * stride_angs_seqlen
             + ang_d_offs[None, :] * stride_angs_hdstate,
-            mask=k_mask[:, None] & (ang_d_offs[None, :] < half_dstate),
-            other=0.0).to(tl.float32)
-        cos_k_s = tl.cos(ang_k_s)  # (BLOCK_K, BLOCK_DSTATE)
-        sin_k_s = tl.sin(ang_k_s)
+            mask=cs_ks_mask, other=0.0)
+        sin_k_s = tl.load(
+            sin_angs_ptr + off_bc_angs
+            + k_offs[:, None] * stride_angs_seqlen
+            + ang_d_offs[None, :] * stride_angs_hdstate,
+            mask=cs_ks_mask, other=0.0)
 
         # C tiles (rotated) pre-loaded before k and r loops.
         # Each rank reuses the cached C tiles, avoiding redundant global loads.
@@ -284,13 +297,13 @@ def _sram_estimate(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_DSTATE, dstate, num_stages=1
     fixed = (BLOCK_M * BLOCK_N * 4             # acc (float32)
             + BLOCK_M * BLOCK_K * 4            # decay (float32)
             + BLOCK_M * dstate * 4             # c_rot tiles (float32, 2 halves)
-            + BLOCK_M * BLOCK_DSTATE * 4       # cum_angles for m (float32)
+            + 2 * BLOCK_M * BLOCK_DSTATE * 4   # cos_m, sin_m (float32)
             )
     # Staged: loop-body global loads, multiplied by num_stages
-    # B loads are now float32 (both halves needed simultaneously for RoPE rotation)
+    # B loads are float32 (both halves needed simultaneously for RoPE rotation)
     staged = (4 * BLOCK_K * BLOCK_DSTATE * 4   # bg_half0, bg_half1, bb_half0, bb_half1 (float32)
             + 2 * BLOCK_K * BLOCK_N * 4        # xg, xb (float32)
-            + 2 * BLOCK_K * BLOCK_DSTATE * 4   # cum_angles[k] + cum_angles_shifted[k] (float32)
+            + 4 * BLOCK_K * BLOCK_DSTATE * 4   # cos_k, sin_k, cos_k_s, sin_k_s (float32)
             )
     return fixed + staged * num_stages
 
@@ -350,26 +363,28 @@ def _select_block_sizes(L, headdim, dstate, device=None):
 
 
 def mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
-                          cum_angles, cum_angles_shifted,
+                          cos_ang, sin_ang, cos_angs, sin_angs,
                           scale, chunk_size, mimo_rank):
     """
     Fused within-chunk computation for Mamba-3 Two-SSD with MIMO and fused RoPE.
 
     Decay matrix L is never materialized. R-loop is fused inside the kernel.
-    RoPE rotation is applied inline from cum_angles (not pre-applied to B/C).
+    RoPE rotation is applied inline from pre-computed cos/sin (no trig in kernel).
 
     Args:
-        Bg:                  (batch, nchunks, chunk_size, ngroups, R, dstate)
-        Bb:                  (batch, nchunks, chunk_size, ngroups, R, dstate)
-        x_dt_g:              (batch, nchunks, chunk_size, nheads, R, headdim) float32
-        x_dt_b:              (batch, nchunks, chunk_size, nheads, R, headdim) float32
-        dA_cumsum:           (batch, nchunks, chunk_size, nheads) float32
-        C:                   (batch, nchunks, chunk_size, ngroups, dstate) float32
-        cum_angles:          (batch, nchunks, chunk_size, half_dstate) float32
-        cum_angles_shifted:  (batch, nchunks, chunk_size, half_dstate) float32
-        scale:               float
-        chunk_size:          int
-        mimo_rank:           int
+        Bg:        (batch, nchunks, chunk_size, ngroups, R, dstate)
+        Bb:        (batch, nchunks, chunk_size, ngroups, R, dstate)
+        x_dt_g:    (batch, nchunks, chunk_size, nheads, R, headdim) float32
+        x_dt_b:    (batch, nchunks, chunk_size, nheads, R, headdim) float32
+        dA_cumsum: (batch, nchunks, chunk_size, nheads) float32
+        C:         (batch, nchunks, chunk_size, ngroups, dstate) float32
+        cos_ang:   (batch, nchunks, chunk_size, half_dstate) float32 — cos(cum_angles)
+        sin_ang:   (batch, nchunks, chunk_size, half_dstate) float32 — sin(cum_angles)
+        cos_angs:  (batch, nchunks, chunk_size, half_dstate) float32 — cos(cum_angles_shifted)
+        sin_angs:  (batch, nchunks, chunk_size, half_dstate) float32 — sin(cum_angles_shifted)
+        scale:     float
+        chunk_size: int
+        mimo_rank: int
     Returns:
         y_intra: (batch, nchunks, chunk_size, nheads, headdim) float32
     """
@@ -392,15 +407,15 @@ def mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
 
     _mamba3_chunk_scan_fwd_kernel[grid](
         Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
-        cum_angles, cum_angles_shifted, y_intra,
+        cos_ang, sin_ang, cos_angs, sin_angs, y_intra,
         Bg.stride(0), Bg.stride(1), Bg.stride(2), Bg.stride(3), Bg.stride(4), Bg.stride(5),
         Bb.stride(0), Bb.stride(1), Bb.stride(2), Bb.stride(3), Bb.stride(4), Bb.stride(5),
         x_dt_g.stride(0), x_dt_g.stride(1), x_dt_g.stride(2), x_dt_g.stride(3), x_dt_g.stride(4), x_dt_g.stride(5),
         x_dt_b.stride(0), x_dt_b.stride(1), x_dt_b.stride(2), x_dt_b.stride(3), x_dt_b.stride(4), x_dt_b.stride(5),
         dA_cumsum.stride(0), dA_cumsum.stride(1), dA_cumsum.stride(2), dA_cumsum.stride(3),
         C.stride(0), C.stride(1), C.stride(2), C.stride(3), C.stride(4),
-        cum_angles.stride(0), cum_angles.stride(1), cum_angles.stride(2), cum_angles.stride(3),
-        cum_angles_shifted.stride(0), cum_angles_shifted.stride(1), cum_angles_shifted.stride(2), cum_angles_shifted.stride(3),
+        cos_ang.stride(0), cos_ang.stride(1), cos_ang.stride(2), cos_ang.stride(3),
+        cos_angs.stride(0), cos_angs.stride(1), cos_angs.stride(2), cos_angs.stride(3),
         y_intra.stride(0), y_intra.stride(1), y_intra.stride(2), y_intra.stride(3), y_intra.stride(4),
         chunk_size=L, headdim=headdim, dstate=dstate,
         nheads=nheads, ngroups=ngroups, nheads_per_group=nheads_per_group,
@@ -413,7 +428,7 @@ def mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
 
 
 # =============================================================================
-# Backward kernels
+# Backward kernels (no fused RoPE — uses pre-rotated B/C from forward)
 # =============================================================================
 
 @triton.jit
