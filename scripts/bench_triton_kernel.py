@@ -64,8 +64,8 @@ def make_inputs(batch, seq_len, d_model, expand, d_state, chunk_size, mimo_rank,
 
     Bg = torch.randn(batch, nc, L, ngroups, R, d_state, device=device, dtype=torch.bfloat16)
     Bb = torch.randn(batch, nc, L, ngroups, R, d_state, device=device, dtype=torch.bfloat16)
-    x_dt_g = torch.randn(batch, nc, L, n_heads, R, headdim, device=device, dtype=torch.float32)
-    x_dt_b = torch.randn(batch, nc, L, n_heads, R, headdim, device=device, dtype=torch.float32)
+    x_dt_g = torch.randn(batch, nc, L, n_heads, R, headdim, device=device, dtype=torch.bfloat16)
+    x_dt_b = torch.randn(batch, nc, L, n_heads, R, headdim, device=device, dtype=torch.bfloat16)
     dA_cumsum = (-torch.rand(batch, nc, L, n_heads, device=device, dtype=torch.float32) * 0.1).cumsum(dim=2)
     C = torch.randn(batch, nc, L, ngroups, d_state, device=device, dtype=torch.float32)
 
@@ -87,11 +87,11 @@ def compute_bytes(batch, nc, L, ngroups, R, d_state, n_heads, headdim):
     """Total bytes read + written by the kernel."""
     half_d = d_state // 2
     b_bytes = 2 * (batch * nc * L * ngroups * R * d_state * 2)
-    xdt_bytes = 2 * (batch * nc * L * n_heads * R * headdim * 4)
+    xdt_bytes = 2 * (batch * nc * L * n_heads * R * headdim * 2)  # bf16 x_dt
     dA_bytes = batch * nc * L * n_heads * 4
     c_bytes = batch * nc * L * ngroups * d_state * 4
     cs_bytes = 4 * (batch * nc * L * half_d * 4)
-    out_bytes = batch * nc * L * n_heads * headdim * 4
+    out_bytes = batch * nc * L * n_heads * headdim * 2  # bf16 output
     return b_bytes + xdt_bytes + dA_bytes + c_bytes + cs_bytes + out_bytes
 
 
@@ -126,7 +126,7 @@ def bench_kernel(cfg, warmup=25, rep=100):
     best = _mamba3_chunk_scan_fwd_kernel.best_config
     bk = best.kwargs
     block_info = (f"BLOCK_M={bk['BLOCK_M']} BLOCK_N={bk['BLOCK_N']} BLOCK_K={bk['BLOCK_K']} "
-                  f"BLOCK_DSTATE={d_state // 2} stages={best.num_stages} warps={best.num_warps}")
+                  f"BLOCK_DSTATE={max(32, d_state // 2)} stages={best.num_stages} warps={best.num_warps}")
 
     total_bytes = compute_bytes(batch, nc, L, ngroups, R, d_state, n_heads, headdim)
     gb_s = total_bytes / (ms * 1e-3) / 1e9
@@ -135,7 +135,7 @@ def bench_kernel(cfg, warmup=25, rep=100):
 
     input_mb = sum(t.nelement() * t.element_size() for t in [Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
                                                                cos_ang, sin_ang, cos_angs, sin_angs]) / 1e6
-    out_mb = (batch * nc * L * n_heads * headdim * 4) / 1e6
+    out_mb = (batch * nc * L * n_heads * headdim * 2) / 1e6  # bf16 output
 
     return dict(ms=ms, gb_s=gb_s, tflops=tflops, block_info=block_info,
                 input_mb=input_mb, out_mb=out_mb)

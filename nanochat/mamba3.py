@@ -289,7 +289,7 @@ if _HAS_TRITON:
                                 cos_ang, sin_ang, cos_angs, sin_angs,
                                 scale, chunk_size, mimo_rank):
         batch, nchunks, L, nheads, R, headdim = x_dt_g.shape
-        return x_dt_g.new_empty(batch, nchunks, L, nheads, headdim, dtype=torch.float32)
+        return x_dt_g.new_empty(batch, nchunks, L, nheads, headdim, dtype=torch.bfloat16)
 
     def _mamba3_intra_autograd_bwd(ctx, dy_intra):
         """Backward for within-chunk: PyTorch autograd (materializes L).
@@ -675,8 +675,8 @@ class Mamba3Layer(nn.Module):
 
         # Pre-compute x*dt for all ranks (reused in within-chunk and between-chunk)
         dt_broad = dt_.unsqueeze(-1).unsqueeze(-1)  # (batch, nc, L, nh, 1, 1)
-        x_dt_g = (x_g * dt_broad).float()
-        x_dt_b = (x_b * dt_broad).float()
+        x_dt_g = (x_g * dt_broad).bfloat16()
+        x_dt_b = (x_b * dt_broad).bfloat16()
 
         # === WITHIN-CHUNK: Triton on CUDA (L never materialized), PyTorch fallback ===
         hpg = n_heads // ngroups

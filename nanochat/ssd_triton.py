@@ -5,9 +5,11 @@ Forward kernel: fused within-chunk computation for Two-SSD with MIMO. The decay
 matrix L is NEVER materialized — computed tile-by-tile in registers. The R-loop
 (MIMO rank) is fused inside the kernel. RoPE rotation is split into a single
 fused pre-rotation kernel (1 launch for C+Bg+Bb) to reduce register pressure
-in the main scan. Pre-rotated B tensors are stored in bf16 to halve register
-footprint and memory traffic. CB score dots use bf16 tensor cores (2x throughput
-vs TF32); score-to-value dots remain TF32 for precision on decay-scaled scores.
+in the main scan. Pre-rotated B tensors and x_dt values are stored in bf16 to
+halve register footprint and memory traffic. CB score dots use bf16 tensor cores
+(2x throughput vs TF32); score-to-value dots remain TF32 for precision on
+decay-scaled scores (x_dt loaded as bf16, widened to f32 for TF32 dots).
+Output is stored as bf16.
 """
 
 import torch
@@ -166,19 +168,30 @@ def _prerotate_for_scan(Bg, Bb, C, cos_ang, sin_ang, cos_angs, sin_angs):
 
 @triton.autotune(
     configs=[
+        # Large blocks (chunk >= 128, headdim >= 64)
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=2, num_warps=8),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=2, num_warps=8),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=1, num_warps=4),
+        # Asymmetric M/N (headdim > chunk or vice versa)
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=1, num_warps=4),
+        # Medium blocks
         triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=3, num_warps=4),
         triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=1, num_warps=4),
+        # Large K for large chunks (reduces K-loop iterations)
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 128}, num_stages=1, num_warps=8),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 128}, num_stages=1, num_warps=4),
+        # Small K for small configs
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=2, num_warps=4),
     ],
-    key=['chunk_size', 'headdim', 'dstate', 'mimo_rank'],
+    key=['chunk_size', 'headdim', 'dstate', 'mimo_rank', 'ngroups'],
 )
 @triton.jit
 def _mamba3_chunk_scan_fwd_kernel(
     # Input tensors (pre-rotated B in bf16, C in float32)
     Bg_ptr, Bb_ptr,            # (batch, nc, L, ngroups, R, dstate) bf16
-    x_dt_g_ptr, x_dt_b_ptr,   # (batch, nc, L, nheads, R, headdim) float32
+    x_dt_g_ptr, x_dt_b_ptr,   # (batch, nc, L, nheads, R, headdim) bf16
     dA_cumsum_ptr,             # (batch, nc, L, nheads) float32
     C_ptr,                     # (batch, nc, L, ngroups, dstate) float32
     out_ptr,                   # (batch, nc, L, nheads, headdim) float32
@@ -327,7 +340,7 @@ def _mamba3_chunk_scan_fwd_kernel(
             scores_g = cb_g * decay * scale
             scores_b = cb_b * decay * scale
 
-            # x_dt_g[k, h, r, p]: (BLOCK_K, BLOCK_N)
+            # x_dt_g[k, h, r, p]: (BLOCK_K, BLOCK_N) — loaded as bf16, cast to f32
             xg_vals = tl.load(
                 x_dt_g_ptr + off_bc_xg
                 + k_offs[:, None] * stride_xg_seqlen
@@ -335,9 +348,9 @@ def _mamba3_chunk_scan_fwd_kernel(
                 + r * stride_xg_rank
                 + offs_n[None, :] * stride_xg_hdim,
                 mask=k_mask[:, None] & (offs_n[None, :] < headdim),
-                other=0.0)
+                other=0.0).to(tl.float32)
 
-            # x_dt_b[k, h, r, p]: (BLOCK_K, BLOCK_N)
+            # x_dt_b[k, h, r, p]: (BLOCK_K, BLOCK_N) — loaded as bf16, cast to f32
             xb_vals = tl.load(
                 x_dt_b_ptr + off_bc_xb
                 + k_offs[:, None] * stride_xb_seqlen
@@ -345,11 +358,11 @@ def _mamba3_chunk_scan_fwd_kernel(
                 + r * stride_xb_rank
                 + offs_n[None, :] * stride_xb_hdim,
                 mask=k_mask[:, None] & (offs_n[None, :] < headdim),
-                other=0.0)
+                other=0.0).to(tl.float32)
 
             # (BLOCK_M, BLOCK_K) @ (BLOCK_K, BLOCK_N) -> (BLOCK_M, BLOCK_N)
-            # TF32 for these dots — scores and x_dt are float32. Scores have large
-            # dynamic range from decay (0->1 exponential) so bf16 would lose precision.
+            # TF32 for these dots — scores are float32 (decay dynamic range 0->1).
+            # x_dt loaded as bf16 and widened to float32 for TF32 tensor cores.
             acc += tl.dot(scores_g, xg_vals)
             acc += tl.dot(scores_b, xb_vals)
 
@@ -359,14 +372,14 @@ def _mamba3_chunk_scan_fwd_kernel(
              + offs_m[:, None] * stride_out_seqlen
              + pid_h * stride_out_head
              + offs_n[None, :] * stride_out_hdim,
-             acc,
+             acc.to(tl.bfloat16),
              mask=(offs_m[:, None] < chunk_size) & (offs_n[None, :] < headdim))
 
 
 def _sram_estimate(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_DSTATE, dstate, num_stages=1):
     """Estimate peak SRAM usage in bytes for the scan kernel.
 
-    B tiles are bf16 (2 bytes), C tiles are bf16 (2 bytes), x_dt/scores are float32.
+    B tiles are bf16 (2 bytes), C tiles are bf16 (2 bytes), x_dt are bf16 (2 bytes).
     """
     # Fixed: not affected by pipeline staging
     fixed = (BLOCK_M * BLOCK_N * 4             # acc (float32)
@@ -375,7 +388,7 @@ def _sram_estimate(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_DSTATE, dstate, num_stages=1
             )
     # Staged: loop-body global loads, multiplied by num_stages
     staged = (4 * BLOCK_K * BLOCK_DSTATE * 2   # bg_tile0, bg_tile1, bb_tile0, bb_tile1 (bf16)
-            + 2 * BLOCK_K * BLOCK_N * 4        # xg, xb (float32)
+            + 2 * BLOCK_K * BLOCK_N * 2        # xg, xb (bf16, cast to f32 in registers)
             )
     return fixed + staged * num_stages
 
@@ -446,8 +459,8 @@ def mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
     Args:
         Bg:        (batch, nchunks, chunk_size, ngroups, R, dstate)
         Bb:        (batch, nchunks, chunk_size, ngroups, R, dstate)
-        x_dt_g:    (batch, nchunks, chunk_size, nheads, R, headdim) float32
-        x_dt_b:    (batch, nchunks, chunk_size, nheads, R, headdim) float32
+        x_dt_g:    (batch, nchunks, chunk_size, nheads, R, headdim) bfloat16
+        x_dt_b:    (batch, nchunks, chunk_size, nheads, R, headdim) bfloat16
         dA_cumsum: (batch, nchunks, chunk_size, nheads) float32
         C:         (batch, nchunks, chunk_size, ngroups, dstate) float32
         cos_ang:   (batch, nchunks, chunk_size, half_dstate) float32
@@ -458,7 +471,7 @@ def mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
         chunk_size: int
         mimo_rank: int
     Returns:
-        y_intra: (batch, nchunks, chunk_size, nheads, headdim) float32
+        y_intra: (batch, nchunks, chunk_size, nheads, headdim) bfloat16
     """
     batch, nchunks, L, nheads, R, headdim = x_dt_g.shape
     ngroups = C.shape[3]
@@ -466,14 +479,14 @@ def mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
     nheads_per_group = nheads // ngroups
 
     assert dstate % 2 == 0, f"Requires even dstate, got {dstate}"
-    BLOCK_DSTATE = dstate // 2
+    BLOCK_DSTATE = max(32, dstate // 2)
 
     # Pre-rotate B and C with RoPE (single fused Triton kernel launch)
     Bg_rot, Bb_rot, C_rot = _prerotate_for_scan(
         Bg, Bb, C, cos_ang, sin_ang, cos_angs, sin_angs)
 
     y_intra = torch.empty(batch, nchunks, L, nheads, headdim,
-                           device=x_dt_g.device, dtype=torch.float32)
+                           device=x_dt_g.device, dtype=torch.bfloat16)
 
     # Grid is a lambda because BLOCK_M/BLOCK_N are chosen by @triton.autotune.
     grid = lambda META: (
