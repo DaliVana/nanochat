@@ -5,8 +5,9 @@ Forward kernel: fused within-chunk computation for Two-SSD with MIMO. The decay
 matrix L is NEVER materialized — computed tile-by-tile in registers. The R-loop
 (MIMO rank) is fused inside the kernel. RoPE rotation is split into a single
 fused pre-rotation kernel (1 launch for C+Bg+Bb) to reduce register pressure
-in the main scan, enabling better occupancy. Dot products use TF32 tensor cores
-(the default for float32 tl.dot on NVIDIA Ampere+).
+in the main scan. Pre-rotated B tensors are stored in bf16 to halve register
+footprint and memory traffic. CB score dots use bf16 tensor cores (2x throughput
+vs TF32); score-to-value dots remain TF32 for precision on decay-scaled scores.
 """
 
 import torch
@@ -93,9 +94,9 @@ def _rope_prerotate_fused_kernel(
                          mask=d_mask, other=0.0)
         base_o = pos * stride_Bo_pos + ch * stride_Bo_ch
         tl.store(Bg_out_ptr + base_o + d_offs * stride_Bo_d,
-                 h0 * cos_v - h1 * sin_v, mask=d_mask)
+                 (h0 * cos_v - h1 * sin_v).to(tl.bfloat16), mask=d_mask)
         tl.store(Bg_out_ptr + base_o + (half_dstate + d_offs) * stride_Bo_d,
-                 h0 * sin_v + h1 * cos_v, mask=d_mask)
+                 (h0 * sin_v + h1 * cos_v).to(tl.bfloat16), mask=d_mask)
     else:
         # --- Rotate Bb with cum_angles_shifted ---
         ch = local - ngroups - N_ch_B
@@ -110,15 +111,15 @@ def _rope_prerotate_fused_kernel(
                          mask=d_mask, other=0.0)
         base_o = pos * stride_Bo_pos + ch * stride_Bo_ch
         tl.store(Bb_out_ptr + base_o + d_offs * stride_Bo_d,
-                 h0 * cos_v - h1 * sin_v, mask=d_mask)
+                 (h0 * cos_v - h1 * sin_v).to(tl.bfloat16), mask=d_mask)
         tl.store(Bb_out_ptr + base_o + (half_dstate + d_offs) * stride_Bo_d,
-                 h0 * sin_v + h1 * cos_v, mask=d_mask)
+                 (h0 * sin_v + h1 * cos_v).to(tl.bfloat16), mask=d_mask)
 
 
 def _prerotate_for_scan(Bg, Bb, C, cos_ang, sin_ang, cos_angs, sin_angs):
     """Pre-rotate B and C tensors with RoPE — single fused Triton kernel launch.
 
-    Returns float32 rotated tensors ready for the simplified scan kernel.
+    Returns bf16 rotated B tensors and float32 rotated C for the scan kernel.
     """
     batch, nc, L, ngroups, R, dstate = Bg.shape
     half_dstate = dstate // 2
@@ -136,8 +137,8 @@ def _prerotate_for_scan(Bg, Bb, C, cos_ang, sin_ang, cos_angs, sin_angs):
     Bb_flat = Bb.contiguous().view(N_pos, N_ch_B, dstate)
 
     C_rot = torch.empty_like(C_flat)
-    Bg_rot = torch.empty(N_pos, N_ch_B, dstate, device=Bg.device, dtype=torch.float32)
-    Bb_rot = torch.empty(N_pos, N_ch_B, dstate, device=Bb.device, dtype=torch.float32)
+    Bg_rot = torch.empty(N_pos, N_ch_B, dstate, device=Bg.device, dtype=torch.bfloat16)
+    Bb_rot = torch.empty(N_pos, N_ch_B, dstate, device=Bb.device, dtype=torch.bfloat16)
 
     total_programs = N_pos * (ngroups + 2 * N_ch_B)
     _rope_prerotate_fused_kernel[(total_programs,)](
@@ -175,8 +176,8 @@ def _prerotate_for_scan(Bg, Bb, C, cos_ang, sin_ang, cos_angs, sin_angs):
 )
 @triton.jit
 def _mamba3_chunk_scan_fwd_kernel(
-    # Input tensors (pre-rotated B and C, all float32)
-    Bg_ptr, Bb_ptr,            # (batch, nc, L, ngroups, R, dstate) float32
+    # Input tensors (pre-rotated B in bf16, C in float32)
+    Bg_ptr, Bb_ptr,            # (batch, nc, L, ngroups, R, dstate) bf16
     x_dt_g_ptr, x_dt_b_ptr,   # (batch, nc, L, nheads, R, headdim) float32
     dA_cumsum_ptr,             # (batch, nc, L, nheads) float32
     C_ptr,                     # (batch, nc, L, ngroups, dstate) float32
@@ -203,8 +204,9 @@ def _mamba3_chunk_scan_fwd_kernel(
     """
     Fused within-chunk computation for Mamba-3 Two-SSD with MIMO.
 
-    Takes pre-rotated B and C tensors (RoPE applied in separate kernel).
-    This reduces register pressure vs fused RoPE, enabling better occupancy.
+    Takes pre-rotated B (bf16) and C (float32) tensors (RoPE applied in separate kernel).
+    B in bf16 halves register footprint and enables bf16 tensor cores for CB dots (2x TF32).
+    Score-to-value dots remain TF32 for precision on decay-scaled scores.
 
     y_intra[m,h,p] = scale * sum_{r} sum_{k<=m} (
         C_rot[m,g(h)] @ Bg_rot[k,g(h),r]^T * L[m,k,h] * x_dt_g[k,h,r,p]
@@ -245,7 +247,8 @@ def _mamba3_chunk_scan_fwd_kernel(
     # Output accumulator
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # Pre-load C tiles (already rotated by pre-rotation kernel)
+    # Pre-load C tiles (already rotated by pre-rotation kernel, float32).
+    # Cast to bf16 for CB dot products — engages bf16 tensor cores (2x TF32).
     c_d0_offs = tl.arange(0, BLOCK_DSTATE)
     c_d0_mask = c_d0_offs < dstate
 
@@ -254,7 +257,7 @@ def _mamba3_chunk_scan_fwd_kernel(
         + offs_m[:, None] * stride_C_seqlen
         + c_d0_offs[None, :] * stride_C_dstate,
         mask=(offs_m[:, None] < chunk_size) & c_d0_mask[None, :],
-        other=0.0).to(tl.float32)
+        other=0.0).to(tl.bfloat16)
 
     c_d1_offs = BLOCK_DSTATE + tl.arange(0, BLOCK_DSTATE)
     c_d1_mask = c_d1_offs < dstate
@@ -263,7 +266,7 @@ def _mamba3_chunk_scan_fwd_kernel(
         + offs_m[:, None] * stride_C_seqlen
         + c_d1_offs[None, :] * stride_C_dstate,
         mask=(offs_m[:, None] < chunk_size) & c_d1_mask[None, :],
-        other=0.0).to(tl.float32)
+        other=0.0).to(tl.bfloat16)
 
     # --- Intra-chunk: tile-by-tile over k positions ---
     # Causal cutoff: skip k-blocks where all k > max(m) in this tile.
@@ -282,7 +285,7 @@ def _mamba3_chunk_scan_fwd_kernel(
         decay = tl.where(causal, decay, 0.0)  # (BLOCK_M, BLOCK_K)
 
         for r in range(mimo_rank):
-            # Load pre-rotated Bg tiles (already float32, no RoPE needed)
+            # Load pre-rotated Bg tiles (bf16, no RoPE needed)
             bg_tile_0 = tl.load(
                 Bg_ptr + off_bc_Bg
                 + k_offs[:, None] * stride_Bg_seqlen
@@ -298,7 +301,7 @@ def _mamba3_chunk_scan_fwd_kernel(
                 mask=(k_offs[:, None] < chunk_size) & c_d1_mask[None, :],
                 other=0.0)
 
-            # Load pre-rotated Bb tiles (already float32, no RoPE needed)
+            # Load pre-rotated Bb tiles (bf16, no RoPE needed)
             bb_tile_0 = tl.load(
                 Bb_ptr + off_bc_Bb
                 + k_offs[:, None] * stride_Bb_seqlen
@@ -315,7 +318,8 @@ def _mamba3_chunk_scan_fwd_kernel(
                 other=0.0)
 
             # Dot products: C_rot @ B_rot^T = sum over both dstate halves
-            # TF32 tensor cores (default for float32 tl.dot on NVIDIA Ampere+).
+            # Both C and B are bf16 → bf16 tensor cores (2x throughput vs TF32),
+            # with float32 accumulation (Triton default).
             cb_g = tl.dot(c_tile_0, tl.trans(bg_tile_0)) + tl.dot(c_tile_1, tl.trans(bg_tile_1))
             cb_b = tl.dot(c_tile_0, tl.trans(bb_tile_0)) + tl.dot(c_tile_1, tl.trans(bb_tile_1))
 
@@ -344,8 +348,8 @@ def _mamba3_chunk_scan_fwd_kernel(
                 other=0.0)
 
             # (BLOCK_M, BLOCK_K) @ (BLOCK_K, BLOCK_N) -> (BLOCK_M, BLOCK_N)
-            # TF32 (default) for these dots — scores have large dynamic range from
-            # decay (0->1 exponential) which BF16's 8-bit mantissa truncates badly.
+            # TF32 for these dots — scores and x_dt are float32. Scores have large
+            # dynamic range from decay (0->1 exponential) so bf16 would lose precision.
             acc += tl.dot(scores_g, xg_vals)
             acc += tl.dot(scores_b, xb_vals)
 
@@ -360,18 +364,17 @@ def _mamba3_chunk_scan_fwd_kernel(
 
 
 def _sram_estimate(BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_DSTATE, dstate, num_stages=1):
-    """Estimate peak SRAM usage in bytes for the scan kernel (no cos/sin tiles).
+    """Estimate peak SRAM usage in bytes for the scan kernel.
 
-    Lighter than fused-RoPE version: no cos_m/sin_m fixed tiles and no
-    cos_k/sin_k staged tiles, freeing ~32-96 KB for larger blocks or more stages.
+    B tiles are bf16 (2 bytes), C tiles are bf16 (2 bytes), x_dt/scores are float32.
     """
     # Fixed: not affected by pipeline staging
     fixed = (BLOCK_M * BLOCK_N * 4             # acc (float32)
             + BLOCK_M * BLOCK_K * 4            # decay (float32)
-            + BLOCK_M * dstate * 4             # c_rot tiles (float32, 2 halves)
+            + BLOCK_M * dstate * 2             # c_rot tiles (bf16, 2 halves)
             )
     # Staged: loop-body global loads, multiplied by num_stages
-    staged = (4 * BLOCK_K * BLOCK_DSTATE * 4   # bg_tile0, bg_tile1, bb_tile0, bb_tile1 (float32)
+    staged = (4 * BLOCK_K * BLOCK_DSTATE * 2   # bg_tile0, bg_tile1, bb_tile0, bb_tile1 (bf16)
             + 2 * BLOCK_K * BLOCK_N * 4        # xg, xb (float32)
             )
     return fixed + staged * num_stages
@@ -436,8 +439,9 @@ def mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
     """
     Fused within-chunk computation for Mamba-3 Two-SSD with MIMO.
 
-    RoPE pre-rotation is applied in a single fused Triton kernel, then the main
-    scan kernel runs with reduced register pressure (no cos/sin in hot loop).
+    RoPE pre-rotation is applied in a single fused Triton kernel (B outputs in bf16,
+    C in float32), then the main scan kernel runs with reduced register pressure
+    (no cos/sin in hot loop, bf16 B tiles halve register footprint).
 
     Args:
         Bg:        (batch, nchunks, chunk_size, ngroups, R, dstate)
