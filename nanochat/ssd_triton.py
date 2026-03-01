@@ -3,10 +3,10 @@ Triton kernels for Mamba-3 SSD (Structured State Space Duality).
 
 Forward kernel: fused within-chunk computation for Two-SSD with MIMO. The decay
 matrix L is NEVER materialized — computed tile-by-tile in registers. The R-loop
-(MIMO rank) is fused inside the kernel. RoPE rotation is split into a lightweight
-pre-rotation kernel to reduce register pressure in the main scan, enabling larger
-block sizes and better occupancy. Dot products use TF32 tensor cores (the default
-for float32 tl.dot on NVIDIA Ampere+).
+(MIMO rank) is fused inside the kernel. RoPE rotation is split into a single
+fused pre-rotation kernel (1 launch for C+Bg+Bb) to reduce register pressure
+in the main scan, enabling better occupancy. Dot products use TF32 tensor cores
+(the default for float32 tl.dot on NVIDIA Ampere+).
 """
 
 import torch
@@ -15,56 +15,108 @@ import triton.language as tl
 
 
 # =============================================================================
-# RoPE pre-rotation kernel
+# Fused RoPE pre-rotation kernel (single launch for C, Bg, Bb)
 # =============================================================================
 
 @triton.jit
-def _rope_prerotate_kernel(
-    inp_ptr, cos_ptr, sin_ptr, out_ptr,
-    N_ch,
-    stride_inp_pos, stride_inp_ch, stride_inp_d,
+def _rope_prerotate_fused_kernel(
+    # 3 input tensors
+    C_ptr, Bg_ptr, Bb_ptr,
+    # 2 cos/sin pairs: regular (for C, Bg) and shifted (for Bb)
+    cos_ptr, sin_ptr, cos_s_ptr, sin_s_ptr,
+    # 3 output tensors
+    C_out_ptr, Bg_out_ptr, Bb_out_ptr,
+    # Strides for C: (N_pos, ngroups, dstate)
+    stride_C_pos, stride_C_ch, stride_C_d,
+    # Strides for B input: (N_pos, N_ch_B, dstate) — shared by Bg and Bb
+    stride_B_pos, stride_B_ch, stride_B_d,
+    # Strides for cos/sin: (N_pos, half_dstate) — shared by both pairs
     stride_cs_pos, stride_cs_d,
-    stride_out_pos, stride_out_ch, stride_out_d,
+    # Strides for C output: (N_pos, ngroups, dstate)
+    stride_Co_pos, stride_Co_ch, stride_Co_d,
+    # Strides for B output: (N_pos, N_ch_B, dstate) — shared by Bg_rot and Bb_rot
+    stride_Bo_pos, stride_Bo_ch, stride_Bo_d,
+    # Dimensions
+    N_pos,
+    ngroups: tl.constexpr,
+    N_ch_B: tl.constexpr,
     half_dstate: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Apply RoPE pre-rotation. Grid: (N_pos * N_ch,).
+    """Fused RoPE pre-rotation for C, Bg, Bb in a single kernel launch.
 
-    Each program handles one (position, channel) pair.
-    Position determines which cos/sin to use; channels broadcast the same rotation.
+    Grid: (N_pos * (ngroups + 2 * N_ch_B),)
+    Programs are assigned to 3 segments per position:
+      [0, ngroups)                        → rotate C  with cos/sin
+      [ngroups, ngroups + N_ch_B)         → rotate Bg with cos/sin
+      [ngroups + N_ch_B, ngroups + 2*N_ch_B) → rotate Bb with cos_s/sin_s
 
-    Rotation: out[..., :half] = in[..., :half]*cos - in[..., half:]*sin
-              out[..., half:] = in[..., :half]*sin + in[..., half:]*cos
+    Consecutive programs within a warp stay in the same segment (minimal divergence).
     """
+    seg_total: tl.constexpr = ngroups + 2 * N_ch_B
     pid = tl.program_id(0)
-    pos = pid // N_ch
-    ch = pid % N_ch
+    pos = pid // seg_total
+    local = pid % seg_total
 
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < half_dstate
-
-    base_inp = pos * stride_inp_pos + ch * stride_inp_ch
     base_cs = pos * stride_cs_pos
-    base_out = pos * stride_out_pos + ch * stride_out_ch
 
-    h0 = tl.load(inp_ptr + base_inp + d_offs * stride_inp_d,
-                  mask=d_mask, other=0.0).to(tl.float32)
-    h1 = tl.load(inp_ptr + base_inp + (half_dstate + d_offs) * stride_inp_d,
-                  mask=d_mask, other=0.0).to(tl.float32)
-
-    cos_v = tl.load(cos_ptr + base_cs + d_offs * stride_cs_d,
-                     mask=d_mask, other=0.0)
-    sin_v = tl.load(sin_ptr + base_cs + d_offs * stride_cs_d,
-                     mask=d_mask, other=0.0)
-
-    tl.store(out_ptr + base_out + d_offs * stride_out_d,
-             h0 * cos_v - h1 * sin_v, mask=d_mask)
-    tl.store(out_ptr + base_out + (half_dstate + d_offs) * stride_out_d,
-             h0 * sin_v + h1 * cos_v, mask=d_mask)
+    if local < ngroups:
+        # --- Rotate C with cum_angles ---
+        ch = local
+        base_i = pos * stride_C_pos + ch * stride_C_ch
+        h0 = tl.load(C_ptr + base_i + d_offs * stride_C_d,
+                      mask=d_mask, other=0.0).to(tl.float32)
+        h1 = tl.load(C_ptr + base_i + (half_dstate + d_offs) * stride_C_d,
+                      mask=d_mask, other=0.0).to(tl.float32)
+        cos_v = tl.load(cos_ptr + base_cs + d_offs * stride_cs_d,
+                         mask=d_mask, other=0.0)
+        sin_v = tl.load(sin_ptr + base_cs + d_offs * stride_cs_d,
+                         mask=d_mask, other=0.0)
+        base_o = pos * stride_Co_pos + ch * stride_Co_ch
+        tl.store(C_out_ptr + base_o + d_offs * stride_Co_d,
+                 h0 * cos_v - h1 * sin_v, mask=d_mask)
+        tl.store(C_out_ptr + base_o + (half_dstate + d_offs) * stride_Co_d,
+                 h0 * sin_v + h1 * cos_v, mask=d_mask)
+    elif local < ngroups + N_ch_B:
+        # --- Rotate Bg with cum_angles ---
+        ch = local - ngroups
+        base_i = pos * stride_B_pos + ch * stride_B_ch
+        h0 = tl.load(Bg_ptr + base_i + d_offs * stride_B_d,
+                      mask=d_mask, other=0.0).to(tl.float32)
+        h1 = tl.load(Bg_ptr + base_i + (half_dstate + d_offs) * stride_B_d,
+                      mask=d_mask, other=0.0).to(tl.float32)
+        cos_v = tl.load(cos_ptr + base_cs + d_offs * stride_cs_d,
+                         mask=d_mask, other=0.0)
+        sin_v = tl.load(sin_ptr + base_cs + d_offs * stride_cs_d,
+                         mask=d_mask, other=0.0)
+        base_o = pos * stride_Bo_pos + ch * stride_Bo_ch
+        tl.store(Bg_out_ptr + base_o + d_offs * stride_Bo_d,
+                 h0 * cos_v - h1 * sin_v, mask=d_mask)
+        tl.store(Bg_out_ptr + base_o + (half_dstate + d_offs) * stride_Bo_d,
+                 h0 * sin_v + h1 * cos_v, mask=d_mask)
+    else:
+        # --- Rotate Bb with cum_angles_shifted ---
+        ch = local - ngroups - N_ch_B
+        base_i = pos * stride_B_pos + ch * stride_B_ch
+        h0 = tl.load(Bb_ptr + base_i + d_offs * stride_B_d,
+                      mask=d_mask, other=0.0).to(tl.float32)
+        h1 = tl.load(Bb_ptr + base_i + (half_dstate + d_offs) * stride_B_d,
+                      mask=d_mask, other=0.0).to(tl.float32)
+        cos_v = tl.load(cos_s_ptr + base_cs + d_offs * stride_cs_d,
+                         mask=d_mask, other=0.0)
+        sin_v = tl.load(sin_s_ptr + base_cs + d_offs * stride_cs_d,
+                         mask=d_mask, other=0.0)
+        base_o = pos * stride_Bo_pos + ch * stride_Bo_ch
+        tl.store(Bb_out_ptr + base_o + d_offs * stride_Bo_d,
+                 h0 * cos_v - h1 * sin_v, mask=d_mask)
+        tl.store(Bb_out_ptr + base_o + (half_dstate + d_offs) * stride_Bo_d,
+                 h0 * sin_v + h1 * cos_v, mask=d_mask)
 
 
 def _prerotate_for_scan(Bg, Bb, C, cos_ang, sin_ang, cos_angs, sin_angs):
-    """Pre-rotate B and C tensors with RoPE using a Triton kernel.
+    """Pre-rotate B and C tensors with RoPE — single fused Triton kernel launch.
 
     Returns float32 rotated tensors ready for the simplified scan kernel.
     """
@@ -79,39 +131,26 @@ def _prerotate_for_scan(Bg, Bb, C, cos_ang, sin_ang, cos_angs, sin_angs):
     cos_s_flat = cos_angs.contiguous().view(N_pos, half_dstate)
     sin_s_flat = sin_angs.contiguous().view(N_pos, half_dstate)
 
-    # Rotate C: (N_pos, ngroups, dstate) with cum_angles
     C_flat = C.contiguous().view(N_pos, ngroups, dstate)
-    C_rot = torch.empty_like(C_flat)
-    _rope_prerotate_kernel[(N_pos * ngroups,)](
-        C_flat, cos_flat, sin_flat, C_rot,
-        ngroups,
-        C_flat.stride(0), C_flat.stride(1), C_flat.stride(2),
-        cos_flat.stride(0), cos_flat.stride(1),
-        C_rot.stride(0), C_rot.stride(1), C_rot.stride(2),
-        half_dstate=half_dstate, BLOCK_D=BLOCK_D,
-    )
-
-    # Rotate Bg: (N_pos, ngroups*R, dstate) with cum_angles
     Bg_flat = Bg.contiguous().view(N_pos, N_ch_B, dstate)
+    Bb_flat = Bb.contiguous().view(N_pos, N_ch_B, dstate)
+
+    C_rot = torch.empty_like(C_flat)
     Bg_rot = torch.empty(N_pos, N_ch_B, dstate, device=Bg.device, dtype=torch.float32)
-    _rope_prerotate_kernel[(N_pos * N_ch_B,)](
-        Bg_flat, cos_flat, sin_flat, Bg_rot,
-        N_ch_B,
+    Bb_rot = torch.empty(N_pos, N_ch_B, dstate, device=Bb.device, dtype=torch.float32)
+
+    total_programs = N_pos * (ngroups + 2 * N_ch_B)
+    _rope_prerotate_fused_kernel[(total_programs,)](
+        C_flat, Bg_flat, Bb_flat,
+        cos_flat, sin_flat, cos_s_flat, sin_s_flat,
+        C_rot, Bg_rot, Bb_rot,
+        C_flat.stride(0), C_flat.stride(1), C_flat.stride(2),
         Bg_flat.stride(0), Bg_flat.stride(1), Bg_flat.stride(2),
         cos_flat.stride(0), cos_flat.stride(1),
+        C_rot.stride(0), C_rot.stride(1), C_rot.stride(2),
         Bg_rot.stride(0), Bg_rot.stride(1), Bg_rot.stride(2),
-        half_dstate=half_dstate, BLOCK_D=BLOCK_D,
-    )
-
-    # Rotate Bb: (N_pos, ngroups*R, dstate) with shifted cum_angles
-    Bb_flat = Bb.contiguous().view(N_pos, N_ch_B, dstate)
-    Bb_rot = torch.empty(N_pos, N_ch_B, dstate, device=Bb.device, dtype=torch.float32)
-    _rope_prerotate_kernel[(N_pos * N_ch_B,)](
-        Bb_flat, cos_s_flat, sin_s_flat, Bb_rot,
-        N_ch_B,
-        Bb_flat.stride(0), Bb_flat.stride(1), Bb_flat.stride(2),
-        cos_s_flat.stride(0), cos_s_flat.stride(1),
-        Bb_rot.stride(0), Bb_rot.stride(1), Bb_rot.stride(2),
+        N_pos,
+        ngroups=ngroups, N_ch_B=N_ch_B,
         half_dstate=half_dstate, BLOCK_D=BLOCK_D,
     )
 
@@ -397,7 +436,7 @@ def mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
     """
     Fused within-chunk computation for Mamba-3 Two-SSD with MIMO.
 
-    RoPE pre-rotation is applied in a separate Triton kernel, then the main
+    RoPE pre-rotation is applied in a single fused Triton kernel, then the main
     scan kernel runs with reduced register pressure (no cos/sin in hot loop).
 
     Args:
@@ -425,7 +464,7 @@ def mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
     assert dstate % 2 == 0, f"Requires even dstate, got {dstate}"
     BLOCK_DSTATE = dstate // 2
 
-    # Pre-rotate B and C with RoPE (separate Triton kernel)
+    # Pre-rotate B and C with RoPE (single fused Triton kernel launch)
     Bg_rot, Bb_rot, C_rot = _prerotate_for_scan(
         Bg, Bb, C, cos_ang, sin_ang, cos_angs, sin_angs)
 

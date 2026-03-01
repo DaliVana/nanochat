@@ -22,15 +22,24 @@ from nanochat.ssd_triton import mamba3_chunk_scan_fwd, _mamba3_chunk_scan_fwd_ke
 
 
 PROFILES = {
-    "small":  dict(batch=2, seq_len=512,  d_model=256,  expand=1, d_state=64,  chunk_size=128, mimo_rank=1, ngroups=1),
-    "medium-64chunk": dict(batch=2, seq_len=2048, d_model=768,  expand=1, d_state=64,  chunk_size=64, mimo_rank=2, ngroups=1),
-    "medium-128chunk": dict(batch=2, seq_len=2048, d_model=768,  expand=1, d_state=64,  chunk_size=128, mimo_rank=2, ngroups=1),
-    "medium-256chunk": dict(batch=2, seq_len=2048, d_model=768,  expand=1, d_state=64,  chunk_size=256, mimo_rank=2, ngroups=1),
-    "large":  dict(batch=2, seq_len=8192, d_model=1280, expand=1, d_state=64,  chunk_size=256, mimo_rank=2, ngroups=1),
-    "xlarge-1ngroup": dict(batch=1, seq_len=8192, d_model=2560, expand=1, d_state=128, chunk_size=256, mimo_rank=4, ngroups=1),
-    "xlarge-2ngroups": dict(batch=1, seq_len=8192, d_model=2560, expand=1, d_state=128, chunk_size=256, mimo_rank=4, ngroups=2),
-    "xlarge-4ngroups": dict(batch=1, seq_len=8192, d_model=2560, expand=1, d_state=128, chunk_size=256, mimo_rank=4, ngroups=4),
-    "xlarge-10ngroups": dict(batch=1, seq_len=8192, d_model=2560, expand=1, d_state=128, chunk_size=256, mimo_rank=4, ngroups=10),
+    "small":  dict(batch=16, seq_len=512,  d_model=256,  expand=1, d_state=64,  chunk_size=128, mimo_rank=1, ngroups=1),
+    "medium-64chunk": dict(batch=8, seq_len=2048, d_model=768,  expand=1, d_state=64,  chunk_size=64, mimo_rank=2, ngroups=1),
+    "medium-128chunk": dict(batch=8, seq_len=2048, d_model=768,  expand=1, d_state=64,  chunk_size=128, mimo_rank=2, ngroups=1),
+    "medium-256chunk": dict(batch=8, seq_len=2048, d_model=768,  expand=1, d_state=64,  chunk_size=256, mimo_rank=2, ngroups=1),
+    "large":  dict(batch=8, seq_len=4096, d_model=1280, expand=2, d_state=64,  chunk_size=128, mimo_rank=4, ngroups=1),
+    "large-expand1":  dict(batch=8, seq_len=4096, d_model=1280, expand=1, d_state=64,  chunk_size=128, mimo_rank=4, ngroups=1),
+    "large-expand4":  dict(batch=8, seq_len=4096, d_model=1280, expand=4, d_state=64,  chunk_size=128, mimo_rank=4, ngroups=1),
+    "large-dstate128":  dict(batch=8, seq_len=4096, d_model=1280, expand=2, d_state=128,  chunk_size=128, mimo_rank=4, ngroups=1),
+    "large-dstate32":  dict(batch=8, seq_len=4096, d_model=1280, expand=2, d_state=32,  chunk_size=128, mimo_rank=4, ngroups=1),
+    "large-chunk256":  dict(batch=8, seq_len=4096, d_model=1280, expand=2, d_state=64,  chunk_size=256, mimo_rank=4, ngroups=1),
+    "large-chunk512":  dict(batch=8, seq_len=4096, d_model=1280, expand=2, d_state=64,  chunk_size=512, mimo_rank=4, ngroups=1),
+    "large-chunk64":  dict(batch=8, seq_len=4096, d_model=1280, expand=2, d_state=64,  chunk_size=64, mimo_rank=4, ngroups=1),
+    "large-len8192":  dict(batch=4, seq_len=8192, d_model=1280, expand=2, d_state=64,  chunk_size=128, mimo_rank=4, ngroups=1),
+    "large-len16384":  dict(batch=2, seq_len=16384, d_model=1280, expand=2, d_state=64,  chunk_size=128, mimo_rank=4, ngroups=1),
+    "large-len32768":  dict(batch=1, seq_len=32768, d_model=1280, expand=2, d_state=64,  chunk_size=128, mimo_rank=4, ngroups=1),
+    "xlarge-1ngroup": dict(batch=4, seq_len=8192, d_model=2560, expand=1, d_state=128, chunk_size=256, mimo_rank=4, ngroups=1),
+    "xlarge-2ngroups": dict(batch=4, seq_len=8192, d_model=2560, expand=1, d_state=128, chunk_size=256, mimo_rank=4, ngroups=2),
+    "xlarge-4ngroups": dict(batch=4, seq_len=8192, d_model=2560, expand=1, d_state=128, chunk_size=256, mimo_rank=4, ngroups=4),
 }
 
 # Subset of profiles for layer benchmarks (full layer is slower to bench)
