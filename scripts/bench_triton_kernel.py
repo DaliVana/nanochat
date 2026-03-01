@@ -18,7 +18,7 @@ import json
 import torch
 import triton
 
-from nanochat.ssd_triton import mamba3_chunk_scan_fwd, _select_block_sizes
+from nanochat.ssd_triton import mamba3_chunk_scan_fwd, _mamba3_chunk_scan_fwd_kernel
 
 
 PROFILES = {
@@ -108,13 +108,16 @@ def bench_kernel(cfg, warmup=25, rep=100):
     ngroups = cfg["ngroups"]
     batch = cfg["batch"]
 
-    BM, BN, BK, BD, stages = _select_block_sizes(L, headdim, d_state, device=Bg.device)
-    block_info = f"BLOCK_M={BM} BLOCK_N={BN} BLOCK_K={BK} BLOCK_DSTATE={BD} stages={stages}"
-
     fn = lambda: mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
                                         cos_ang, sin_ang, cos_angs, sin_angs,
                                         scale, L, R)
     ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+
+    # Query block sizes chosen by @triton.autotune (available after first launch)
+    best = _mamba3_chunk_scan_fwd_kernel.best_config
+    bk = best.kwargs
+    block_info = (f"BLOCK_M={bk['BLOCK_M']} BLOCK_N={bk['BLOCK_N']} BLOCK_K={bk['BLOCK_K']} "
+                  f"BLOCK_DSTATE={d_state // 2} stages={best.num_stages} warps={best.num_warps}")
 
     total_bytes = compute_bytes(batch, nc, L, ngroups, R, d_state, n_heads, headdim)
     gb_s = total_bytes / (ms * 1e-3) / 1e9

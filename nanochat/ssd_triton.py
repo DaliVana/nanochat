@@ -18,6 +18,16 @@ import triton.language as tl
 # Forward kernel
 # =============================================================================
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=1, num_warps=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=1, num_warps=4),
+    ],
+    key=['chunk_size', 'headdim', 'dstate', 'mimo_rank'],
+)
 @triton.jit
 def _mamba3_chunk_scan_fwd_kernel(
     # Input tensors
@@ -394,17 +404,18 @@ def mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
     dstate = C.shape[4]
     nheads_per_group = nheads // ngroups
 
+    assert dstate % 2 == 0, f"Fused RoPE requires even dstate, got {dstate}"
+    BLOCK_DSTATE = dstate // 2
+
     y_intra = torch.empty(batch, nchunks, L, nheads, headdim,
                            device=x_dt_g.device, dtype=torch.float32)
 
-    BLOCK_M, BLOCK_N, BLOCK_K, BLOCK_DSTATE, num_stages = _select_block_sizes(
-        L, headdim, dstate, device=x_dt_g.device)
-    assert dstate == 2 * BLOCK_DSTATE, (
-        f"Fused RoPE requires dstate={dstate} == 2*BLOCK_DSTATE={2*BLOCK_DSTATE}. "
-        f"The two d-state tiles must map to the two halves for RoPE rotation."
+    # Grid is a lambda because BLOCK_M/BLOCK_N are chosen by @triton.autotune.
+    grid = lambda META: (
+        triton.cdiv(L, META['BLOCK_M']) * triton.cdiv(headdim, META['BLOCK_N']),
+        batch * nchunks,
+        nheads,
     )
-    grid = (triton.cdiv(L, BLOCK_M) * triton.cdiv(headdim, BLOCK_N),
-            batch * nchunks, nheads)
 
     _mamba3_chunk_scan_fwd_kernel[grid](
         Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
@@ -421,8 +432,6 @@ def mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
         chunk_size=L, headdim=headdim, dstate=dstate,
         nheads=nheads, ngroups=ngroups, nheads_per_group=nheads_per_group,
         nchunks=nchunks, mimo_rank=R, scale=scale,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, BLOCK_DSTATE=BLOCK_DSTATE,
-        num_warps=8,
-        num_stages=num_stages,
+        BLOCK_DSTATE=BLOCK_DSTATE,
     )
     return y_intra
