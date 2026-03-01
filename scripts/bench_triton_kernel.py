@@ -85,6 +85,19 @@ def compute_bytes(batch, nc, L, ngroups, R, d_state, n_heads, headdim):
     return b_bytes + xdt_bytes + dA_bytes + c_bytes + cs_bytes + out_bytes
 
 
+def compute_flops(batch, nc, L, n_heads, R, d_state, headdim):
+    """Total FLOPs for the kernel (dot products only, dominates compute).
+
+    Per (batch, chunk, head, rank), the kernel computes:
+      CB scores: C_rot (L, dstate) @ B_rot (L, dstate)^T -> causal (L, L)
+        = L^2/2 * 2*dstate per SSD, x2 for gamma+beta = 2 * L^2 * dstate
+      Final accum: scores (L, L, causal) @ x_dt (L, headdim) -> (L, headdim)
+        = L^2/2 * 2*headdim per SSD, x2 for gamma+beta = 2 * L^2 * headdim
+    """
+    flops_per_head_rank = 2 * L * L * (d_state + headdim)
+    return batch * nc * n_heads * R * flops_per_head_rank
+
+
 def bench_config(cfg, warmup=25, rep=100):
     """Benchmark a single config. Returns (latency_ms, throughput_gb_s, block_info)."""
     inputs = make_inputs(**cfg)
@@ -107,52 +120,54 @@ def bench_config(cfg, warmup=25, rep=100):
     total_bytes = compute_bytes(batch, nc, L, ngroups, R, d_state, n_heads, headdim)
     gb_s = total_bytes / (ms * 1e-3) / 1e9
 
+    total_flops = compute_flops(batch, nc, L, n_heads, R, d_state, headdim)
+    tflops = total_flops / (ms * 1e-3) / 1e12
+
     input_mb = sum(t.nelement() * t.element_size() for t in [Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
                                                                cos_ang, sin_ang, cos_angs, sin_angs]) / 1e6
     out_mb = (batch * nc * L * n_heads * headdim * 4) / 1e6
 
-    return ms, gb_s, block_info, input_mb, out_mb
+    return ms, gb_s, tflops, block_info, input_mb, out_mb
 
 
-def get_peak_bw():
-    """Get approximate peak HBM bandwidth for the current GPU (GB/s)."""
+def get_gpu_specs():
+    """Get approximate peak HBM bandwidth (GB/s) and TF32 dense TFLOP/s for the current GPU."""
     name = torch.cuda.get_device_name().lower()
-    # Common GPUs and their approximate peak HBM bandwidths
-    if "b300" in name:
-        return 8000
-    elif "b200" in name:
-        return 8000
-    elif "h200" in name:
-        return 4800
-    elif "h100" in name and "sxm" in name:
-        return 3350
-    elif "h100" in name:
-        return 2000  # PCIe
-    elif "a100" in name and "sxm" in name:
-        return 2039
-    elif "a100" in name:
-        return 1555  # PCIe
-    elif "4090" in name:
-        return 1008
-    elif "3090" in name:
-        return 936
-    elif "l40" in name:
-        return 864
-    return 0  # unknown
+    # (peak_hbm_bw_gb_s, peak_tf32_dense_tflops)
+    specs = [
+        ("b300",  8000, 2250),
+        ("b200",  8000, 2250),
+        ("h200",  4800,  495),
+        ("h100",  3350,  495, "sxm"),  # SXM variant
+        ("h100",  2000,  378),         # PCIe
+        ("a100",  2039,  156, "sxm"),
+        ("a100",  1555,  156),
+        ("4090",  1008,   83),
+        ("3090",   936,   36),
+        ("l40",    864,   91),
+    ]
+    for entry in specs:
+        gpu_key, bw, tflops = entry[0], entry[1], entry[2]
+        variant = entry[3] if len(entry) > 3 else None
+        if gpu_key in name and (variant is None or variant in name):
+            return bw, tflops
+    return 0, 0  # unknown
 
 
-def print_result(name, cfg, ms, gb_s, block_info, input_mb, out_mb, peak_bw):
+def print_result(name, cfg, ms, gb_s, tflops, block_info, input_mb, out_mb, peak_bw, peak_tflops):
     """Print formatted benchmark result."""
     parts = [f"batch={cfg['batch']}", f"T={cfg['seq_len']}", f"d={cfg['d_model']}",
              f"d_state={cfg['d_state']}", f"chunk={cfg['chunk_size']}", f"R={cfg['mimo_rank']}"]
     desc = ", ".join(parts)
     bw_pct = f" ({gb_s / peak_bw * 100:.1f}% of peak)" if peak_bw else ""
+    compute_pct = f" ({tflops / peak_tflops * 100:.1f}% of peak)" if peak_tflops else ""
 
     print(f"Config: {name} ({desc})")
     print(f"  Blocks: {block_info}")
     print(f"  Input: {input_mb:.1f} MB | Output: {out_mb:.1f} MB")
     print(f"  Latency: {ms:.3f} ms")
     print(f"  Throughput: {gb_s:.1f} GB/s{bw_pct}")
+    print(f"  Compute:    {tflops:.1f} TFLOP/s{compute_pct}")
 
 
 def main():
@@ -177,11 +192,16 @@ def main():
     assert torch.cuda.is_available(), "CUDA required"
 
     gpu_name = torch.cuda.get_device_name()
-    peak_bw = get_peak_bw()
-    bw_str = f" | Peak BW: {peak_bw} GB/s" if peak_bw else ""
+    peak_bw, peak_tflops = get_gpu_specs()
+    specs_parts = []
+    if peak_bw:
+        specs_parts.append(f"Peak BW: {peak_bw} GB/s")
+    if peak_tflops:
+        specs_parts.append(f"Peak TF32: {peak_tflops} TFLOP/s")
+    specs_str = f" | {' | '.join(specs_parts)}" if specs_parts else ""
 
     print(f"\nMamba-3 SSD Triton Forward Kernel Benchmark")
-    print(f"GPU: {gpu_name}{bw_str}")
+    print(f"GPU: {gpu_name}{specs_str}")
     sep = "=" * 60
 
     # Check if custom config provided
@@ -203,8 +223,8 @@ def main():
             f"expand*d_model ({d_inner}) must be divisible by d_state ({base['d_state']})"
 
         print(sep)
-        ms, gb_s, bi, imb, omb = bench_config(base, args.warmup, args.rep)
-        print_result("custom", base, ms, gb_s, bi, imb, omb, peak_bw)
+        ms, gb_s, tfl, bi, imb, omb = bench_config(base, args.warmup, args.rep)
+        print_result("custom", base, ms, gb_s, tfl, bi, imb, omb, peak_bw, peak_tflops)
         print(sep)
         return
 
@@ -236,16 +256,16 @@ def main():
             if sweep_values:
                 print(sep)
                 for name, cfg in sweep_values:
-                    ms, gb_s, bi, imb, omb = bench_config(cfg, args.warmup, args.rep)
-                    print_result(name, cfg, ms, gb_s, bi, imb, omb, peak_bw)
+                    ms, gb_s, tfl, bi, imb, omb = bench_config(cfg, args.warmup, args.rep)
+                    print_result(name, cfg, ms, gb_s, tfl, bi, imb, omb, peak_bw, peak_tflops)
                     print("-" * 60)
         print(sep)
     else:
         # Run all selected profiles
         print(sep)
         for pname, cfg in profiles.items():
-            ms, gb_s, bi, imb, omb = bench_config(cfg, args.warmup, args.rep)
-            print_result(pname, cfg, ms, gb_s, bi, imb, omb, peak_bw)
+            ms, gb_s, tfl, bi, imb, omb = bench_config(cfg, args.warmup, args.rep)
+            print_result(pname, cfg, ms, gb_s, tfl, bi, imb, omb, peak_bw, peak_tflops)
             print("-" * 60)
         print(sep)
 
