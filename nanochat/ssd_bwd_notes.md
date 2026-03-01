@@ -205,6 +205,14 @@ Added `_sram_estimate_bwd_dx`, `_sram_estimate_bwd_dC`, `_select_block_sizes_bwd
 - `_mamba3_intra_autograd_bwd`: if `Bg.is_cuda` → Triton path, else PyTorch fallback
 - Return order matches custom_op inputs: (dBg, dBb, dx_dt_g, dx_dt_b, ddA_cumsum, dC, None, None, None)
 
+### Step 5b: torch.compile compatibility for backward ✅
+- Problem: `torch.compile` traced into `_mamba3_intra_autograd_bwd`, which called
+  `mamba3_chunk_scan_bwd()` directly. Triton's `.data_ptr()` call on FakeTensor crashed.
+- Fix: wrapped backward as opaque custom op `nanochat::mamba3_intra_bwd` (same pattern as forward).
+  - `_mamba3_intra_bwd_op`: calls `mamba3_chunk_scan_bwd`, returns `list[Tensor]` (6 grads)
+  - `register_fake`: returns correctly-shaped empties with proper dtypes (float32 for dBg/dBb/dC/ddA_cumsum)
+  - `_mamba3_intra_autograd_bwd` now calls `_mamba3_intra_bwd_op(...)` instead of raw `mamba3_chunk_scan_bwd`
+
 ### Step 6: Tests ✅
 Added 3 backward tests to test_mamba3.py:
 - `test_triton_bwd_per_gradient`: Each gradient vs PyTorch (dBg, dBb, dx_dt_g/b, dC, ddA_cumsum), tol 0.02
