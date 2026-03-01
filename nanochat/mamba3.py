@@ -205,7 +205,7 @@ import torch.nn.functional as F
 # Triton kernels for CUDA (optional — falls back to PyTorch on CPU/MPS)
 _HAS_TRITON = False
 try:
-    from nanochat.ssd_triton import mamba3_chunk_scan_fwd, mamba3_chunk_scan_bwd
+    from nanochat.ssd_triton import mamba3_chunk_scan_fwd
     _HAS_TRITON = True
 except ImportError:
     pass
@@ -286,47 +286,14 @@ if _HAS_TRITON:
         batch, nchunks, L, nheads, R, headdim = x_dt_g.shape
         return x_dt_g.new_empty(batch, nchunks, L, nheads, headdim, dtype=torch.float32)
 
-    @torch.library.custom_op("nanochat::mamba3_intra_bwd", mutates_args=())
-    def _mamba3_intra_bwd_op(
-        Bg: torch.Tensor, Bb: torch.Tensor,
-        x_dt_g: torch.Tensor, x_dt_b: torch.Tensor,
-        dA_cumsum: torch.Tensor, C: torch.Tensor,
-        dy: torch.Tensor,
-        scale: float, chunk_size: int, mimo_rank: int,
-    ) -> list[torch.Tensor]:
-        dx_dt_g, dx_dt_b, dBg, dBb, dC, ddA_cumsum = mamba3_chunk_scan_bwd(
-            Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, dy, scale, chunk_size, mimo_rank)
-        return [dx_dt_g, dx_dt_b, dBg, dBb, dC, ddA_cumsum]
-
-    @_mamba3_intra_bwd_op.register_fake
-    def _mamba3_intra_bwd_fake(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, dy,
-                                scale, chunk_size, mimo_rank):
-        batch, nchunks, L, nheads, R, headdim = x_dt_g.shape
-        ngroups = C.shape[3]
-        dstate = C.shape[4]
-        return [
-            x_dt_g.new_empty(x_dt_g.shape),                                    # dx_dt_g
-            x_dt_b.new_empty(x_dt_b.shape),                                    # dx_dt_b
-            Bg.new_empty(Bg.shape, dtype=torch.float32),                        # dBg
-            Bb.new_empty(Bb.shape, dtype=torch.float32),                        # dBb
-            C.new_empty(batch, nchunks, L, ngroups, dstate, dtype=torch.float32),  # dC
-            dA_cumsum.new_empty(dA_cumsum.shape, dtype=torch.float32),          # ddA_cumsum
-        ]
-
     def _mamba3_intra_autograd_bwd(ctx, dy_intra):
-        """Backward for within-chunk: Triton kernels on CUDA, PyTorch fallback on CPU."""
+        """Backward for within-chunk: PyTorch autograd (materializes L).
+        cuBLAS batched GEMMs outperform hand-written Triton tiling for these shapes."""
         Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C = ctx.saved_tensors
         scale = ctx.scale
         R = ctx.mimo_rank
         L = ctx.chunk_size
 
-        if Bg.is_cuda:
-            # Fused Triton backward: 2 kernels, no L materialization
-            dx_dt_g, dx_dt_b, dBg, dBb, dC, ddA_cumsum = _mamba3_intra_bwd_op(
-                Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, dy_intra, scale, L, R)
-            return (dBg, dBb, dx_dt_g, dx_dt_b, ddA_cumsum, dC, None, None, None)
-
-        # CPU/debug fallback: PyTorch autograd (materializes L)
         causal_mask = torch.triu(torch.ones(L, L, dtype=torch.bool, device=Bg.device), diagonal=1)
         with torch.enable_grad():
             Bg_ = Bg.float().detach().requires_grad_()

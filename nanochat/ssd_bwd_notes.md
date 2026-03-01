@@ -219,27 +219,69 @@ Added 3 backward tests to test_mamba3.py:
 - `test_triton_bwd_multigroup`: 4 heads / 1 group, tests atomic dBg/dBb correctness
 - `test_triton_bwd_full_layer`: Full Mamba3Layer forward-backward with Triton, checks all params have gradients
 
-### Step 7: Performance fix — parallelize dC kernel over heads ✅
+### Step 7: Performance investigation — Triton bwd 2x slower than PyTorch fallback
+
 **Problem:** Training 2x slower with Triton backward vs old PyTorch autograd fallback.
 
-**Root cause:** Kernel 1 (`_mamba3_chunk_scan_bwd_dC_kernel`) had grid `(cdiv(L,BLOCK_M), B*nc, ngroups)`.
-With `ngroups=1` (default), all `nheads_per_group` heads (e.g. 12) were serialized in the innermost
-`for h_idx in range(nheads_per_group)` loop inside a single thread block. This meant the GPU had
-only `2 * batch * nchunks * 1` blocks — terrible parallelism, and each block did 12x the work.
+**Failed attempt: parallelize dC kernel over heads.**
+Changed grid from `(cdiv(L,BLOCK_M), B*nc, ngroups)` → `(cdiv(L,BLOCK_M), B*nc, nheads)`,
+removing the serial `for h_idx` head loop. Result: **even slower**, because:
 
-Meanwhile Kernel 2 (dx) correctly parallelized over `nheads` in the grid.
+1. **Redundant group-level work:** `cb = C @ Bg^T` (group-indexed, h-independent) was recomputed
+   per-head — 12x redundant dot products.
+2. **Inefficient dC accumulation:** Old code does one `(Σ_h dcb_h) @ Bg` matmul per (k,r).
+   New code does 12 separate `dcb_h @ Bg` matmuls + atomic_add. Mathematically equivalent
+   (`Σ_h (dcb_h @ Bg) = (Σ_h dcb_h) @ Bg`) but 12x the matmul FLOPs.
+3. **Atomic overhead:** 12 heads contending on (BLOCK_M, BLOCK_DSTATE) dC positions.
 
-**Fix:**
-- Changed grid from `(cdiv(L,BLOCK_M), B*nc, ngroups)` → `(cdiv(L,BLOCK_M), B*nc, nheads)`
-- Each program handles **one head** instead of iterating all heads in a group
-- Removed the inner `for h_idx in range(nheads_per_group)` loop entirely
-- dA_cumsum for m positions now pre-loaded once (single head, persistent)
-- Decay computed once per k-block (not recomputed per head)
-- dC accumulated per-head, written via `tl.atomic_add` (multiple heads in same group contend)
-- ddA_m written via plain `tl.store` (each pid_h writes to distinct positions, no contention)
-- dC output changed from `torch.empty` → `torch.zeros` (needed for atomic_add target)
-- ddA_m output changed from `torch.zeros` → `torch.empty` (each position written exactly once)
+Total FLOPs roughly doubled vs original. **Reverted.**
 
-**Speedup:** ~nheads_per_group × (12x for typical config). Atomic contention on dC is minimal
-since only `nheads_per_group` programs per (m-block, batch-chunk) write to the same dC positions,
-and the write is a small (BLOCK_M, BLOCK_DSTATE) tile done once at the end of the kernel.
+**Root cause analysis of original 2x slowdown:**
+The Triton backward's serial head loop in the dC kernel is NOT the bottleneck (only ~25% of total
+backward work). The real issue is that the PyTorch fallback path uses cuBLAS batched GEMMs which
+are highly optimized for these shapes, while the Triton kernels use manual tiling with scalar loops.
+
+For the user's config (d_state=128, expand=2, mimo_rank=4, nheads=12, headdim=128, chunk_size=128):
+- Kernel 2 (dx): grid (8, 256, 12) = 24K blocks, each with ~48 dot products
+- Kernel 1 (dC): grid (2, 256, 1) = 512 blocks, each with ~312 dot products (12h × 4r × 2hdim loops)
+- Kernel 2 dominates (~75% of total work)
+
+The dC kernel's head loop DOES redundantly recompute decay inside the r-loop (decay doesn't
+depend on rank), wasting (R-1) × nheads_per_group = 36 extra exp() computations per k-block.
+But this is minor compared to the overall gap.
+
+**Why PyTorch fallback wins:**
+- cuBLAS GEMMs: single batched matmul call for `einsum('bcign, bcjgn -> bcijg', C, Bg_r)` etc.
+  Shapes like (B*nc, L, dstate) × (B*nc, L, dstate)^T → (B*nc, L, L) are ideal for cuBLAS.
+- Autograd backward: generates efficient batched GEMMs for each einsum.
+- Memory cost: materializes L matrix (B, nc, L, L, nheads) but for chunk_size=128 this is manageable.
+- The Triton kernels trade memory for compute (no L materialization) but the compute overhead
+  from manual tiling exceeds cuBLAS's efficiency advantage.
+
+**Possible future approaches:**
+- Use cuBLAS for the backward too (keep PyTorch fallback) — simplest, probably fastest.
+- Hybrid: Triton for forward (memory-efficient), PyTorch for backward (compute-efficient).
+- Profile to find which specific kernel/operation is the bottleneck before further optimization.
+
+### Step 8: Mamba-3 paper confirms — Triton forward only, PyTorch backward ✅
+
+**Paper findings (Sections 4.2.1, Appendix H):**
+The original Mamba-3 paper uses Triton only for the forward pass (prefill). They do NOT write
+custom backward kernels — backward gradients come from PyTorch autograd through the forward.
+For decode they use CuTe-DSL (not relevant for training).
+
+**Key algorithmic insight (Appendix B.1):**
+The trapezoidal discretization's L matrix decomposes as L = L1 × L2:
+- L1: standard Mamba-2 decay mask (exponential)
+- L2: size-2 bidiagonal convolution (from trapezoidal rule)
+This means the trapezoidal part is a trivial operation for autograd — no need for custom backward.
+
+**Decision:** Keep Triton forward kernel (`mamba3_chunk_scan_fwd`), revert backward to PyTorch
+autograd fallback permanently. This is the same approach the Mamba-3 authors use.
+
+**Changes made:**
+- Removed `mamba3_chunk_scan_bwd` import from mamba3.py
+- Removed `_mamba3_intra_bwd_op` custom op and its `register_fake`
+- Removed `if Bg.is_cuda` Triton branch from `_mamba3_intra_autograd_bwd`
+- Backward now always uses `_mamba3_intra_pytorch` via PyTorch autograd (materializes L, cuBLAS GEMMs)
+- Triton backward kernels remain in ssd_triton.py for reference but are unused
