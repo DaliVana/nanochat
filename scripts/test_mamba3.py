@@ -403,7 +403,10 @@ def test_triton_intra_vs_pytorch():
     Bb_raw = torch.randn(batch, nc, L, ngroups, R, dstate, device=device, dtype=torch.float32)
     x_dt_g = torch.randn(batch, nc, L, nheads, R, headdim, device=device, dtype=torch.float32)
     x_dt_b = torch.randn(batch, nc, L, nheads, R, headdim, device=device, dtype=torch.float32)
-    dA_cumsum = (torch.randn(batch, nc, L, nheads, device=device, dtype=torch.float32) * 0.1).cumsum(dim=2)
+    # In the real model, log_dA = A * dt where A < 0 and dt > 0, so increments are
+    # always negative and cum_log_dA is monotonically non-increasing. The Triton kernel
+    # relies on this via min(dA_cs[m]-dA_cs[k], 0) clamping decay to [0, 1].
+    dA_cumsum = (-torch.rand(batch, nc, L, nheads, device=device, dtype=torch.float32) * 0.1).cumsum(dim=2)
     C_raw = torch.randn(batch, nc, L, ngroups, dstate, device=device, dtype=torch.float32)
     cum_angles = torch.randn(batch, nc, L, half_d, device=device, dtype=torch.float32) * 0.5
     cum_angles_shifted = torch.randn(batch, nc, L, half_d, device=device, dtype=torch.float32) * 0.5
@@ -459,7 +462,8 @@ def test_triton_intra_r4():
     Bb_raw = torch.randn(batch, nc, L, ngroups, R, dstate, device=device, dtype=torch.float32)
     x_dt_g = torch.randn(batch, nc, L, nheads, R, headdim, device=device, dtype=torch.float32)
     x_dt_b = torch.randn(batch, nc, L, nheads, R, headdim, device=device, dtype=torch.float32)
-    dA_cumsum = (torch.randn(batch, nc, L, nheads, device=device, dtype=torch.float32) * 0.1).cumsum(dim=2)
+    # Monotonically non-increasing (matches real model where log_dA = A*dt < 0)
+    dA_cumsum = (-torch.rand(batch, nc, L, nheads, device=device, dtype=torch.float32) * 0.1).cumsum(dim=2)
     C_raw = torch.randn(batch, nc, L, ngroups, dstate, device=device, dtype=torch.float32)
     cum_angles = torch.randn(batch, nc, L, half_d, device=device, dtype=torch.float32) * 0.5
     cum_angles_shifted = torch.randn(batch, nc, L, half_d, device=device, dtype=torch.float32) * 0.5

@@ -377,7 +377,18 @@ Full BF16 (both CB and final dots) caused loss spikes. Root cause: the final acc
 dots multiply `scores = cb * decay * scale` by x_dt. The decay term `exp(min(dA_cs[m] -
 dA_cs[k], 0))` spans 0→1 exponentially, creating large dynamic range that BF16's 8-bit
 mantissa truncates. Unlike Flash Attention where softmax normalizes scores to [0,1], SSD
-scores are unbounded. Fix: keep CB score dots (C@B^T) in BF16 (safe — contracts over
-d_state, bounded feature dimension), revert final dots (scores@x_dt) to TF32 (default
-for float32 inputs). This gives partial speedup on the CB dots while maintaining
-numerical stability in the accumulation path.
+scores are unbounded. Reverted final dots to TF32, kept CB dots in BF16.
+
+**Step 10c: BF16 CB dots also reverted — all dots back to TF32.**
+Hybrid BF16 (CB only) caused catastrophic errors in isolated kernel tests: max_abs=132,
+rel=0.78. The full layer test still passed (cos_sim=0.999997) because QK-norm bounds B/C
+values in the actual training pipeline, but the isolated kernel test uses unnormalized
+inputs where BF16 truncation is destructive. Rather than relying on QK-norm to mask
+precision issues, reverted all dots to TF32 (the default for float32 `tl.dot` on NVIDIA
+Ampere+). TF32 already uses tensor cores — BF16 dots are not viable for this kernel.
+
+**Conclusion:** BF16 tensor core dots don't work for SSD's C@B^T computation. Unlike
+attention's QK^T (which benefits from softmax normalization), the SSD score path has
+unbounded values and exponential decay that require TF32/FP32 precision. The kernel is
+already using TF32 tensor cores by default — no further dot precision optimization is
+possible without architectural changes (e.g. normalizing scores before accumulation).
