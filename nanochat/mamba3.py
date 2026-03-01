@@ -205,7 +205,7 @@ import torch.nn.functional as F
 # Triton kernels for CUDA (optional — falls back to PyTorch on CPU/MPS)
 _HAS_TRITON = False
 try:
-    from nanochat.ssd_triton import mamba3_chunk_scan_fwd
+    from nanochat.ssd_triton import mamba3_chunk_scan_fwd, mamba3_chunk_scan_bwd
     _HAS_TRITON = True
 except ImportError:
     pass
@@ -287,29 +287,30 @@ if _HAS_TRITON:
         return x_dt_g.new_empty(batch, nchunks, L, nheads, headdim, dtype=torch.float32)
 
     def _mamba3_intra_autograd_bwd(ctx, dy_intra):
-        """Backward for within-chunk: fall back to PyTorch (materializes L)."""
+        """Backward for within-chunk: Triton kernels on CUDA, PyTorch fallback on CPU."""
         Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C = ctx.saved_tensors
         scale = ctx.scale
         R = ctx.mimo_rank
         L = ctx.chunk_size
 
-        # Build causal mask for PyTorch path
-        causal_mask = torch.triu(torch.ones(L, L, dtype=torch.bool, device=Bg.device), diagonal=1)
+        if Bg.is_cuda:
+            # Fused Triton backward: 2 kernels, no L materialization
+            dx_dt_g, dx_dt_b, dBg, dBb, dC, ddA_cumsum = mamba3_chunk_scan_bwd(
+                Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, dy_intra, scale, L, R)
+            return (dBg, dBb, dx_dt_g, dx_dt_b, ddA_cumsum, dC, None, None, None)
 
+        # CPU/debug fallback: PyTorch autograd (materializes L)
+        causal_mask = torch.triu(torch.ones(L, L, dtype=torch.bool, device=Bg.device), diagonal=1)
         with torch.enable_grad():
-            # Bg/Bb are BF16 (model dtype) — cast to float32 for backward precision.
-            # x_dt, C, dA_cumsum are already float32.
             Bg_ = Bg.float().detach().requires_grad_()
             Bb_ = Bb.float().detach().requires_grad_()
             x_dt_g_ = x_dt_g.detach().requires_grad_()
             x_dt_b_ = x_dt_b.detach().requires_grad_()
             dA_cumsum_ = dA_cumsum.detach().requires_grad_()
             C_ = C.detach().requires_grad_()
-
             y_intra = _mamba3_intra_pytorch(Bg_, Bb_, x_dt_g_, x_dt_b_,
                                              dA_cumsum_, C_, scale, R, causal_mask)
             y_intra.backward(dy_intra)
-
         return (Bg_.grad, Bb_.grad, x_dt_g_.grad, x_dt_b_.grad,
                 dA_cumsum_.grad, C_.grad, None, None, None)
 

@@ -498,6 +498,154 @@ def test_triton_full_layer_gradient():
     return all_ok
 
 
+def test_triton_bwd_per_gradient():
+    """Compare each gradient from Triton backward vs PyTorch backward."""
+    from nanochat.mamba3 import _mamba3_intra_pytorch
+    from nanochat.ssd_triton import mamba3_chunk_scan_bwd
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    batch, nc, L, ngroups, R, dstate = 2, 4, 64, 1, 2, 64
+    nheads = 4
+    headdim = 64
+    scale = (dstate * R) ** -0.5
+
+    Bg = torch.randn(batch, nc, L, ngroups, R, dstate, device=device, dtype=torch.float32)
+    Bb = torch.randn(batch, nc, L, ngroups, R, dstate, device=device, dtype=torch.float32)
+    x_dt_g = torch.randn(batch, nc, L, nheads, R, headdim, device=device, dtype=torch.float32)
+    x_dt_b = torch.randn(batch, nc, L, nheads, R, headdim, device=device, dtype=torch.float32)
+    dA_cumsum = (torch.randn(batch, nc, L, nheads, device=device, dtype=torch.float32) * 0.1).cumsum(dim=2)
+    C = torch.randn(batch, nc, L, ngroups, dstate, device=device, dtype=torch.float32)
+    dy = torch.randn(batch, nc, L, nheads, headdim, device=device, dtype=torch.float32)
+
+    # Triton backward
+    dx_g_tri, dx_b_tri, dBg_tri, dBb_tri, dC_tri, ddA_tri = mamba3_chunk_scan_bwd(
+        Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, dy, scale, L, R)
+
+    # PyTorch backward (reference)
+    causal_mask = torch.triu(torch.ones(L, L, dtype=torch.bool, device=device), diagonal=1)
+    Bg_ = Bg.detach().requires_grad_()
+    Bb_ = Bb.detach().requires_grad_()
+    x_dt_g_ = x_dt_g.detach().requires_grad_()
+    x_dt_b_ = x_dt_b.detach().requires_grad_()
+    dA_ = dA_cumsum.detach().requires_grad_()
+    C_ = C.detach().requires_grad_()
+    y_ref = _mamba3_intra_pytorch(Bg_, Bb_, x_dt_g_, x_dt_b_, dA_, C_, scale, R, causal_mask)
+    y_ref.backward(dy)
+
+    all_ok = True
+    for name, tri, ref in [
+        ("dx_dt_g", dx_g_tri, x_dt_g_.grad),
+        ("dx_dt_b", dx_b_tri, x_dt_b_.grad),
+        ("dBg", dBg_tri, Bg_.grad),
+        ("dBb", dBb_tri, Bb_.grad),
+        ("dC", dC_tri, C_.grad),
+        ("ddA_cumsum", ddA_tri, dA_.grad),
+    ]:
+        max_diff = (tri - ref).abs().max().item()
+        scale_val = ref.abs().max().item() + 1e-8
+        rel = max_diff / scale_val
+        ok = rel < 0.02
+        all_ok &= ok
+        print(f"    {name:12s}: rel={rel:.6f} {'PASS' if ok else 'FAIL'}")
+
+    return all_ok
+
+
+def test_triton_bwd_multigroup():
+    """Test backward with nheads > ngroups (atomic dBg/dBb across heads)."""
+    from nanochat.mamba3 import _mamba3_intra_pytorch
+    from nanochat.ssd_triton import mamba3_chunk_scan_bwd
+
+    torch.manual_seed(99)
+    device = "cuda"
+
+    batch, nc, L, ngroups, R, dstate = 1, 2, 32, 1, 1, 32
+    nheads = 4  # 4 heads per group -> tests atomic add
+    headdim = 32
+    scale = (dstate * R) ** -0.5
+
+    Bg = torch.randn(batch, nc, L, ngroups, R, dstate, device=device, dtype=torch.float32)
+    Bb = torch.randn(batch, nc, L, ngroups, R, dstate, device=device, dtype=torch.float32)
+    x_dt_g = torch.randn(batch, nc, L, nheads, R, headdim, device=device, dtype=torch.float32)
+    x_dt_b = torch.randn(batch, nc, L, nheads, R, headdim, device=device, dtype=torch.float32)
+    dA_cumsum = (torch.randn(batch, nc, L, nheads, device=device, dtype=torch.float32) * 0.1).cumsum(dim=2)
+    C = torch.randn(batch, nc, L, ngroups, dstate, device=device, dtype=torch.float32)
+    dy = torch.randn(batch, nc, L, nheads, headdim, device=device, dtype=torch.float32)
+
+    dx_g_tri, dx_b_tri, dBg_tri, dBb_tri, dC_tri, ddA_tri = mamba3_chunk_scan_bwd(
+        Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, dy, scale, L, R)
+
+    causal_mask = torch.triu(torch.ones(L, L, dtype=torch.bool, device=device), diagonal=1)
+    Bg_ = Bg.detach().requires_grad_()
+    Bb_ = Bb.detach().requires_grad_()
+    x_dt_g_ = x_dt_g.detach().requires_grad_()
+    x_dt_b_ = x_dt_b.detach().requires_grad_()
+    dA_ = dA_cumsum.detach().requires_grad_()
+    C_ = C.detach().requires_grad_()
+    y_ref = _mamba3_intra_pytorch(Bg_, Bb_, x_dt_g_, x_dt_b_, dA_, C_, scale, R, causal_mask)
+    y_ref.backward(dy)
+
+    all_ok = True
+    for name, tri, ref in [
+        ("dBg", dBg_tri, Bg_.grad),
+        ("dBb", dBb_tri, Bb_.grad),
+        ("dC", dC_tri, C_.grad),
+    ]:
+        max_diff = (tri - ref).abs().max().item()
+        scale_val = ref.abs().max().item() + 1e-8
+        rel = max_diff / scale_val
+        ok = rel < 0.02
+        all_ok &= ok
+        print(f"    {name:12s}: rel={rel:.6f} {'PASS' if ok else 'FAIL'}")
+
+    return all_ok
+
+
+def test_triton_bwd_full_layer():
+    """Full Mamba3Layer gradient flow using Triton backward."""
+    from nanochat.mamba3 import Mamba3Layer
+
+    torch.manual_seed(42)
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    batch, T = 2, 128
+    d_model, d_state, expand, chunk_size = 128, 32, 2, 64
+
+    layer = Mamba3Layer(d_model=d_model, d_state=d_state, expand=expand,
+                        chunk_size=chunk_size, mimo_rank=2)
+    layer.to(device=device, dtype=dtype)
+
+    with torch.no_grad():
+        layer.A_log.copy_(torch.log(torch.linspace(0.001, layer.n_heads, layer.n_heads)))
+        torch.nn.init.uniform_(layer.dt_bias, -4.0, -2.0)
+
+    x = torch.randn(batch, T, d_model, device=device, dtype=dtype, requires_grad=True)
+    y, _, _ = layer(x)
+    loss = y.sum()
+    loss.backward()
+
+    all_ok = True
+    for name, p in layer.named_parameters():
+        if p.grad is None:
+            print(f"    WARNING: {name} has no gradient")
+            all_ok = False
+        elif p.grad.isnan().any():
+            print(f"    WARNING: {name} has NaN gradient")
+            all_ok = False
+        elif p.grad.abs().max().item() == 0:
+            print(f"    WARNING: {name} has zero gradient")
+            all_ok = False
+
+    has_input_grad = x.grad is not None and not x.grad.isnan().any()
+    all_ok = all_ok and has_input_grad
+
+    print(f"  Triton backward full-layer gradient: {'PASS' if all_ok else 'FAIL'}")
+    return all_ok
+
+
 if __name__ == "__main__":
     use_cuda = "--cuda" in sys.argv
 
@@ -545,6 +693,15 @@ if __name__ == "__main__":
 
         print("\n13. Triton full-layer gradient flow:")
         all_pass &= test_triton_full_layer_gradient()
+
+        print("\n14. Triton backward per-gradient comparison:")
+        all_pass &= test_triton_bwd_per_gradient()
+
+        print("\n15. Triton backward multigroup (atomic dBg):")
+        all_pass &= test_triton_bwd_multigroup()
+
+        print("\n16. Triton backward full-layer:")
+        all_pass &= test_triton_bwd_full_layer()
 
     if all_pass:
         print("\nAll tests PASSED!")
