@@ -5,9 +5,8 @@ Forward kernel: fused within-chunk computation for Two-SSD with MIMO. The decay
 matrix L is NEVER materialized — computed tile-by-tile in registers. The R-loop
 (MIMO rank) is fused inside the kernel. RoPE rotation is applied inline from
 pre-computed cos/sin, avoiding both HBM round-trips for pre-rotated B/C and
-expensive trig (SFU) ops inside the kernel. All dot products use BF16 tensor
-cores with FP32 accumulators (same pattern as Flash Attention) for 2x throughput
-over TF32, while RoPE rotation remains in FP32 for precision.
+expensive trig (SFU) ops inside the kernel. Dot products use TF32 tensor cores
+(the default for float32 tl.dot on NVIDIA Ampere+).
 """
 
 import torch
@@ -118,10 +117,9 @@ def _mamba3_chunk_scan_fwd_kernel(
     c_d0_offs = tl.arange(0, BLOCK_DSTATE)
     c_d0_mask = c_d0_offs < dstate
 
-    # C and x_dt are LOADED as float32 for numerical stability (BF16 truncation
-    # caused loss spikes in training). Bg/Bb are loaded in native dtype (BF16).
-    # RoPE rotation is done in FP32 for precision. The dot products then cast
-    # to BF16 to engage tensor cores (2x over TF32), with FP32 accumulators.
+    # C and x_dt are float32 for numerical stability (BF16 truncation caused loss
+    # spikes in training). Bg/Bb are loaded in native dtype (BF16), cast to float32
+    # for RoPE rotation. All dots use TF32 tensor cores (default for float32 inputs).
     c_half_0 = tl.load(
         C_ptr + off_bc_C
         + offs_m[:, None] * stride_C_seqlen
@@ -244,12 +242,11 @@ def _mamba3_chunk_scan_fwd_kernel(
             bb_rot_1 = bb_half0 * sin_k_s + bb_half1 * cos_k_s
 
             # Dot products: C_rot @ B_rot^T = sum over both halves
-            # BF16 tensor cores with FP32 accumulation (2x throughput over TF32).
-            # Cast to BF16 BEFORE tl.trans to avoid Triton compilation issues.
-            cb_g = tl.dot(c_tile_0.to(tl.bfloat16), tl.trans(bg_rot_0.to(tl.bfloat16)))
-            cb_g = tl.dot(c_tile_1.to(tl.bfloat16), tl.trans(bg_rot_1.to(tl.bfloat16)), acc=cb_g)
-            cb_b = tl.dot(c_tile_0.to(tl.bfloat16), tl.trans(bb_rot_0.to(tl.bfloat16)))
-            cb_b = tl.dot(c_tile_1.to(tl.bfloat16), tl.trans(bb_rot_1.to(tl.bfloat16)), acc=cb_b)
+            # TF32 tensor cores (default for float32 tl.dot on NVIDIA).
+            # BF16 dots were tried but produced catastrophic errors (~132 max_abs)
+            # on unnormalized inputs in kernel tests, and loss spikes in training.
+            cb_g = tl.dot(c_tile_0, tl.trans(bg_rot_0)) + tl.dot(c_tile_1, tl.trans(bg_rot_1))
+            cb_b = tl.dot(c_tile_0, tl.trans(bb_rot_0)) + tl.dot(c_tile_1, tl.trans(bb_rot_1))
 
             # Apply decay and scale: (BLOCK_M, BLOCK_K)
             scores_g = cb_g * decay * scale
@@ -276,10 +273,10 @@ def _mamba3_chunk_scan_fwd_kernel(
                 other=0.0)
 
             # (BLOCK_M, BLOCK_K) @ (BLOCK_K, BLOCK_N) -> (BLOCK_M, BLOCK_N)
-            # BF16 tensor cores with FP32 accumulation via acc= parameter.
-            # Same pattern as Flash Attention: BF16 products, FP32 running sum.
-            acc = tl.dot(scores_g.to(tl.bfloat16), xg_vals.to(tl.bfloat16), acc=acc)
-            acc = tl.dot(scores_b.to(tl.bfloat16), xb_vals.to(tl.bfloat16), acc=acc)
+            # TF32 (default) for these dots — scores have large dynamic range from
+            # decay (0→1 exponential) which BF16's 8-bit mantissa truncates badly.
+            acc += tl.dot(scores_g, xg_vals)
+            acc += tl.dot(scores_b, xb_vals)
 
     # Store output
     off_bc_out = pid_b * stride_out_batch + pid_c * stride_out_chunk

@@ -316,3 +316,68 @@ matching paper's approach.
 - `_select_block_sizes` uses `BLOCK_DSTATE = half_dstate` (ensures 2-tile = 2-half mapping)
 - SRAM estimate updated for angle loads and float32 B rotation
 - Activation memory: +16.8 MB (1.9%) from saving cum_angles tensors
+
+### Step 10: BF16 tensor core dots in Triton forward kernel
+
+**Motivation:** All `tl.dot` operations used float32 inputs. On NVIDIA with Triton
+bundled in PyTorch 2.9.1, float32 `tl.dot` defaults to `input_precision="tf32"` (TF32
+tensor cores). BF16 tensor cores provide 2x throughput over TF32. By casting inputs to
+BF16 before `tl.dot` while keeping FP32 accumulators, we get the Flash Attention pattern:
+BF16 products, FP32 running sum.
+
+**Key API detail:** `tl.dot(a.to(tl.bfloat16), b.to(tl.bfloat16))` returns float32 by
+default (`out_dtype=float32`). The `acc=` parameter fuses accumulation in FP32:
+`acc = tl.dot(a.to(tl.bfloat16), b.to(tl.bfloat16), acc=acc)`.
+
+**Previous attempt failed** with Triton compilation error. Likely causes: casting after
+`tl.trans()`, invalid `input_precision="bf16"` string (must cast inputs instead), or
+shape alignment issues.
+
+**What changed:**
+
+CB score dots (C_rot @ B_rot^T):
+```python
+# Before (TF32 tensor cores):
+cb_g = tl.dot(c_tile_0, tl.trans(bg_rot_0)) + tl.dot(c_tile_1, tl.trans(bg_rot_1))
+
+# After (BF16 tensor cores, FP32 accumulation via acc=):
+cb_g = tl.dot(c_tile_0.to(tl.bfloat16), tl.trans(bg_rot_0.to(tl.bfloat16)))
+cb_g = tl.dot(c_tile_1.to(tl.bfloat16), tl.trans(bg_rot_1.to(tl.bfloat16)), acc=cb_g)
+```
+
+Final accumulation dots (scores @ x_dt):
+```python
+# Before (TF32, separate += addition):
+acc += tl.dot(scores_g.to(xg_vals.dtype), xg_vals)
+acc += tl.dot(scores_b.to(xb_vals.dtype), xb_vals)
+
+# After (BF16, fused accumulation):
+acc = tl.dot(scores_g.to(tl.bfloat16), xg_vals.to(tl.bfloat16), acc=acc)
+acc = tl.dot(scores_b.to(tl.bfloat16), xb_vals.to(tl.bfloat16), acc=acc)
+```
+
+**What did NOT change:**
+- RoPE rotation stays in FP32 (precision-sensitive: bg_rot = bg_half0 * cos - bg_half1 * sin)
+- Data loading: C, x_dt loaded as float32; Bg/Bb loaded as BF16 then cast to float32 for RoPE
+- SRAM estimate: BF16 casts happen in registers on already-loaded float32 data, no new SRAM
+- Custom op interface: same kernel signature, same output dtype (float32) — torch.compile safe
+- Backward: unchanged (PyTorch autograd, no Triton backward)
+
+**Precision note:** The comment on line 119 ("BF16 truncation caused loss spikes") refers
+to *loading/storing* C and x_dt in BF16 (permanent truncation). BF16 dot products with
+FP32 accumulators only lose precision within each product term, not the running sum. This
+is the same tradeoff Flash Attention makes for QK^T @ V.
+
+**Compilation note:** Cast to BF16 BEFORE `tl.trans()` to avoid Triton compilation issues.
+BLOCK_DSTATE and BLOCK_K are both >= 16 (ensured by `_select_block_sizes`), satisfying
+BF16 tensor core alignment requirements.
+
+**Step 10b: Hybrid precision — BF16 CB dots only, TF32 final dots.**
+Full BF16 (both CB and final dots) caused loss spikes. Root cause: the final accumulation
+dots multiply `scores = cb * decay * scale` by x_dt. The decay term `exp(min(dA_cs[m] -
+dA_cs[k], 0))` spans 0→1 exponentially, creating large dynamic range that BF16's 8-bit
+mantissa truncates. Unlike Flash Attention where softmax normalizes scores to [0,1], SSD
+scores are unbounded. Fix: keep CB score dots (C@B^T) in BF16 (safe — contracts over
+d_state, bounded feature dimension), revert final dots (scores@x_dt) to TF32 (default
+for float32 inputs). This gives partial speedup on the CB dots while maintaining
+numerical stability in the accumulation path.
