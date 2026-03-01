@@ -178,8 +178,10 @@ def bench_layer_inference(cfg, warmup=25, rep=100):
     n_heads = (cfg["expand"] * cfg["d_model"]) // d_state
     headdim = (cfg["expand"] * cfg["d_model"]) // n_heads
 
-    # Pre-allocate SSM state
-    h = torch.zeros(batch, n_heads, headdim, d_state, device="cuda", dtype=torch.bfloat16)
+    # Pre-allocate SSM state in float32: the recurrent loop promotes h to float32
+    # because A is computed in float32 (A = -exp(A_log.float())), so alpha_t * h
+    # upcasts h on the first step. Match that steady-state dtype here.
+    h = torch.zeros(batch, n_heads, headdim, d_state, device="cuda", dtype=torch.float32)
     prev_Bx = torch.zeros_like(h)
     ssm_state = {'h': h, 'prev_Bx': prev_Bx}
 

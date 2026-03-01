@@ -833,8 +833,9 @@ class Mamba3Layer(nn.Module):
 
             prev_Bx = Bx_t
 
-            # Output (C is single-rank)
-            y_t = torch.einsum('bhn, bhpn -> bhp', C_t, h) * self._ssd_scale
+            # Output (C is single-rank). Cast C_t to match h dtype — h is promoted
+            # to float32 by alpha_t (from A.float()) when the model runs in bf16.
+            y_t = torch.einsum('bhn, bhpn -> bhp', C_t.to(h.dtype), h) * self._ssd_scale
             outputs.append(y_t)
 
         y = torch.stack(outputs, dim=1)
