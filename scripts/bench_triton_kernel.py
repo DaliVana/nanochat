@@ -30,7 +30,7 @@ PROFILES = {
     "xlarge-1ngroup": dict(batch=1, seq_len=8192, d_model=2560, expand=1, d_state=128, chunk_size=256, mimo_rank=4, ngroups=1),
     "xlarge-2ngroups": dict(batch=1, seq_len=8192, d_model=2560, expand=1, d_state=128, chunk_size=256, mimo_rank=4, ngroups=2),
     "xlarge-4ngroups": dict(batch=1, seq_len=8192, d_model=2560, expand=1, d_state=128, chunk_size=256, mimo_rank=4, ngroups=4),
-    "xlarge-8ngroups": dict(batch=1, seq_len=8192, d_model=2560, expand=1, d_state=128, chunk_size=256, mimo_rank=4, ngroups=8),
+    "xlarge-10ngroups": dict(batch=1, seq_len=8192, d_model=2560, expand=1, d_state=128, chunk_size=256, mimo_rank=4, ngroups=10),
 }
 
 # Subset of profiles for layer benchmarks (full layer is slower to bench)
