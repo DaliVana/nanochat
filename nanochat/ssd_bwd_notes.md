@@ -285,3 +285,34 @@ autograd fallback permanently. This is the same approach the Mamba-3 authors use
 - Removed `if Bg.is_cuda` Triton branch from `_mamba3_intra_autograd_bwd`
 - Backward now always uses `_mamba3_intra_pytorch` via PyTorch autograd (materializes L, cuBLAS GEMMs)
 - Triton backward kernels remain in ssd_triton.py for reference but are unused
+
+### Step 9: Fused RoPE in Triton forward kernel ✅
+
+**Motivation:** Paper fuses "SSM+Rotary" in one Triton kernel. Our code previously applied RoPE
+in Python (materializing rotated B/C to HBM, ~80 MB extra traffic). Fusing eliminates this
+round-trip. Estimated <3% wall-clock improvement (kernel is compute-bound), plus cleaner code
+matching paper's approach.
+
+**Design:**
+- Raw (unrotated) B/C + cum_angles passed to Triton kernel
+- With dstate=128, BLOCK_DSTATE=64: the two d-state tiles naturally map to RoPE halves
+- C rotation in pre-load phase: load angles[m], compute cos/sin, rotate cached C tiles
+- B rotation in k-loop: load angles[k] once per k-block (shared across R ranks), rotate both halves
+- Bg uses cum_angles[k], Bb uses cum_angles_shifted[k] (position t-1)
+- Between-chunk code lazily computes rotated B/C from raw + angles after Triton returns
+
+**Backward handling:**
+- Custom op saves raw Bg, Bb, C + cum_angles, cum_angles_shifted
+- Backward reconstructs rotated B/C from saved raw + angles
+- Runs `_mamba3_intra_pytorch` on rotated B/C to get gradients w.r.t. rotated tensors
+- Applies inverse rotation (R^{-1}, using -sin) to map gradients back to raw B/C space
+
+**Changes made:**
+- Split `_apply_data_dependent_rope` into `_compute_rope_angles` + wrapper
+- `forward()` branches: Triton path passes raw B/C + angles; CPU/inference pre-rotates
+- `_two_ssd_forward` accepts `cum_angles`, computes `cum_angles_shifted`, chunks both
+- Custom op signature updated with `cum_angles`, `cum_angles_shifted`
+- Triton kernel applies RoPE inline: tl.cos/tl.sin from cum_angles in registers
+- `_select_block_sizes` uses `BLOCK_DSTATE = half_dstate` (ensures 2-tile = 2-half mapping)
+- SRAM estimate updated for angle loads and float32 B rotation
+- Activation memory: +16.8 MB (1.9%) from saving cum_angles tensors

@@ -385,8 +385,8 @@ def test_cuda_forward_backward():
 
 
 def test_triton_intra_vs_pytorch():
-    """Verify Triton within-chunk kernel matches PyTorch materialized-L computation."""
-    from nanochat.mamba3 import _mamba3_intra_pytorch
+    """Verify Triton within-chunk kernel (with fused RoPE) matches PyTorch."""
+    from nanochat.mamba3 import _mamba3_intra_pytorch, _apply_rope_pairs
     from nanochat.ssd_triton import mamba3_chunk_scan_fwd
 
     torch.manual_seed(42)
@@ -395,36 +395,49 @@ def test_triton_intra_vs_pytorch():
     batch, nc, L, ngroups, R, dstate = 2, 4, 64, 1, 2, 64
     nheads = 4
     headdim = 64
+    half_d = dstate // 2
     scale = (dstate * R) ** -0.5
 
-    Bg = torch.randn(batch, nc, L, ngroups, R, dstate, device=device, dtype=torch.float32)
-    Bb = torch.randn(batch, nc, L, ngroups, R, dstate, device=device, dtype=torch.float32)
+    # Raw (unrotated) B/C and angles
+    Bg_raw = torch.randn(batch, nc, L, ngroups, R, dstate, device=device, dtype=torch.float32)
+    Bb_raw = torch.randn(batch, nc, L, ngroups, R, dstate, device=device, dtype=torch.float32)
     x_dt_g = torch.randn(batch, nc, L, nheads, R, headdim, device=device, dtype=torch.float32)
     x_dt_b = torch.randn(batch, nc, L, nheads, R, headdim, device=device, dtype=torch.float32)
-    # Use realistic cumulative decay values
     dA_cumsum = (torch.randn(batch, nc, L, nheads, device=device, dtype=torch.float32) * 0.1).cumsum(dim=2)
-    C = torch.randn(batch, nc, L, ngroups, dstate, device=device, dtype=torch.float32)
+    C_raw = torch.randn(batch, nc, L, ngroups, dstate, device=device, dtype=torch.float32)
+    cum_angles = torch.randn(batch, nc, L, half_d, device=device, dtype=torch.float32) * 0.5
+    cum_angles_shifted = torch.randn(batch, nc, L, half_d, device=device, dtype=torch.float32) * 0.5
 
-    # Triton path
-    y_triton = mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, scale, L, R)
+    # Triton path: raw B/C + angles (RoPE fused in kernel)
+    y_triton = mamba3_chunk_scan_fwd(Bg_raw, Bb_raw, x_dt_g, x_dt_b, dA_cumsum, C_raw,
+                                      cum_angles, cum_angles_shifted, scale, L, R)
 
-    # PyTorch path
+    # PyTorch path: pre-rotate B/C, then run without angles
+    cos_a = torch.cos(cum_angles).unsqueeze(3)       # (batch, nc, L, 1, half_d)
+    sin_a = torch.sin(cum_angles).unsqueeze(3)
+    cos_s = torch.cos(cum_angles_shifted).unsqueeze(3)
+    sin_s = torch.sin(cum_angles_shifted).unsqueeze(3)
+    Bg_rot = _apply_rope_pairs(Bg_raw, cos_a.unsqueeze(4), sin_a.unsqueeze(4))
+    Bb_rot = _apply_rope_pairs(Bb_raw, cos_s.unsqueeze(4), sin_s.unsqueeze(4))
+    C_rot = _apply_rope_pairs(C_raw, cos_a, sin_a)
+
     causal_mask = torch.triu(torch.ones(L, L, dtype=torch.bool, device=device), diagonal=1)
-    y_pytorch = _mamba3_intra_pytorch(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, scale, R, causal_mask)
+    y_pytorch = _mamba3_intra_pytorch(Bg_rot, Bb_rot, x_dt_g, x_dt_b, dA_cumsum,
+                                       C_rot.float(), scale, R, causal_mask)
 
     max_diff = (y_triton - y_pytorch).abs().max().item()
     scale_val = y_pytorch.abs().max().item() + 1e-8
     rel_diff = max_diff / scale_val
 
     passed = rel_diff < 0.01
-    print(f"  Triton vs PyTorch intra (R=2): max_abs={max_diff:.6f}, "
+    print(f"  Triton fused-RoPE vs PyTorch pre-rotated (R=2): max_abs={max_diff:.6f}, "
           f"rel={rel_diff:.6f} {'PASS' if passed else 'FAIL'}")
     return passed
 
 
 def test_triton_intra_r4():
-    """Verify Triton kernel works for MIMO R=4."""
-    from nanochat.mamba3 import _mamba3_intra_pytorch
+    """Verify Triton kernel with fused RoPE works for MIMO R=4."""
+    from nanochat.mamba3 import _mamba3_intra_pytorch, _apply_rope_pairs
     from nanochat.ssd_triton import mamba3_chunk_scan_fwd
 
     torch.manual_seed(123)
@@ -433,26 +446,41 @@ def test_triton_intra_r4():
     batch, nc, L, ngroups, R, dstate = 2, 2, 32, 1, 4, 32
     nheads = 4
     headdim = 32
+    half_d = dstate // 2
     scale = (dstate * R) ** -0.5
 
-    Bg = torch.randn(batch, nc, L, ngroups, R, dstate, device=device, dtype=torch.float32)
-    Bb = torch.randn(batch, nc, L, ngroups, R, dstate, device=device, dtype=torch.float32)
+    Bg_raw = torch.randn(batch, nc, L, ngroups, R, dstate, device=device, dtype=torch.float32)
+    Bb_raw = torch.randn(batch, nc, L, ngroups, R, dstate, device=device, dtype=torch.float32)
     x_dt_g = torch.randn(batch, nc, L, nheads, R, headdim, device=device, dtype=torch.float32)
     x_dt_b = torch.randn(batch, nc, L, nheads, R, headdim, device=device, dtype=torch.float32)
     dA_cumsum = (torch.randn(batch, nc, L, nheads, device=device, dtype=torch.float32) * 0.1).cumsum(dim=2)
-    C = torch.randn(batch, nc, L, ngroups, dstate, device=device, dtype=torch.float32)
+    C_raw = torch.randn(batch, nc, L, ngroups, dstate, device=device, dtype=torch.float32)
+    cum_angles = torch.randn(batch, nc, L, half_d, device=device, dtype=torch.float32) * 0.5
+    cum_angles_shifted = torch.randn(batch, nc, L, half_d, device=device, dtype=torch.float32) * 0.5
 
-    y_triton = mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, scale, L, R)
+    # Triton: fused RoPE
+    y_triton = mamba3_chunk_scan_fwd(Bg_raw, Bb_raw, x_dt_g, x_dt_b, dA_cumsum, C_raw,
+                                      cum_angles, cum_angles_shifted, scale, L, R)
+
+    # PyTorch: pre-rotate
+    cos_a = torch.cos(cum_angles).unsqueeze(3)
+    sin_a = torch.sin(cum_angles).unsqueeze(3)
+    cos_s = torch.cos(cum_angles_shifted).unsqueeze(3)
+    sin_s = torch.sin(cum_angles_shifted).unsqueeze(3)
+    Bg_rot = _apply_rope_pairs(Bg_raw, cos_a.unsqueeze(4), sin_a.unsqueeze(4))
+    Bb_rot = _apply_rope_pairs(Bb_raw, cos_s.unsqueeze(4), sin_s.unsqueeze(4))
+    C_rot = _apply_rope_pairs(C_raw, cos_a, sin_a)
 
     causal_mask = torch.triu(torch.ones(L, L, dtype=torch.bool, device=device), diagonal=1)
-    y_pytorch = _mamba3_intra_pytorch(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, scale, R, causal_mask)
+    y_pytorch = _mamba3_intra_pytorch(Bg_rot, Bb_rot, x_dt_g, x_dt_b, dA_cumsum,
+                                       C_rot.float(), scale, R, causal_mask)
 
     max_diff = (y_triton - y_pytorch).abs().max().item()
     scale_val = y_pytorch.abs().max().item() + 1e-8
     rel_diff = max_diff / scale_val
 
     passed = rel_diff < 0.01
-    print(f"  Triton vs PyTorch intra (R=4): max_abs={max_diff:.6f}, "
+    print(f"  Triton fused-RoPE vs PyTorch pre-rotated (R=4): max_abs={max_diff:.6f}, "
           f"rel={rel_diff:.6f} {'PASS' if passed else 'FAIL'}")
     return passed
 
@@ -646,6 +674,66 @@ def test_triton_bwd_full_layer():
     return all_ok
 
 
+def test_fused_rope_full_layer():
+    """Test full Mamba3Layer with fused RoPE in Triton kernel (d_state=128, our target config).
+
+    Compares CUDA (fused RoPE in Triton) forward+backward against CPU (pre-rotated) to
+    verify end-to-end correctness including between-chunk code with lazy rotation.
+    """
+    from nanochat.mamba3 import Mamba3Layer
+
+    torch.manual_seed(42)
+    dtype = torch.float32  # Use float32 for accurate comparison
+
+    batch, T = 2, 128
+    d_model, d_state, expand, chunk_size = 128, 128, 2, 64
+    mimo_rank = 2
+
+    # Create layer on CPU first
+    layer = Mamba3Layer(d_model=d_model, d_state=d_state, expand=expand,
+                        chunk_size=chunk_size, mimo_rank=mimo_rank)
+    layer.to(dtype=dtype)
+    layer.eval()
+
+    with torch.no_grad():
+        layer.A_log.copy_(torch.log(torch.linspace(0.001, layer.n_heads, layer.n_heads)))
+        torch.nn.init.uniform_(layer.dt_bias, -4.0, -2.0)
+
+    x = torch.randn(batch, T, d_model, dtype=dtype)
+
+    # CPU forward (pre-rotated RoPE, no Triton)
+    with torch.no_grad():
+        y_cpu, _, _ = layer(x, ssm_state=None)
+
+    # CUDA forward (fused RoPE in Triton kernel)
+    layer_cuda = Mamba3Layer(d_model=d_model, d_state=d_state, expand=expand,
+                              chunk_size=chunk_size, mimo_rank=mimo_rank)
+    layer_cuda.to(device="cuda", dtype=dtype)
+    # Copy weights
+    with torch.no_grad():
+        for (n1, p1), (n2, p2) in zip(layer.named_parameters(), layer_cuda.named_parameters()):
+            p2.copy_(p1)
+    layer_cuda.eval()
+
+    x_cuda = x.to("cuda")
+    with torch.no_grad():
+        y_cuda, _, _ = layer_cuda(x_cuda, ssm_state=None)
+
+    y_cuda_cpu = y_cuda.cpu()
+    max_diff = (y_cpu - y_cuda_cpu).abs().max().item()
+    scale_val = y_cpu.abs().max().item() + 1e-8
+    rel_diff = max_diff / scale_val
+    cos_sim = F.cosine_similarity(
+        y_cpu.reshape(-1).unsqueeze(0),
+        y_cuda_cpu.reshape(-1).unsqueeze(0)
+    ).item()
+
+    passed = cos_sim > 0.999 and rel_diff < 0.01
+    print(f"  Fused RoPE full layer (CPU vs CUDA): max_abs={max_diff:.6f}, "
+          f"rel={rel_diff:.6f}, cos_sim={cos_sim:.6f} {'PASS' if passed else 'FAIL'}")
+    return passed
+
+
 if __name__ == "__main__":
     use_cuda = "--cuda" in sys.argv
 
@@ -685,10 +773,10 @@ if __name__ == "__main__":
         print("\n10. CUDA forward+backward:")
         all_pass &= test_cuda_forward_backward()
 
-        print("\n11. Triton intra-chunk vs PyTorch (R=2):")
+        print("\n11. Triton fused-RoPE vs PyTorch (R=2):")
         all_pass &= test_triton_intra_vs_pytorch()
 
-        print("\n12. Triton intra-chunk vs PyTorch (R=4):")
+        print("\n12. Triton fused-RoPE vs PyTorch (R=4):")
         all_pass &= test_triton_intra_r4()
 
         print("\n13. Triton full-layer gradient flow:")
@@ -702,6 +790,9 @@ if __name__ == "__main__":
 
         print("\n16. Triton backward full-layer:")
         all_pass &= test_triton_bwd_full_layer()
+
+        print("\n17. Fused RoPE full layer (CPU vs CUDA):")
+        all_pass &= test_fused_rope_full_layer()
 
     if all_pass:
         print("\nAll tests PASSED!")
