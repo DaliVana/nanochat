@@ -584,7 +584,7 @@ def _mamba3_chunk_scan_bwd_dC_kernel(
     # Upstream gradient
     dy_ptr,                    # (batch, nc, L, nheads, headdim)
     # Outputs
-    dC_ptr,                    # (batch, nc, L, ngroups, dstate)
+    dC_ptr,                    # (batch, nc, L, ngroups, dstate) — zero-init, atomic add
     ddA_m_ptr,                 # (batch, nc, L, nheads) — m-side, zero-init, atomic add
     # Strides Bg/Bb
     stride_Bg_batch, stride_Bg_chunk, stride_Bg_seqlen, stride_Bg_group, stride_Bg_rank, stride_Bg_dstate,
@@ -612,8 +612,8 @@ def _mamba3_chunk_scan_bwd_dC_kernel(
     """
     Backward kernel 1: computes dC and ddA_cumsum (m-side).
 
-    Grid: (cdiv(L, BLOCK_M), batch * nchunks, ngroups)
-    For each m-block, loops over k <= m, ranks, and heads within group.
+    Grid: (cdiv(L, BLOCK_M), batch * nchunks, nheads)
+    Each program handles one head; dC is accumulated across heads via atomic_add.
 
     dC[m,g,d] = Σ_{k≤m} Σ_r (dcb_g[m,k,g,r] · Bg[k,g,r,d] + dcb_b · Bb)
     where dcb_g[m,k,g,r] = Σ_{h∈g} dscores_g[m,k,h,r] * L[m,k,h] * scale
@@ -622,15 +622,16 @@ def _mamba3_chunk_scan_bwd_dC_kernel(
     """
     pid_m = tl.program_id(0)
     pid_bc = tl.program_id(1)
-    pid_g = tl.program_id(2)
+    pid_h = tl.program_id(2)
 
     pid_b = pid_bc // nchunks
     pid_c = pid_bc % nchunks
+    pid_g = pid_h // nheads_per_group
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     m_mask = offs_m < chunk_size
 
-    # Base offsets for this (batch, chunk, group)
+    # Base offsets for this (batch, chunk, group/head)
     off_bc_dA = pid_b * stride_dA_batch + pid_c * stride_dA_chunk
     off_bc_Bg = pid_b * stride_Bg_batch + pid_c * stride_Bg_chunk + pid_g * stride_Bg_group
     off_bc_Bb = pid_b * stride_Bb_batch + pid_c * stride_Bb_chunk + pid_g * stride_Bb_group
@@ -653,10 +654,18 @@ def _mamba3_chunk_scan_bwd_dC_kernel(
             C_ptr + off_bc_C + offs_m[:, None] * stride_C_seqlen + c_d1_offs[None, :] * stride_C_dstate,
             mask=m_mask[:, None] & c_d1_mask[None, :], other=0.0)
 
+    # Load dA_cumsum for m positions (persistent — single head)
+    dA_cs_m = tl.load(
+        dA_cumsum_ptr + off_bc_dA + offs_m * stride_dA_seqlen + pid_h * stride_dA_head,
+        mask=m_mask, other=0.0).to(tl.float32)
+
     # dC accumulators (one per dstate tile)
     dC_acc_0 = tl.zeros((BLOCK_M, BLOCK_DSTATE), dtype=tl.float32)
     if C_TILES > 1:
         dC_acc_1 = tl.zeros((BLOCK_M, BLOCK_DSTATE), dtype=tl.float32)
+
+    # ddA_m accumulator for this head
+    ddA_m_acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
 
     # k-loop: k ≤ m (causal, same direction as forward)
     k_max = tl.minimum((pid_m + 1) * BLOCK_M, chunk_size)
@@ -664,6 +673,14 @@ def _mamba3_chunk_scan_bwd_dC_kernel(
         k_offs = k_start + tl.arange(0, BLOCK_K)
         k_mask = k_offs < chunk_size
         causal = offs_m[:, None] >= k_offs[None, :]  # (BLOCK_M, BLOCK_K)
+
+        # Decay: L[m,k,h] = exp(min(dA_cs_m[h] - dA_cs_k[h], 0)) * (m >= k)
+        dA_cs_k = tl.load(
+            dA_cumsum_ptr + off_bc_dA + k_offs * stride_dA_seqlen + pid_h * stride_dA_head,
+            mask=k_mask, other=0.0).to(tl.float32)
+        diff = dA_cs_m[:, None] - dA_cs_k[None, :]
+        decay = tl.exp(tl.minimum(diff, 0.0))
+        decay = tl.where(causal, decay, 0.0)
 
         for r in range(mimo_rank):
             # Load Bg[k,g,r,:] and Bb[k,g,r,:] for this rank
@@ -692,76 +709,54 @@ def _mamba3_chunk_scan_bwd_dC_kernel(
                 cb_g += tl.dot(c_m_1, tl.trans(bg_k_1))
                 cb_b += tl.dot(c_m_1, tl.trans(bb_k_1))
 
-            # dcb = Σ_{h∈g} dscores * decay * scale, accumulated over heads in group
-            dcb_g = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
-            dcb_b = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+            # dscores[m,k,h,r] = Σ_p dy[m,h,p] * x_dt[k,h,r,p] (full headdim reduction)
+            dscores_g = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+            dscores_b = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+            for hdim_start in range(0, headdim, BLOCK_N):
+                hd_offs = hdim_start + tl.arange(0, BLOCK_N)
+                hd_mask = hd_offs < headdim
+                dy_h = tl.load(
+                    dy_ptr + off_bc_dy + offs_m[:, None] * stride_dy_seqlen
+                    + pid_h * stride_dy_head + hd_offs[None, :] * stride_dy_hdim,
+                    mask=m_mask[:, None] & hd_mask[None, :], other=0.0)
+                xg_h = tl.load(
+                    x_dt_g_ptr + off_bc_xg + k_offs[:, None] * stride_xg_seqlen
+                    + pid_h * stride_xg_head + r * stride_xg_rank + hd_offs[None, :] * stride_xg_hdim,
+                    mask=k_mask[:, None] & hd_mask[None, :], other=0.0)
+                xb_h = tl.load(
+                    x_dt_b_ptr + off_bc_xb + k_offs[:, None] * stride_xb_seqlen
+                    + pid_h * stride_xb_head + r * stride_xb_rank + hd_offs[None, :] * stride_xb_hdim,
+                    mask=k_mask[:, None] & hd_mask[None, :], other=0.0)
+                dscores_g += tl.dot(dy_h, tl.trans(xg_h))
+                dscores_b += tl.dot(dy_h, tl.trans(xb_h))
 
-            for h_idx in range(nheads_per_group):
-                h = pid_g * nheads_per_group + h_idx
-
-                # Decay: L[m,k,h] = exp(min(dA_cs_m[h] - dA_cs_k[h], 0)) * (m >= k)
-                dA_cs_m_h = tl.load(
-                    dA_cumsum_ptr + off_bc_dA + offs_m * stride_dA_seqlen + h * stride_dA_head,
-                    mask=m_mask, other=0.0).to(tl.float32)
-                dA_cs_k_h = tl.load(
-                    dA_cumsum_ptr + off_bc_dA + k_offs * stride_dA_seqlen + h * stride_dA_head,
-                    mask=k_mask, other=0.0).to(tl.float32)
-                diff = dA_cs_m_h[:, None] - dA_cs_k_h[None, :]
-                decay = tl.exp(tl.minimum(diff, 0.0))
-                decay = tl.where(causal, decay, 0.0)
-
-                # dscores[m,k,h,r] = Σ_p dy[m,h,p] * x_dt[k,h,r,p] (full headdim reduction)
-                dscores_g = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
-                dscores_b = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
-                for hdim_start in range(0, headdim, BLOCK_N):
-                    hd_offs = hdim_start + tl.arange(0, BLOCK_N)
-                    hd_mask = hd_offs < headdim
-                    dy_h = tl.load(
-                        dy_ptr + off_bc_dy + offs_m[:, None] * stride_dy_seqlen
-                        + h * stride_dy_head + hd_offs[None, :] * stride_dy_hdim,
-                        mask=m_mask[:, None] & hd_mask[None, :], other=0.0)
-                    xg_h = tl.load(
-                        x_dt_g_ptr + off_bc_xg + k_offs[:, None] * stride_xg_seqlen
-                        + h * stride_xg_head + r * stride_xg_rank + hd_offs[None, :] * stride_xg_hdim,
-                        mask=k_mask[:, None] & hd_mask[None, :], other=0.0)
-                    xb_h = tl.load(
-                        x_dt_b_ptr + off_bc_xb + k_offs[:, None] * stride_xb_seqlen
-                        + h * stride_xb_head + r * stride_xb_rank + hd_offs[None, :] * stride_xb_hdim,
-                        mask=k_mask[:, None] & hd_mask[None, :], other=0.0)
-                    dscores_g += tl.dot(dy_h, tl.trans(xg_h))
-                    dscores_b += tl.dot(dy_h, tl.trans(xb_h))
-
-                # Accumulate dcb across heads in group
-                dcb_g += dscores_g * decay * scale
-                dcb_b += dscores_b * decay * scale
-
-                # ddA_m[m,h]: dL_r * L_active, summed over k dim — local accumulation
-                L_active = tl.where(diff < 0.0, decay, 0.0)
-                dL_r = scale * (dscores_g * cb_g + dscores_b * cb_b)
-                ddA_m_contrib = tl.sum(dL_r * L_active, axis=1)  # (BLOCK_M,)
-                # No cross-program contention: each (pid_m, pid_g) writes to
-                # distinct (m, h) positions. Use load-add-store instead of atomic.
-                prev_ddA = tl.load(
-                    ddA_m_ptr + pid_b * stride_ddAm_batch + pid_c * stride_ddAm_chunk
-                    + offs_m * stride_ddAm_seqlen + h * stride_ddAm_head,
-                    mask=m_mask, other=0.0)
-                tl.store(
-                    ddA_m_ptr + pid_b * stride_ddAm_batch + pid_c * stride_ddAm_chunk
-                    + offs_m * stride_ddAm_seqlen + h * stride_ddAm_head,
-                    prev_ddA + ddA_m_contrib, mask=m_mask)
+            # dcb for this single head (no head loop needed)
+            dcb_g = dscores_g * decay * scale
+            dcb_b = dscores_b * decay * scale
 
             # dC += dcb_g @ Bg_k + dcb_b @ Bb_k  ->  (BLOCK_M, BLOCK_DSTATE)
             dC_acc_0 += tl.dot(dcb_g, bg_k_0) + tl.dot(dcb_b, bb_k_0)
             if C_TILES > 1:
                 dC_acc_1 += tl.dot(dcb_g, bg_k_1) + tl.dot(dcb_b, bb_k_1)
 
-    # Store dC[m, g, :]
+            # ddA_m[m,h]: dL_r * L_active, summed over k dim
+            L_active = tl.where(diff < 0.0, decay, 0.0)
+            dL_r = scale * (dscores_g * cb_g + dscores_b * cb_b)
+            ddA_m_acc += tl.sum(dL_r * L_active, axis=1)  # (BLOCK_M,)
+
+    # Store ddA_m[m, h] — no contention: each (pid_m, pid_h) writes distinct positions
+    tl.store(
+        ddA_m_ptr + pid_b * stride_ddAm_batch + pid_c * stride_ddAm_chunk
+        + offs_m * stride_ddAm_seqlen + pid_h * stride_ddAm_head,
+        ddA_m_acc, mask=m_mask)
+
+    # Atomic-add dC[m, g, :] — multiple heads in same group contend here
     off_dC = pid_b * stride_dC_batch + pid_c * stride_dC_chunk + pid_g * stride_dC_group
-    tl.store(dC_ptr + off_dC + offs_m[:, None] * stride_dC_seqlen + c_d0_offs[None, :] * stride_dC_dstate,
-             dC_acc_0, mask=m_mask[:, None] & c_d0_mask[None, :])
+    tl.atomic_add(dC_ptr + off_dC + offs_m[:, None] * stride_dC_seqlen + c_d0_offs[None, :] * stride_dC_dstate,
+                  dC_acc_0, mask=m_mask[:, None] & c_d0_mask[None, :])
     if C_TILES > 1:
-        tl.store(dC_ptr + off_dC + offs_m[:, None] * stride_dC_seqlen + c_d1_offs[None, :] * stride_dC_dstate,
-                 dC_acc_1, mask=m_mask[:, None] & c_d1_mask[None, :])
+        tl.atomic_add(dC_ptr + off_dC + offs_m[:, None] * stride_dC_seqlen + c_d1_offs[None, :] * stride_dC_dstate,
+                      dC_acc_1, mask=m_mask[:, None] & c_d1_mask[None, :])
 
 
 # =============================================================================
@@ -878,8 +873,8 @@ def mamba3_chunk_scan_bwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, dy, scale, chunk
     dx_dt_b = torch.empty_like(x_dt_b)
     dBg = torch.zeros_like(Bg, dtype=torch.float32)  # atomic add target
     dBb = torch.zeros_like(Bb, dtype=torch.float32)
-    dC = torch.empty(batch, nchunks, L, ngroups, dstate, device=device, dtype=torch.float32)
-    ddA_m = torch.zeros(batch, nchunks, L, nheads, device=device, dtype=torch.float32)
+    dC = torch.zeros(batch, nchunks, L, ngroups, dstate, device=device, dtype=torch.float32)
+    ddA_m = torch.empty(batch, nchunks, L, nheads, device=device, dtype=torch.float32)
     ddA_k = torch.empty(batch, nchunks, L, nheads, device=device, dtype=torch.float32)
 
     # --- Kernel 2: dx_dt + dBg/dBb + ddA_k ---
@@ -921,7 +916,7 @@ def mamba3_chunk_scan_bwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, dy, scale, chunk
     )
 
     # --- Kernel 1: dC + ddA_m ---
-    grid_dC = (triton.cdiv(L, BLOCK_M), batch * nchunks, ngroups)
+    grid_dC = (triton.cdiv(L, BLOCK_M), batch * nchunks, nheads)
     _mamba3_chunk_scan_bwd_dC_kernel[grid_dC](
         Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
         dy,

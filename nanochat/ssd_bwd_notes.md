@@ -218,3 +218,28 @@ Added 3 backward tests to test_mamba3.py:
 - `test_triton_bwd_per_gradient`: Each gradient vs PyTorch (dBg, dBb, dx_dt_g/b, dC, ddA_cumsum), tol 0.02
 - `test_triton_bwd_multigroup`: 4 heads / 1 group, tests atomic dBg/dBb correctness
 - `test_triton_bwd_full_layer`: Full Mamba3Layer forward-backward with Triton, checks all params have gradients
+
+### Step 7: Performance fix — parallelize dC kernel over heads ✅
+**Problem:** Training 2x slower with Triton backward vs old PyTorch autograd fallback.
+
+**Root cause:** Kernel 1 (`_mamba3_chunk_scan_bwd_dC_kernel`) had grid `(cdiv(L,BLOCK_M), B*nc, ngroups)`.
+With `ngroups=1` (default), all `nheads_per_group` heads (e.g. 12) were serialized in the innermost
+`for h_idx in range(nheads_per_group)` loop inside a single thread block. This meant the GPU had
+only `2 * batch * nchunks * 1` blocks — terrible parallelism, and each block did 12x the work.
+
+Meanwhile Kernel 2 (dx) correctly parallelized over `nheads` in the grid.
+
+**Fix:**
+- Changed grid from `(cdiv(L,BLOCK_M), B*nc, ngroups)` → `(cdiv(L,BLOCK_M), B*nc, nheads)`
+- Each program handles **one head** instead of iterating all heads in a group
+- Removed the inner `for h_idx in range(nheads_per_group)` loop entirely
+- dA_cumsum for m positions now pre-loaded once (single head, persistent)
+- Decay computed once per k-block (not recomputed per head)
+- dC accumulated per-head, written via `tl.atomic_add` (multiple heads in same group contend)
+- ddA_m written via plain `tl.store` (each pid_h writes to distinct positions, no contention)
+- dC output changed from `torch.empty` → `torch.zeros` (needed for atomic_add target)
+- ddA_m output changed from `torch.zeros` → `torch.empty` (each position written exactly once)
+
+**Speedup:** ~nheads_per_group × (12x for typical config). Atomic contention on dC is minimal
+since only `nheads_per_group` programs per (m-block, batch-chunk) write to the same dC positions,
+and the write is a small (BLOCK_M, BLOCK_DSTATE) tile done once at the end of the kernel.
