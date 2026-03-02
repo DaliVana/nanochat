@@ -240,14 +240,27 @@ def _mamba3_intra_pytorch(Bg, Bb, x_dt_g, x_dt_b, cum_log_dA, C, scale, R, causa
     del log_decay_matrix
 
     hpg = n_heads // ngroups
+
+    # Batch CB scores across all R ranks in one GEMM (instead of R separate launches).
+    # C: (B, nc, L, ngroups, dstate), Bg: (B, nc, L, ngroups, R, dstate)
+    # -> scores: (B, nc, L_i, L_j, ngroups, R) via batched matmul
+    BN = batch_size * n_chunks
+    C_flat = C.reshape(BN * ngroups, L, dstate)                       # (BN*G, L, D)
+    Bg_flat = Bg.permute(0, 1, 3, 2, 4, 5).reshape(BN * ngroups, L * R, dstate)  # (BN*G, L*R, D)
+    Bb_flat = Bb.permute(0, 1, 3, 2, 4, 5).reshape(BN * ngroups, L * R, dstate)
+    all_scores_g = torch.bmm(C_flat, Bg_flat.transpose(-1, -2)).reshape(
+        batch_size, n_chunks, ngroups, L, L, R).permute(0, 1, 3, 4, 2, 5) * scale
+    all_scores_b = torch.bmm(C_flat, Bb_flat.transpose(-1, -2)).reshape(
+        batch_size, n_chunks, ngroups, L, L, R).permute(0, 1, 3, 4, 2, 5) * scale
+    del C_flat, Bg_flat, Bb_flat
+    # all_scores shape: (B, nc, L_i, L_j, ngroups, R)
+
     y_intra = torch.zeros(batch_size, n_chunks, L, n_heads, headdim,
                            device=Bg.device, dtype=torch.float32)
 
     for r in range(R):
-        Bg_r = Bg[:, :, :, :, r, :]
-        Bb_r = Bb[:, :, :, :, r, :]
-        scores_g = torch.einsum('bcign, bcjgn -> bcijg', C, Bg_r) * scale
-        scores_b = torch.einsum('bcign, bcjgn -> bcijg', C, Bb_r) * scale
+        scores_g = all_scores_g[..., r]   # (B, nc, L, L, ngroups)
+        scores_b = all_scores_b[..., r]
 
         if ngroups < n_heads:
             decay_grouped = decay_matrix.view(
@@ -267,6 +280,13 @@ def _mamba3_intra_pytorch(Bg, Bb, x_dt_g, x_dt_b, cum_log_dA, C, scale, R, causa
                            scores_b, x_dt_b[:, :, :, :, r, :]))
 
     return y_intra
+
+
+# Compiled version of _mamba3_intra_pytorch for CUDA backward. The whole-model
+# torch.compile treats the custom op as opaque, so the backward recomputation
+# runs eagerly. Compiling it independently lets the compiler fuse element-wise
+# ops (decay computation), unroll the R-loop, and optimize the autograd backward.
+_mamba3_intra_compiled = None
 
 
 # ---- Custom ops for torch.compile compatibility (Triton path) ----
@@ -295,7 +315,13 @@ if _HAS_TRITON:
         """Backward for within-chunk: PyTorch autograd (materializes L).
         cuBLAS batched GEMMs outperform hand-written Triton tiling for these shapes.
         Reconstructs rotated B/C from saved cos/sin, then inverse-rotates
-        gradients back to raw B/C space."""
+        gradients back to raw B/C space.
+
+        Uses torch.compile on the recomputation for fused ops and optimized
+        autograd backward (the whole-model compile treats the custom op as opaque,
+        so without this the backward runs entirely eagerly)."""
+        global _mamba3_intra_compiled
+
         (Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
          cos_ang, sin_ang, cos_angs, sin_angs) = ctx.saved_tensors
         scale = ctx.scale
@@ -318,6 +344,15 @@ if _HAS_TRITON:
             Bb_rot = Bb
 
         causal_mask = torch.triu(torch.ones(L, L, dtype=torch.bool, device=Bg.device), diagonal=1)
+
+        # Use compiled version on CUDA for fused ops and optimized autograd backward.
+        # Lazy init: first call triggers compilation, subsequent calls use the cache.
+        intra_fn = _mamba3_intra_pytorch
+        if Bg.device.type == 'cuda':
+            if _mamba3_intra_compiled is None:
+                _mamba3_intra_compiled = torch.compile(_mamba3_intra_pytorch, dynamic=False)
+            intra_fn = _mamba3_intra_compiled
+
         with torch.enable_grad():
             Bg_ = Bg_rot.float().detach().requires_grad_()
             Bb_ = Bb_rot.float().detach().requires_grad_()
@@ -325,8 +360,8 @@ if _HAS_TRITON:
             x_dt_b_ = x_dt_b.detach().requires_grad_()
             dA_cumsum_ = dA_cumsum.detach().requires_grad_()
             C_ = C_rot.float().detach().requires_grad_()
-            y_intra = _mamba3_intra_pytorch(Bg_, Bb_, x_dt_g_, x_dt_b_,
-                                             dA_cumsum_, C_, scale, R, causal_mask)
+            y_intra = intra_fn(Bg_, Bb_, x_dt_g_, x_dt_b_,
+                               dA_cumsum_, C_, scale, R, causal_mask)
             y_intra.backward(dy_intra)
 
         # Inverse-rotate gradients: dL/dBg_raw = R^{-1}(dL/dBg_rot)
