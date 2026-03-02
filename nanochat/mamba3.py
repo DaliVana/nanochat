@@ -242,18 +242,10 @@ def _mamba3_intra_pytorch(Bg, Bb, x_dt_g, x_dt_b, cum_log_dA, C, scale, R, causa
     hpg = n_heads // ngroups
 
     # Batch CB scores across all R ranks in one GEMM (instead of R separate launches).
-    # C: (B, nc, L, ngroups, dstate), Bg: (B, nc, L, ngroups, R, dstate)
-    # -> scores: (B, nc, L_i, L_j, ngroups, R) via batched matmul
-    BN = batch_size * n_chunks
-    C_flat = C.reshape(BN * ngroups, L, dstate)                       # (BN*G, L, D)
-    Bg_flat = Bg.permute(0, 1, 3, 2, 4, 5).reshape(BN * ngroups, L * R, dstate)  # (BN*G, L*R, D)
-    Bb_flat = Bb.permute(0, 1, 3, 2, 4, 5).reshape(BN * ngroups, L * R, dstate)
-    all_scores_g = torch.bmm(C_flat, Bg_flat.transpose(-1, -2)).reshape(
-        batch_size, n_chunks, ngroups, L, L, R).permute(0, 1, 3, 4, 2, 5) * scale
-    all_scores_b = torch.bmm(C_flat, Bb_flat.transpose(-1, -2)).reshape(
-        batch_size, n_chunks, ngroups, L, L, R).permute(0, 1, 3, 4, 2, 5) * scale
-    del C_flat, Bg_flat, Bb_flat
-    # all_scores shape: (B, nc, L_i, L_j, ngroups, R)
+    # einsum handles the non-adjacent G dimension correctly (no manual reshape needed).
+    # C: (B, nc, L_i, G, D), Bg: (B, nc, L_j, G, R, D) -> (B, nc, L_i, L_j, G, R)
+    all_scores_g = torch.einsum('bcign, bcjgrn -> bcijgr', C, Bg) * scale
+    all_scores_b = torch.einsum('bcign, bcjgrn -> bcijgr', C, Bb) * scale
 
     y_intra = torch.zeros(batch_size, n_chunks, L, n_heads, headdim,
                            device=Bg.device, dtype=torch.float32)
