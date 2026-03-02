@@ -196,7 +196,7 @@ def _compute_layer_types(config):
     """Compute per-layer type from layer_pattern string. Returns list of 'M' or 'A'."""
     pattern = config.layer_pattern.upper()
     assert all(c in "MA" for c in pattern), f"Invalid layer_pattern: {pattern}. Use only M and A."
-    assert any(c == 'A' for c in pattern), "layer_pattern must contain at least one A (attention) layer"
+
     return [pattern[i % len(pattern)] for i in range(config.n_layer)]
 
 
