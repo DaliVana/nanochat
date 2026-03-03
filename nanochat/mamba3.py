@@ -206,7 +206,7 @@ import torch.nn.functional as F
 # Triton kernels for CUDA (optional — falls back to PyTorch on CPU/MPS)
 _HAS_TRITON = False
 try:
-    from nanochat.ssd_triton import mamba3_chunk_scan_fwd
+    from nanochat.ssd_triton import mamba3_chunk_scan_fwd, _prerotate_for_scan
     _HAS_TRITON = True
 except ImportError:
     pass
@@ -379,6 +379,40 @@ def _apply_rope_pairs(x, cos, sin):
     x1 = x[..., :half]
     x2 = x[..., half:]
     return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+
+
+if _HAS_TRITON:
+    class _PrerotateForScan(torch.autograd.Function):
+        """Differentiable wrapper around the fused Triton RoPE pre-rotation kernel.
+
+        Forward: single fused Triton kernel for C+Bg+Bb rotation (1 launch
+        instead of 3 _apply_rope_pairs calls + 4 dtype casts).
+        Backward: inverse rotation via _apply_rope_pairs (Python).
+        """
+        @staticmethod
+        def forward(ctx, Bg, Bb, C, cos_ang, sin_ang, cos_angs, sin_angs):
+            Bg_rot, Bb_rot, C_rot = _prerotate_for_scan(
+                Bg, Bb, C, cos_ang, sin_ang, cos_angs, sin_angs)
+            ctx.save_for_backward(cos_ang, sin_ang, cos_angs, sin_angs)
+            return Bg_rot, Bb_rot, C_rot
+
+        @staticmethod
+        def backward(ctx, dBg_rot, dBb_rot, dC_rot):
+            cos_ang, sin_ang, cos_angs, sin_angs = ctx.saved_tensors
+            # Inverse rotation: negate sin
+            cos_a = cos_ang.unsqueeze(3)       # (batch, nc, L, 1, half_d)
+            neg_sin_a = (-sin_ang).unsqueeze(3)
+            cos_s = cos_angs.unsqueeze(3)
+            neg_sin_s = (-sin_angs).unsqueeze(3)
+
+            dC = _apply_rope_pairs(dC_rot, cos_a, neg_sin_a)
+            dBg = _apply_rope_pairs(
+                dBg_rot.float(), cos_a.unsqueeze(4), neg_sin_a.unsqueeze(4)
+            ).to(dBg_rot.dtype)
+            dBb = _apply_rope_pairs(
+                dBb_rot.float(), cos_s.unsqueeze(4), neg_sin_s.unsqueeze(4)
+            ).to(dBb_rot.dtype)
+            return dBg, dBb, dC, None, None, None, None
 
 
 class Mamba3Layer(nn.Module):
@@ -699,27 +733,17 @@ class Mamba3Layer(nn.Module):
                 scale, L, R)
         else:
             y_intra = _mamba3_intra_pytorch(
-                Bg.float(), Bb.float(), x_dt_g, x_dt_b, cum_log_dA, C_f,
-                scale, R, self._causal_mask)
+                Bg.float(), Bb.float(), x_dt_g.float(), x_dt_b.float(),
+                cum_log_dA, C_f, scale, R, self._causal_mask)
 
         # === BETWEEN-CHUNK: shared decay, combined delta_h ===
-        # Between-chunk needs rotated B/C — reuse pre-computed cos/sin
+        # Fused Triton pre-rotation: 1 kernel for C+Bg+Bb (replaces 3
+        # _apply_rope_pairs calls + 4 dtype casts). Outputs bf16 B, f32 C.
+        # Einsums auto-upcast bf16 B to f32 (decay_to_end is f32).
         if fused_rope:
-            input_dtype = Bg.dtype
-            cos_a = cos_a_f32.to(input_dtype)
-            sin_a = sin_a_f32.to(input_dtype)
-            cos_s = cos_s_f32.to(input_dtype)
-            sin_s = sin_s_f32.to(input_dtype)
+            Bg_rot, Bb_rot, C_rot = _PrerotateForScan.apply(
+                Bg, Bb, C_f, cos_a_f32, sin_a_f32, cos_s_f32, sin_s_f32)
             del cos_a_f32, sin_a_f32, cos_s_f32, sin_s_f32
-            # Rotate C: (batch, nc, L, ngroups, d_state) with cos/sin (batch, nc, L, half_d)
-            C_rot = _apply_rope_pairs(C_, cos_a.unsqueeze(3), sin_a.unsqueeze(3))
-            # Rotate Bg: (batch, nc, L, ngroups, R, d_state) with cos/sin
-            Bg_rot = _apply_rope_pairs(Bg, cos_a.unsqueeze(3).unsqueeze(4),
-                                       sin_a.unsqueeze(3).unsqueeze(4))
-            # Rotate Bb with shifted cos/sin (position t-1)
-            Bb_rot = _apply_rope_pairs(Bb, cos_s.unsqueeze(3).unsqueeze(4),
-                                       sin_s.unsqueeze(3).unsqueeze(4))
-            del cos_a, sin_a, cos_s, sin_s
         else:
             # B/C already rotated
             C_rot = C_
