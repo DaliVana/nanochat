@@ -66,15 +66,6 @@ def has_ve(layer_idx, n_layer):
     return False #layer_idx % 2 == (n_layer - 1) % 2
 
 
-def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4
-    d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:]
-    y1 = x1 * cos + x2 * sin
-    y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3)
-
-
 @torch.compiler.disable
 def _flash_attn_kvcache_eager(q, k_cache, v_cache, k=None, v=None,
                                cache_seqlens=None, window_size=(-1, -1)):
