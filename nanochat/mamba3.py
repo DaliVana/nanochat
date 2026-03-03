@@ -206,7 +206,7 @@ import torch.nn.functional as F
 # Triton kernels for CUDA (optional — falls back to PyTorch on CPU/MPS)
 _HAS_TRITON = False
 try:
-    from nanochat.ssd_triton import mamba3_chunk_scan_fwd, _prerotate_for_scan
+    from nanochat.ssd_triton import mamba3_chunk_scan_fwd
     _HAS_TRITON = True
 except ImportError:
     pass
@@ -285,7 +285,7 @@ if _HAS_TRITON:
         cos_ang: torch.Tensor, sin_ang: torch.Tensor,
         cos_angs: torch.Tensor, sin_angs: torch.Tensor,
         scale: float, chunk_size: int, mimo_rank: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
                                      cos_ang, sin_ang, cos_angs, sin_angs,
                                      scale, chunk_size, mimo_rank)
@@ -295,17 +295,25 @@ if _HAS_TRITON:
                                 cos_ang, sin_ang, cos_angs, sin_angs,
                                 scale, chunk_size, mimo_rank):
         batch, nchunks, L, nheads, R, headdim = x_dt_g.shape
-        return x_dt_g.new_empty(batch, nchunks, L, nheads, headdim, dtype=torch.bfloat16)
+        ngroups = C.shape[3]
+        dstate = C.shape[4]
+        return (
+            x_dt_g.new_empty(batch, nchunks, L, nheads, headdim, dtype=torch.bfloat16),
+            Bg.new_empty(batch, nchunks, L, ngroups, R, dstate, dtype=torch.bfloat16),
+            Bb.new_empty(batch, nchunks, L, ngroups, R, dstate, dtype=torch.bfloat16),
+            C.new_empty(batch, nchunks, L, ngroups, dstate),
+        )
 
-    def _mamba3_intra_autograd_bwd(ctx, dy_intra):
-        """Backward for within-chunk: PyTorch autograd (materializes L).
+    def _mamba3_intra_autograd_bwd(ctx, dy_intra, dBg_rot_ext, dBb_rot_ext, dC_rot_ext):
+        """Backward for within-chunk + between-chunk gradient accumulation.
+
+        The custom_op returns (y_intra, Bg_rot, Bb_rot, C_rot). Gradients arrive
+        from both within-chunk (dy_intra) and between-chunk (dBg/Bb/C_rot_ext)
+        uses of the rotated tensors. Both are inverse-rotated and summed.
+
         cuBLAS batched GEMMs outperform hand-written Triton tiling for these shapes.
-        Reconstructs rotated B/C from saved cos/sin, then inverse-rotates
-        gradients back to raw B/C space.
-
-        Note: aot_autograd (from the whole-model torch.compile) traces through
-        this function, so these operations ARE compiled. The batched BMM in
-        _mamba3_intra_pytorch merges R rank-wise CB computations into one GEMM."""
+        aot_autograd (from whole-model torch.compile) traces through this function,
+        so these operations ARE compiled."""
         (Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
          cos_ang, sin_ang, cos_angs, sin_angs) = ctx.saved_tensors
         scale = ctx.scale
@@ -342,9 +350,21 @@ if _HAS_TRITON:
         # Inverse-rotate gradients: dL/dBg_raw = R^{-1}(dL/dBg_rot)
         # Inverse rotation uses -sin (negate sin_a/sin_s).
         if fused:
-            dBg = _apply_rope_pairs(Bg_.grad, cos_a.unsqueeze(4), (-sin_a).unsqueeze(4))
-            dBb = _apply_rope_pairs(Bb_.grad, cos_s.unsqueeze(4), (-sin_s).unsqueeze(4))
+            neg_sin_a = (-sin_a).unsqueeze(4)
+            neg_sin_s = (-sin_s).unsqueeze(4)
+            cos_a4 = cos_a.unsqueeze(4)
+            cos_s4 = cos_s.unsqueeze(4)
+            # Within-chunk gradients (from dy_intra)
+            dBg = _apply_rope_pairs(Bg_.grad, cos_a4, neg_sin_a)
+            dBb = _apply_rope_pairs(Bb_.grad, cos_s4, neg_sin_s)
             dC = _apply_rope_pairs(C_.grad, cos_a, -sin_a)
+            # Between-chunk gradients (from rotated tensor outputs)
+            if dBg_rot_ext is not None:
+                dBg = dBg + _apply_rope_pairs(
+                    dBg_rot_ext.float(), cos_a4, neg_sin_a)
+                dBb = dBb + _apply_rope_pairs(
+                    dBb_rot_ext.float(), cos_s4, neg_sin_s)
+                dC = dC + _apply_rope_pairs(dC_rot_ext, cos_a, -sin_a)
         else:
             dBg = Bg_.grad
             dBb = Bb_.grad
@@ -379,40 +399,6 @@ def _apply_rope_pairs(x, cos, sin):
     x1 = x[..., :half]
     x2 = x[..., half:]
     return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
-
-
-if _HAS_TRITON:
-    class _PrerotateForScan(torch.autograd.Function):
-        """Differentiable wrapper around the fused Triton RoPE pre-rotation kernel.
-
-        Forward: single fused Triton kernel for C+Bg+Bb rotation (1 launch
-        instead of 3 _apply_rope_pairs calls + 4 dtype casts).
-        Backward: inverse rotation via _apply_rope_pairs (Python).
-        """
-        @staticmethod
-        def forward(ctx, Bg, Bb, C, cos_ang, sin_ang, cos_angs, sin_angs):
-            Bg_rot, Bb_rot, C_rot = _prerotate_for_scan(
-                Bg, Bb, C, cos_ang, sin_ang, cos_angs, sin_angs)
-            ctx.save_for_backward(cos_ang, sin_ang, cos_angs, sin_angs)
-            return Bg_rot, Bb_rot, C_rot
-
-        @staticmethod
-        def backward(ctx, dBg_rot, dBb_rot, dC_rot):
-            cos_ang, sin_ang, cos_angs, sin_angs = ctx.saved_tensors
-            # Inverse rotation: negate sin
-            cos_a = cos_ang.unsqueeze(3)       # (batch, nc, L, 1, half_d)
-            neg_sin_a = (-sin_ang).unsqueeze(3)
-            cos_s = cos_angs.unsqueeze(3)
-            neg_sin_s = (-sin_angs).unsqueeze(3)
-
-            dC = _apply_rope_pairs(dC_rot, cos_a, neg_sin_a)
-            dBg = _apply_rope_pairs(
-                dBg_rot.float(), cos_a.unsqueeze(4), neg_sin_a.unsqueeze(4)
-            ).to(dBg_rot.dtype)
-            dBb = _apply_rope_pairs(
-                dBb_rot.float(), cos_s.unsqueeze(4), neg_sin_s.unsqueeze(4)
-            ).to(dBb_rot.dtype)
-            return dBg, dBb, dC, None, None, None, None
 
 
 class Mamba3Layer(nn.Module):
@@ -706,8 +692,8 @@ class Mamba3Layer(nn.Module):
             angles_chunked = cum_angles.view(batch_size, n_chunks, L, half_d)
             angles_shifted_chunked = cum_angles_shifted.view(
                 batch_size, n_chunks, L, half_d)
-            # Pre-compute cos/sin once — shared by both within-chunk kernel and
-            # between-chunk rotation. Eliminates trig from Triton kernel.
+            # Pre-compute cos/sin once for the within-chunk kernel.
+            # Eliminates trig from Triton kernel.
             cos_a_f32 = torch.cos(angles_chunked)   # (batch, nc, L, half_d) float32
             sin_a_f32 = torch.sin(angles_chunked)
             cos_s_f32 = torch.cos(angles_shifted_chunked)
@@ -727,25 +713,18 @@ class Mamba3Layer(nn.Module):
         C_f = C_.float()
         if _HAS_TRITON and x_gamma.device.type == 'cuda':
             assert fused_rope, "Triton path requires fused RoPE (cum_angles must be provided)"
-            y_intra = _mamba3_intra_fwd_op(
+            # Custom op returns pre-rotated B/C alongside y_intra — rotation
+            # happens once (inside the scan kernel) and is shared with between-chunk.
+            y_intra, Bg_rot, Bb_rot, C_rot = _mamba3_intra_fwd_op(
                 Bg, Bb, x_dt_g, x_dt_b, cum_log_dA, C_f,
                 cos_a_f32, sin_a_f32, cos_s_f32, sin_s_f32,
                 scale, L, R)
+            del cos_a_f32, sin_a_f32, cos_s_f32, sin_s_f32
         else:
             y_intra = _mamba3_intra_pytorch(
                 Bg.float(), Bb.float(), x_dt_g.float(), x_dt_b.float(),
                 cum_log_dA, C_f, scale, R, self._causal_mask)
-
-        # === BETWEEN-CHUNK: shared decay, combined delta_h ===
-        # Fused Triton pre-rotation: 1 kernel for C+Bg+Bb (replaces 3
-        # _apply_rope_pairs calls + 4 dtype casts). Outputs bf16 B, f32 C.
-        # Einsums auto-upcast bf16 B to f32 (decay_to_end is f32).
-        if fused_rope:
-            Bg_rot, Bb_rot, C_rot = _PrerotateForScan.apply(
-                Bg, Bb, C_f, cos_a_f32, sin_a_f32, cos_s_f32, sin_s_f32)
-            del cos_a_f32, sin_a_f32, cos_s_f32, sin_s_f32
-        else:
-            # B/C already rotated
+            # B/C already rotated in non-fused path
             C_rot = C_
             Bg_rot = Bg
             Bb_rot = Bb

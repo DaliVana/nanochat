@@ -471,7 +471,10 @@ def mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
         chunk_size: int
         mimo_rank: int
     Returns:
-        y_intra: (batch, nchunks, chunk_size, nheads, headdim) bfloat16
+        y_intra:  (batch, nchunks, chunk_size, nheads, headdim) bfloat16
+        Bg_rot:   (batch, nchunks, chunk_size, ngroups, R, dstate) bfloat16
+        Bb_rot:   (batch, nchunks, chunk_size, ngroups, R, dstate) bfloat16
+        C_rot:    (batch, nchunks, chunk_size, ngroups, dstate) same dtype as C
     """
     batch, nchunks, L, nheads, R, headdim = x_dt_g.shape
     ngroups = C.shape[3]
@@ -510,4 +513,4 @@ def mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
         nchunks=nchunks, mimo_rank=R, scale=scale,
         BLOCK_DSTATE=BLOCK_DSTATE,
     )
-    return y_intra
+    return y_intra, Bg_rot, Bb_rot, C_rot
