@@ -36,7 +36,7 @@ def _rotary_embedding_kernel(
     q1 = tl.load(q_base + seq_dim_low, mask=seq_mask[:, None])
     q2 = tl.load(q_base + seq_dim_high, mask=seq_mask[:, None])
     tl.store(q_base + seq_dim_low, q1 * cos + q2 * sin, mask=seq_mask[:, None])
-    tl.store(q_base + seq_dim_high, q2 * cos - q1 * sin, mask=seq_mask[:, None])
+    tl.store(q_base + seq_dim_high, q1 * (-sin) + q2 * cos, mask=seq_mask[:, None])
 
     # Apply RoPE to corresponding K head (once per GQA group)
     if pid_head % GQA_RATIO == 0:
