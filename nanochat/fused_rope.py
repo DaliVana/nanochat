@@ -47,22 +47,11 @@ def _rotary_embedding_kernel(
         k1 = tl.load(k_base + k_seq_dim_low, mask=seq_mask[:, None])
         k2 = tl.load(k_base + k_seq_dim_high, mask=seq_mask[:, None])
         tl.store(k_base + k_seq_dim_low, k1 * cos + k2 * sin, mask=seq_mask[:, None])
-        tl.store(k_base + k_seq_dim_high, k2 * cos - k1 * sin, mask=seq_mask[:, None])
+        tl.store(k_base + k_seq_dim_high, k1 * (-sin) + k2 * cos, mask=seq_mask[:, None])
 
 
-def apply_rotary_emb_triton(q, k, cos, sin):
-    """
-    Applies Rotary Position Embedding in-place to Queries and Keys.
-    Each program handles one Q head and, for the first head in each GQA group,
-    also the corresponding K head — amortizing cos/sin loads.
-    Args:
-        q: (batch, seq, n_heads, head_dim)
-        k: (batch, seq, n_kv_heads, head_dim)
-        cos: (batch, seq, 1, head_dim // 2) or (1, seq, 1, head_dim // 2)
-        sin: (batch, seq, 1, head_dim // 2) or (1, seq, 1, head_dim // 2)
-    Returns:
-        q, k (both modified in place)
-    """
+def _launch_rotary_kernel(q, k, cos, sin):
+    """Launch the Triton rotary embedding kernel (in-place on q and k)."""
     batch, seqlen, n_heads, _ = q.shape
     _, _, n_kv_heads, _ = k.shape
     half_rot_dim = cos.shape[-1]
@@ -83,7 +72,39 @@ def apply_rotary_emb_triton(q, k, cos, sin):
         BLOCK_SEQ=BLOCK_SEQ, HALF_ROT_DIM=half_rot_dim,
         num_warps=num_warps,
     )
-    return q, k
+
+
+class _ApplyRotaryEmb(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, cos, sin):
+        q = q.clone()
+        k = k.clone()
+        _launch_rotary_kernel(q, k, cos, sin)
+        ctx.save_for_backward(cos, sin)
+        return q, k
+
+    @staticmethod
+    def backward(ctx, dq, dk):
+        cos, sin = ctx.saved_tensors
+        dq = dq.clone()
+        dk = dk.clone()
+        # Inverse rotation: same kernel with negated sin
+        _launch_rotary_kernel(dq, dk, cos, -sin)
+        return dq, dk, None, None
+
+
+def apply_rotary_emb_triton(q, k, cos, sin):
+    """
+    Applies Rotary Position Embedding to Queries and Keys with correct autograd support.
+    Args:
+        q: (batch, seq, n_heads, head_dim)
+        k: (batch, seq, n_kv_heads, head_dim)
+        cos: (batch, seq, 1, head_dim // 2) or (1, seq, 1, head_dim // 2)
+        sin: (batch, seq, 1, head_dim // 2) or (1, seq, 1, head_dim // 2)
+    Returns:
+        q, k (new tensors with rotary embeddings applied)
+    """
+    return _ApplyRotaryEmb.apply(q, k, cos, sin)
 
 
 @triton.jit

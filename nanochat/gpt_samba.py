@@ -108,15 +108,14 @@ class CausalSelfAttention(nn.Module):
         if kv_cache is None:
             # Training: sliding window attention with global RoPE
             cos, sin = cos_sin
-            # Fused Triton kernel applies this in-place
-            apply_rotary_emb_triton(q, k, cos, sin)
+            q, k = apply_rotary_emb_triton(q, k, cos, sin)
             q, k = norm(q), norm(k)
             y = flash_attn.flash_attn_func(q, k, v, causal=True,
                                            window_size=(self.sliding_window, 0))
         else:
             # Inference: use KV cache with sliding window
             cos, sin = cos_sin  # global positions for inference
-            apply_rotary_emb_triton(q, k, cos, sin)
+            q, k = apply_rotary_emb_triton(q, k, cos, sin)
             q, k = norm(q), norm(k)
 
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
