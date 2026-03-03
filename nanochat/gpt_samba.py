@@ -33,7 +33,7 @@ from nanochat.optim import MuonAdamW, DistMuonAdamW
 from nanochat.flash_attention import flash_attn
 from nanochat.mamba3 import Mamba3Layer
 
-from nanochat.fused_rope import apply_rotary_emb_triton
+from nanochat.fused_rope import apply_rotary_norm_triton
 
 
 @dataclass
@@ -108,15 +108,13 @@ class CausalSelfAttention(nn.Module):
         if kv_cache is None:
             # Training: sliding window attention with global RoPE
             cos, sin = cos_sin
-            q, k = apply_rotary_emb_triton(q, k, cos, sin)
-            q, k = norm(q), norm(k)
+            q, k = apply_rotary_norm_triton(q, k, cos, sin)
             y = flash_attn.flash_attn_func(q, k, v, causal=True,
                                            window_size=(self.sliding_window, 0))
         else:
             # Inference: use KV cache with sliding window
             cos, sin = cos_sin  # global positions for inference
-            q, k = apply_rotary_emb_triton(q, k, cos, sin)
-            q, k = norm(q), norm(k)
+            q, k = apply_rotary_norm_triton(q, k, cos, sin)
 
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
             y = _flash_attn_kvcache_eager(
