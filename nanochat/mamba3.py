@@ -339,8 +339,8 @@ if _HAS_TRITON:
         with torch.enable_grad():
             Bg_ = Bg_rot.float().detach().requires_grad_()
             Bb_ = Bb_rot.float().detach().requires_grad_()
-            x_dt_g_ = x_dt_g.detach().requires_grad_()
-            x_dt_b_ = x_dt_b.detach().requires_grad_()
+            x_dt_g_ = x_dt_g.float().detach().requires_grad_()
+            x_dt_b_ = x_dt_b.float().detach().requires_grad_()
             dA_cumsum_ = dA_cumsum.detach().requires_grad_()
             C_ = C_rot.float().detach().requires_grad_()
             y_intra = _mamba3_intra_pytorch(Bg_, Bb_, x_dt_g_, x_dt_b_,
