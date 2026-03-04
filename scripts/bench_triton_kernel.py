@@ -18,7 +18,7 @@ import json
 import torch
 import triton
 
-from nanochat.ssd_triton import mamba3_chunk_scan_fwd, _mamba3_chunk_scan_fwd_kernel, state_propagation_fwd
+from nanochat.ssd_triton import mamba3_chunk_scan_fwd, _mamba3_chunk_scan_fwd_kernel, state_propagation_fwd, delta_h_fwd
 
 
 PROFILES = {
@@ -188,6 +188,49 @@ def bench_state_propagation(cfg, warmup=25, rep=100):
     speedup = ms_python / ms_triton
     return dict(ms_triton=ms_triton, ms_python=ms_python, speedup=speedup,
                 gb_s=gb_s, n_chunks=nc)
+
+
+# ── delta_h benchmark ──────────────────────────────────────────────────────
+
+def bench_delta_h(cfg, warmup=25, rep=100):
+    """Benchmark the fused delta_h Triton kernel vs Python einsum loop."""
+    d_inner = cfg["expand"] * cfg["d_model"]
+    n_heads = d_inner // cfg["d_state"]
+    head_dim = d_inner // n_heads
+    d_state = cfg["d_state"]
+    batch = cfg["batch"]
+    R = cfg["mimo_rank"]
+    nc = cfg["seq_len"] // cfg["chunk_size"]
+    L = cfg["chunk_size"]
+    ngroups = cfg["ngroups"]
+
+    x_dt_g = torch.randn(batch, nc, L, n_heads, R, head_dim, device="cuda", dtype=torch.bfloat16)
+    x_dt_b = torch.randn(batch, nc, L, n_heads, R, head_dim, device="cuda", dtype=torch.bfloat16)
+    Bg_rot = torch.randn(batch, nc, L, ngroups, R, d_state, device="cuda", dtype=torch.bfloat16)
+    Bb_rot = torch.randn(batch, nc, L, ngroups, R, d_state, device="cuda", dtype=torch.bfloat16)
+    cum_log_dA = (-torch.rand(batch, nc, L, n_heads, device="cuda") * 0.1).cumsum(dim=2)
+
+    # Triton kernel
+    fn_triton = lambda: delta_h_fwd(x_dt_g, x_dt_b, Bg_rot, Bb_rot, cum_log_dA)
+    ms_triton = triton.testing.do_bench(fn_triton, warmup=warmup, rep=rep)
+
+    # Python einsum reference
+    def fn_python():
+        decay_to_end = torch.exp(cum_log_dA[:, :, -1:, :] - cum_log_dA)
+        dh = torch.zeros(batch, nc, n_heads, head_dim, d_state, device="cuda", dtype=torch.float32)
+        for r in range(R):
+            dh = dh + (
+                torch.einsum('bclh, bclhp, bclhn -> bchpn',
+                             decay_to_end, x_dt_g[:, :, :, :, r, :].float(),
+                             Bg_rot[:, :, :, :, r, :].float())
+                + torch.einsum('bclh, bclhp, bclhn -> bchpn',
+                               decay_to_end, x_dt_b[:, :, :, :, r, :].float(),
+                               Bb_rot[:, :, :, :, r, :].float()))
+        return dh
+    ms_python = triton.testing.do_bench(fn_python, warmup=warmup, rep=rep)
+
+    speedup = ms_python / ms_triton
+    return dict(ms_triton=ms_triton, ms_python=ms_python, speedup=speedup)
 
 
 # ── Layer-level benchmark ───────────────────────────────────────────────────
@@ -451,6 +494,17 @@ def main():
                 print(f"  [{name}] nc={r['n_chunks']}")
                 print(f"    Triton: {r['ms_triton']:.3f} ms | Python: {r['ms_python']:.3f} ms | "
                       f"Speedup: {r['speedup']:.2f}x | BW: {r['gb_s']:.0f} GB/s")
+                print("-" * 70)
+
+            print(sep)
+            print("DELTA_H (Triton vs Python einsum loop)")
+            print(sep)
+            for name, cfg in collect_configs(kernel_profiles):
+                r = bench_delta_h(cfg, args.warmup, args.rep)
+                results[f"delta_h/{name}"] = r
+                print(f"  [{name}] ({cfg_desc(cfg)})")
+                print(f"    Triton: {r['ms_triton']:.3f} ms | Python: {r['ms_python']:.3f} ms | "
+                      f"Speedup: {r['speedup']:.2f}x")
                 print("-" * 70)
 
         # Layer benchmarks

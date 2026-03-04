@@ -639,3 +639,243 @@ def state_propagation_fwd(delta_h, chunk_decay):
     )
 
     return all_states
+
+
+# =============================================================================
+# Fused between-chunk delta_h kernel (replaces Python R-loop of einsums)
+# =============================================================================
+
+@triton.autotune(
+    configs=[
+        # Full tile (head_dim=64, d_state=64)
+        triton.Config({'BLOCK_P': 64, 'BLOCK_N': 64, 'BLOCK_L': 64}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_P': 64, 'BLOCK_N': 64, 'BLOCK_L': 32}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_P': 64, 'BLOCK_N': 64, 'BLOCK_L': 64}, num_stages=1, num_warps=4),
+        triton.Config({'BLOCK_P': 64, 'BLOCK_N': 64, 'BLOCK_L': 32}, num_stages=1, num_warps=4),
+        # Larger d_state (128) or smaller tiles for higher occupancy
+        triton.Config({'BLOCK_P': 64, 'BLOCK_N': 64, 'BLOCK_L': 32}, num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_P': 32, 'BLOCK_N': 64, 'BLOCK_L': 32}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_P': 64, 'BLOCK_N': 32, 'BLOCK_L': 32}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_P': 32, 'BLOCK_N': 32, 'BLOCK_L': 64}, num_stages=2, num_warps=4),
+        # Large L-tile (reduces loop overhead for L=256)
+        triton.Config({'BLOCK_P': 64, 'BLOCK_N': 64, 'BLOCK_L': 128}, num_stages=1, num_warps=8),
+        triton.Config({'BLOCK_P': 32, 'BLOCK_N': 64, 'BLOCK_L': 128}, num_stages=1, num_warps=4),
+    ],
+    key=['head_dim', 'd_state', 'chunk_size', 'mimo_rank'],
+)
+@triton.jit
+def _delta_h_fwd_kernel(
+    # Inputs
+    x_dt_g_ptr,        # (B, nc, L, n_heads, R, head_dim) bf16
+    x_dt_b_ptr,        # (B, nc, L, n_heads, R, head_dim) bf16
+    Bg_rot_ptr,        # (B, nc, L, ngroups, R, d_state)  bf16
+    Bb_rot_ptr,        # (B, nc, L, ngroups, R, d_state)  bf16
+    cum_log_dA_ptr,    # (B, nc, L, n_heads)               f32
+    # Output
+    delta_h_ptr,       # (B, nc, n_heads, head_dim, d_state) f32
+    # Strides for x_dt_g (6D)
+    stride_xg_b, stride_xg_c, stride_xg_l, stride_xg_h, stride_xg_r, stride_xg_p,
+    # Strides for x_dt_b (6D)
+    stride_xb_b, stride_xb_c, stride_xb_l, stride_xb_h, stride_xb_r, stride_xb_p,
+    # Strides for Bg_rot (6D)
+    stride_Bg_b, stride_Bg_c, stride_Bg_l, stride_Bg_g, stride_Bg_r, stride_Bg_n,
+    # Strides for Bb_rot (6D)
+    stride_Bb_b, stride_Bb_c, stride_Bb_l, stride_Bb_g, stride_Bb_r, stride_Bb_n,
+    # Strides for cum_log_dA (4D)
+    stride_dA_b, stride_dA_c, stride_dA_l, stride_dA_h,
+    # Strides for delta_h (5D)
+    stride_dh_b, stride_dh_c, stride_dh_h, stride_dh_p, stride_dh_n,
+    # Dimensions
+    n_heads: tl.constexpr,
+    ngroups: tl.constexpr,
+    hpg: tl.constexpr,
+    head_dim: tl.constexpr,
+    d_state: tl.constexpr,
+    chunk_size: tl.constexpr,
+    mimo_rank: tl.constexpr,
+    # Block sizes (autotuned)
+    BLOCK_P: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_L: tl.constexpr,
+):
+    """Fused between-chunk delta_h: outer-product reduction over (L, R).
+
+    Computes decay_to_end = exp(dA_last - dA[l]) in registers from cum_log_dA,
+    avoiding a separate (B, nc, L, n_heads) allocation. The R-loop is unrolled
+    at compile time. bf16 tensor core dots with f32 accumulation.
+
+    delta_h[b,c,h,p,n] = sum_{r,l} decay_to_end[b,c,l,h] * (
+        x_dt_g[b,c,l,h,r,p] * Bg_rot[b,c,l,g(h),r,n]
+      + x_dt_b[b,c,l,h,r,p] * Bb_rot[b,c,l,g(h),r,n]
+    )
+
+    Grid: (cdiv(head_dim, BLOCK_P) * cdiv(d_state, BLOCK_N), batch * n_chunks * n_heads)
+    """
+    pid_tile = tl.program_id(0)
+    pid_bch = tl.program_id(1)
+
+    # Decompose: pid_bch = (b * n_chunks + c) * n_heads + h
+    # pid_bc = b * n_chunks + c — used with stride_c since stride_b = nc * stride_c
+    # for contiguous tensors.
+    pid_h = pid_bch % n_heads
+    pid_bc = pid_bch // n_heads
+
+    # Decompose tile into (head_dim, d_state) coordinates
+    n_tiles_n = tl.cdiv(d_state, BLOCK_N)
+    pid_p = pid_tile // n_tiles_n
+    pid_n = pid_tile % n_tiles_n
+
+    group_idx = pid_h // hpg
+
+    # Tile offsets
+    offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    p_mask = offs_p < head_dim
+    n_mask = offs_n < d_state
+
+    # Base pointers using strides (avoids needing n_chunks as constexpr)
+    # pid_bc = batch_idx * n_chunks + chunk_idx
+    # stride_xg_b already accounts for full batch stride
+    base_xg = pid_bc * stride_xg_c + pid_h * stride_xg_h
+    base_xb = pid_bc * stride_xb_c + pid_h * stride_xb_h
+    base_Bg = pid_bc * stride_Bg_c + group_idx * stride_Bg_g
+    base_Bb = pid_bc * stride_Bb_c + group_idx * stride_Bb_g
+    base_dA = pid_bc * stride_dA_c + pid_h * stride_dA_h
+
+    # Load cum_log_dA at L-1 (last position in chunk)
+    dA_last = tl.load(cum_log_dA_ptr + base_dA + (chunk_size - 1) * stride_dA_l)
+
+    # Accumulator
+    acc = tl.zeros((BLOCK_P, BLOCK_N), dtype=tl.float32)
+
+    # Reduction over L (tiled)
+    for l_start in range(0, chunk_size, BLOCK_L):
+        l_offs = l_start + tl.arange(0, BLOCK_L)
+        l_mask = l_offs < chunk_size
+
+        # Compute decay_to_end in registers
+        dA_vals = tl.load(cum_log_dA_ptr + base_dA + l_offs * stride_dA_l,
+                          mask=l_mask, other=0.0)
+        decay = tl.exp(dA_last - dA_vals)
+        decay = tl.where(l_mask, decay, 0.0)
+
+        # Unrolled R loop
+        for r in range(mimo_rank):
+            # Load x_dt_g[b, c, l, h, r, p]: (BLOCK_L, BLOCK_P)
+            xg = tl.load(
+                x_dt_g_ptr + base_xg
+                + l_offs[:, None] * stride_xg_l
+                + r * stride_xg_r
+                + offs_p[None, :] * stride_xg_p,
+                mask=l_mask[:, None] & p_mask[None, :],
+                other=0.0)
+
+            # Load x_dt_b[b, c, l, h, r, p]: (BLOCK_L, BLOCK_P)
+            xb = tl.load(
+                x_dt_b_ptr + base_xb
+                + l_offs[:, None] * stride_xb_l
+                + r * stride_xb_r
+                + offs_p[None, :] * stride_xb_p,
+                mask=l_mask[:, None] & p_mask[None, :],
+                other=0.0)
+
+            # Load Bg_rot[b, c, l, g, r, n]: (BLOCK_L, BLOCK_N)
+            bg = tl.load(
+                Bg_rot_ptr + base_Bg
+                + l_offs[:, None] * stride_Bg_l
+                + r * stride_Bg_r
+                + offs_n[None, :] * stride_Bg_n,
+                mask=l_mask[:, None] & n_mask[None, :],
+                other=0.0)
+
+            # Load Bb_rot[b, c, l, g, r, n]: (BLOCK_L, BLOCK_N)
+            bb = tl.load(
+                Bb_rot_ptr + base_Bb
+                + l_offs[:, None] * stride_Bb_l
+                + r * stride_Bb_r
+                + offs_n[None, :] * stride_Bb_n,
+                mask=l_mask[:, None] & n_mask[None, :],
+                other=0.0)
+
+            # Scale x by decay, cast to bf16 for tensor core dot
+            xg_s = (xg.to(tl.float32) * decay[:, None]).to(tl.bfloat16)
+            xb_s = (xb.to(tl.float32) * decay[:, None]).to(tl.bfloat16)
+
+            # Outer product reduction:
+            # (BLOCK_P, BLOCK_L) @ (BLOCK_L, BLOCK_N) -> (BLOCK_P, BLOCK_N)
+            acc += tl.dot(tl.trans(xg_s), bg)
+            acc += tl.dot(tl.trans(xb_s), bb)
+
+    # Store result
+    base_out = pid_bc * stride_dh_c + pid_h * stride_dh_h
+    tl.store(
+        delta_h_ptr + base_out
+        + offs_p[:, None] * stride_dh_p
+        + offs_n[None, :] * stride_dh_n,
+        acc,
+        mask=p_mask[:, None] & n_mask[None, :])
+
+
+def delta_h_fwd(x_dt_g, x_dt_b, Bg_rot, Bb_rot, cum_log_dA):
+    """Fused between-chunk delta_h computation.
+
+    Replaces the Python R-loop of einsums with a single Triton kernel that
+    computes decay_to_end in registers and unrolls the MIMO rank loop.
+
+    Args:
+        x_dt_g:     (B, nc, L, n_heads, R, head_dim) bf16
+        x_dt_b:     (B, nc, L, n_heads, R, head_dim) bf16
+        Bg_rot:     (B, nc, L, ngroups, R, d_state)  bf16
+        Bb_rot:     (B, nc, L, ngroups, R, d_state)  bf16
+        cum_log_dA: (B, nc, L, n_heads)               f32
+    Returns:
+        delta_h:    (B, nc, n_heads, head_dim, d_state) f32
+    """
+    batch, nc, L, n_heads, R, head_dim = x_dt_g.shape
+    ngroups = Bg_rot.shape[3]
+    d_state = Bg_rot.shape[5]
+    hpg = n_heads // ngroups
+
+    delta_h = torch.empty(batch, nc, n_heads, head_dim, d_state,
+                           device=x_dt_g.device, dtype=torch.float32)
+
+    # Flatten batch and n_chunks into one grid axis for simplicity.
+    # The stride-based addressing handles the actual memory layout.
+    # We pass x_dt_g pointer with batch stride folded into the chunk stride
+    # by setting base = pid_bc * stride_c where pid_bc = b * nc + c.
+    # This works because tensors are contiguous in (batch, nc, ...) layout,
+    # so stride_b = nc * stride_c for contiguous tensors.
+
+    grid = lambda META: (
+        triton.cdiv(head_dim, META['BLOCK_P']) * triton.cdiv(d_state, META['BLOCK_N']),
+        batch * nc * n_heads,
+    )
+
+    _delta_h_fwd_kernel[grid](
+        x_dt_g, x_dt_b, Bg_rot, Bb_rot, cum_log_dA,
+        delta_h,
+        # x_dt_g strides
+        x_dt_g.stride(0), x_dt_g.stride(1), x_dt_g.stride(2),
+        x_dt_g.stride(3), x_dt_g.stride(4), x_dt_g.stride(5),
+        # x_dt_b strides
+        x_dt_b.stride(0), x_dt_b.stride(1), x_dt_b.stride(2),
+        x_dt_b.stride(3), x_dt_b.stride(4), x_dt_b.stride(5),
+        # Bg_rot strides
+        Bg_rot.stride(0), Bg_rot.stride(1), Bg_rot.stride(2),
+        Bg_rot.stride(3), Bg_rot.stride(4), Bg_rot.stride(5),
+        # Bb_rot strides
+        Bb_rot.stride(0), Bb_rot.stride(1), Bb_rot.stride(2),
+        Bb_rot.stride(3), Bb_rot.stride(4), Bb_rot.stride(5),
+        # cum_log_dA strides
+        cum_log_dA.stride(0), cum_log_dA.stride(1),
+        cum_log_dA.stride(2), cum_log_dA.stride(3),
+        # delta_h strides
+        delta_h.stride(0), delta_h.stride(1), delta_h.stride(2),
+        delta_h.stride(3), delta_h.stride(4),
+        # Dimensions
+        n_heads=n_heads, ngroups=ngroups, hpg=hpg,
+        head_dim=head_dim, d_state=d_state,
+        chunk_size=L, mimo_rank=R,
+    )
+
+    return delta_h

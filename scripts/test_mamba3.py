@@ -588,6 +588,70 @@ def test_state_propagation_triton_vs_pytorch():
     return all_pass
 
 
+def test_delta_h_triton_vs_pytorch():
+    """Verify Triton delta_h kernel matches PyTorch einsum reference."""
+    from nanochat.ssd_triton import delta_h_fwd
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    configs = [
+        # (B, nc, L, n_heads, ngroups, R, head_dim, d_state)
+        (2, 4, 128, 4, 4, 2, 64, 64),     # ngroups == n_heads, R=2
+        (2, 4, 128, 8, 2, 2, 64, 64),     # ngroups < n_heads (hpg=4)
+        (2, 4, 64,  4, 1, 1, 64, 64),     # ngroups=1, R=1 (SISO)
+        (2, 4, 256, 4, 4, 4, 64, 128),    # large L, R=4, d_state=128
+        (1, 2, 128, 4, 2, 2, 128, 64),    # large head_dim
+    ]
+
+    all_pass = True
+    for B, nc, L, nh, ng, R, hd, ds in configs:
+        hpg = nh // ng
+        x_dt_g = torch.randn(B, nc, L, nh, R, hd, device=device, dtype=torch.bfloat16)
+        x_dt_b = torch.randn(B, nc, L, nh, R, hd, device=device, dtype=torch.bfloat16)
+        Bg_rot = torch.randn(B, nc, L, ng, R, ds, device=device, dtype=torch.bfloat16)
+        Bb_rot = torch.randn(B, nc, L, ng, R, ds, device=device, dtype=torch.bfloat16)
+        cum_log_dA = (-torch.rand(B, nc, L, nh, device=device) * 0.1).cumsum(dim=2)
+
+        # Triton
+        delta_h_triton = delta_h_fwd(x_dt_g, x_dt_b, Bg_rot, Bb_rot, cum_log_dA)
+
+        # Python reference
+        decay_to_end = torch.exp(cum_log_dA[:, :, -1:, :] - cum_log_dA)
+        delta_h_ref = torch.zeros(B, nc, nh, hd, ds, device=device, dtype=torch.float32)
+        if ng < nh:
+            decay_g = decay_to_end.view(B, nc, L, ng, hpg)
+            for r in range(R):
+                xg_r = x_dt_g[:, :, :, :, r, :].float().view(B, nc, L, ng, hpg, hd)
+                xb_r = x_dt_b[:, :, :, :, r, :].float().view(B, nc, L, ng, hpg, hd)
+                delta_h_ref += torch.einsum('bclgk, bclgkp, bclgn -> bcgkpn',
+                    decay_g, xg_r, Bg_rot[:, :, :, :, r, :].float()
+                ).reshape(B, nc, nh, hd, ds)
+                delta_h_ref += torch.einsum('bclgk, bclgkp, bclgn -> bcgkpn',
+                    decay_g, xb_r, Bb_rot[:, :, :, :, r, :].float()
+                ).reshape(B, nc, nh, hd, ds)
+        else:
+            for r in range(R):
+                delta_h_ref += torch.einsum('bclh, bclhp, bclhn -> bchpn',
+                    decay_to_end, x_dt_g[:, :, :, :, r, :].float(),
+                    Bg_rot[:, :, :, :, r, :].float())
+                delta_h_ref += torch.einsum('bclh, bclhp, bclhn -> bchpn',
+                    decay_to_end, x_dt_b[:, :, :, :, r, :].float(),
+                    Bb_rot[:, :, :, :, r, :].float())
+
+        max_diff = (delta_h_triton - delta_h_ref).abs().max().item()
+        rel_diff = max_diff / (delta_h_ref.abs().max().item() + 1e-8)
+        ok = rel_diff < 0.02  # bf16 dots have limited precision
+        if not ok:
+            print(f"    FAIL ({B},{nc},{L},{nh},{ng},{R},{hd},{ds}): "
+                  f"max_abs={max_diff:.6f}, rel={rel_diff:.6f}")
+            all_pass = False
+
+    print(f"  delta_h Triton vs Python ({len(configs)} configs): "
+          f"{'PASS' if all_pass else 'FAIL'}")
+    return all_pass
+
+
 def test_fused_rope_full_layer():
     """Test full Mamba3Layer with fused RoPE in Triton kernel (d_state=128, our target config).
 
@@ -701,6 +765,9 @@ if __name__ == "__main__":
 
         print("\n15. State propagation Triton vs Python:")
         all_pass &= test_state_propagation_triton_vs_pytorch()
+
+        print("\n16. delta_h Triton vs Python:")
+        all_pass &= test_delta_h_triton_vs_pytorch()
 
     if all_pass:
         print("\nAll tests PASSED!")

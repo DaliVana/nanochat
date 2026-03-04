@@ -206,7 +206,7 @@ import torch.nn.functional as F
 # Triton kernels for CUDA (optional — falls back to PyTorch on CPU/MPS)
 _HAS_TRITON = False
 try:
-    from nanochat.ssd_triton import mamba3_chunk_scan_fwd, state_propagation_fwd
+    from nanochat.ssd_triton import mamba3_chunk_scan_fwd, state_propagation_fwd, delta_h_fwd
     _HAS_TRITON = True
 except ImportError:
     pass
@@ -731,36 +731,41 @@ class Mamba3Layer(nn.Module):
             Bb_rot = Bb
 
         chunk_decay = torch.exp(cum_log_dA[:, :, -1, :])
-        decay_to_end = torch.exp(cum_log_dA[:, :, -1:, :] - cum_log_dA)
 
-        # Group-aware einsum: keep B in group space, restructure heads as (ngroups, hpg)
-        delta_h = torch.zeros(batch_size, n_chunks, n_heads, head_dim, d_state,
-                               device=x_gamma.device, dtype=torch.float32)
-        if ngroups < n_heads:
-            decay_to_end_g = decay_to_end.view(
-                batch_size, n_chunks, L, ngroups, hpg)
-            for r in range(R):
-                xg_r = x_dt_g[:, :, :, :, r, :].view(
-                    batch_size, n_chunks, L, ngroups, hpg, head_dim)
-                xb_r = x_dt_b[:, :, :, :, r, :].view(
-                    batch_size, n_chunks, L, ngroups, hpg, head_dim)
-                delta_h = delta_h + (
-                    torch.einsum('bclgk, bclgkp, bclgn -> bcgkpn',
-                                 decay_to_end_g, xg_r,
-                                 Bg_rot[:, :, :, :, r, :].float())
-                    + torch.einsum('bclgk, bclgkp, bclgn -> bcgkpn',
-                                   decay_to_end_g, xb_r,
-                                   Bb_rot[:, :, :, :, r, :].float())
-                ).reshape(batch_size, n_chunks, n_heads, head_dim, d_state)
+        # Between-chunk delta_h: outer-product reduction over (L, R).
+        # Triton kernel computes decay_to_end in registers from cum_log_dA.
+        if (_HAS_TRITON and x_gamma.device.type == 'cuda'
+                and not torch.compiler.is_compiling()):
+            delta_h = delta_h_fwd(x_dt_g, x_dt_b, Bg_rot, Bb_rot, cum_log_dA)
         else:
-            for r in range(R):
-                delta_h = delta_h + (
-                    torch.einsum('bclh, bclhp, bclhn -> bchpn',
-                                 decay_to_end, x_dt_g[:, :, :, :, r, :],
-                                 Bg_rot[:, :, :, :, r, :].float())
-                    + torch.einsum('bclh, bclhp, bclhn -> bchpn',
-                                   decay_to_end, x_dt_b[:, :, :, :, r, :],
-                                   Bb_rot[:, :, :, :, r, :].float()))
+            decay_to_end = torch.exp(cum_log_dA[:, :, -1:, :] - cum_log_dA)
+            delta_h = torch.zeros(batch_size, n_chunks, n_heads, head_dim, d_state,
+                                   device=x_gamma.device, dtype=torch.float32)
+            if ngroups < n_heads:
+                decay_to_end_g = decay_to_end.view(
+                    batch_size, n_chunks, L, ngroups, hpg)
+                for r in range(R):
+                    xg_r = x_dt_g[:, :, :, :, r, :].view(
+                        batch_size, n_chunks, L, ngroups, hpg, head_dim)
+                    xb_r = x_dt_b[:, :, :, :, r, :].view(
+                        batch_size, n_chunks, L, ngroups, hpg, head_dim)
+                    delta_h = delta_h + (
+                        torch.einsum('bclgk, bclgkp, bclgn -> bcgkpn',
+                                     decay_to_end_g, xg_r,
+                                     Bg_rot[:, :, :, :, r, :].float())
+                        + torch.einsum('bclgk, bclgkp, bclgn -> bcgkpn',
+                                       decay_to_end_g, xb_r,
+                                       Bb_rot[:, :, :, :, r, :].float())
+                    ).reshape(batch_size, n_chunks, n_heads, head_dim, d_state)
+            else:
+                for r in range(R):
+                    delta_h = delta_h + (
+                        torch.einsum('bclh, bclhp, bclhn -> bchpn',
+                                     decay_to_end, x_dt_g[:, :, :, :, r, :],
+                                     Bg_rot[:, :, :, :, r, :].float())
+                        + torch.einsum('bclh, bclhp, bclhn -> bchpn',
+                                       decay_to_end, x_dt_b[:, :, :, :, r, :],
+                                       Bb_rot[:, :, :, :, r, :].float()))
         del x_dt_g, x_dt_b
 
         # Single state propagation pass (instead of two)
