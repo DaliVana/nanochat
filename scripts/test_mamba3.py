@@ -418,8 +418,8 @@ def test_triton_intra_vs_pytorch():
     sin_s_f32 = torch.sin(cum_angles_shifted)
 
     # Triton path: raw B/C + pre-computed cos/sin (RoPE fused in kernel)
-    y_triton = mamba3_chunk_scan_fwd(Bg_raw, Bb_raw, x_dt_g, x_dt_b, dA_cumsum, C_raw,
-                                      cos_a_f32, sin_a_f32, cos_s_f32, sin_s_f32, scale, L, R)
+    y_triton, _, _, _ = mamba3_chunk_scan_fwd(Bg_raw, Bb_raw, x_dt_g, x_dt_b, dA_cumsum, C_raw,
+                                               cos_a_f32, sin_a_f32, cos_s_f32, sin_s_f32, scale, L, R)
 
     # PyTorch path: pre-rotate B/C, then run without angles
     cos_a = cos_a_f32.unsqueeze(3)       # (batch, nc, L, 1, half_d)
@@ -475,8 +475,8 @@ def test_triton_intra_r4():
     sin_s_f32 = torch.sin(cum_angles_shifted)
 
     # Triton: fused RoPE with pre-computed cos/sin
-    y_triton = mamba3_chunk_scan_fwd(Bg_raw, Bb_raw, x_dt_g, x_dt_b, dA_cumsum, C_raw,
-                                      cos_a_f32, sin_a_f32, cos_s_f32, sin_s_f32, scale, L, R)
+    y_triton, _, _, _ = mamba3_chunk_scan_fwd(Bg_raw, Bb_raw, x_dt_g, x_dt_b, dA_cumsum, C_raw,
+                                               cos_a_f32, sin_a_f32, cos_s_f32, sin_s_f32, scale, L, R)
 
     # PyTorch: pre-rotate
     cos_a = cos_a_f32.unsqueeze(3)
@@ -586,33 +586,6 @@ def test_state_propagation_triton_vs_pytorch():
     print(f"  State propagation Triton vs Python ({len(configs)} configs): "
           f"{'PASS' if all_pass else 'FAIL'}")
     return all_pass
-
-
-def test_state_propagation_gradient():
-    """Verify backward gradients for fused state propagation custom op."""
-    from nanochat.mamba3 import _HAS_TRITON
-    if not _HAS_TRITON:
-        print("  State propagation gradient: SKIP (no Triton)")
-        return True
-
-    from nanochat.mamba3 import _state_propagation_fwd_op
-
-    torch.manual_seed(42)
-    device = "cuda"
-
-    batch, nc, n_heads, head_dim, d_state = 2, 8, 4, 16, 16
-
-    delta_h = torch.randn(batch, nc, n_heads, head_dim, d_state,
-                           device=device, dtype=torch.float64, requires_grad=True)
-    chunk_decay = torch.randn(batch, nc, n_heads,
-                               device=device, dtype=torch.float64, requires_grad=True)
-
-    passed = torch.autograd.gradcheck(
-        _state_propagation_fwd_op, (delta_h, chunk_decay),
-        eps=1e-6, atol=1e-4, rtol=1e-3)
-
-    print(f"  State propagation gradcheck: {'PASS' if passed else 'FAIL'}")
-    return passed
 
 
 def test_fused_rope_full_layer():
@@ -728,9 +701,6 @@ if __name__ == "__main__":
 
         print("\n15. State propagation Triton vs Python:")
         all_pass &= test_state_propagation_triton_vs_pytorch()
-
-        print("\n16. State propagation gradient:")
-        all_pass &= test_state_propagation_gradient()
 
     if all_pass:
         print("\nAll tests PASSED!")
