@@ -692,6 +692,7 @@ def _delta_h_fwd_kernel(
     head_dim: tl.constexpr,
     d_state: tl.constexpr,
     chunk_size: tl.constexpr,
+    n_chunks: tl.constexpr,
     mimo_rank: tl.constexpr,
     # Block sizes (autotuned)
     BLOCK_P: tl.constexpr,
@@ -709,16 +710,14 @@ def _delta_h_fwd_kernel(
       + x_dt_b[b,c,l,h,r,p] * Bb_rot[b,c,l,g(h),r,n]
     )
 
-    Grid: (cdiv(head_dim, BLOCK_P) * cdiv(d_state, BLOCK_N), batch * n_chunks * n_heads)
+    Grid: (cdiv(head_dim, BLOCK_P) * cdiv(d_state, BLOCK_N), batch * n_chunks, n_heads)
     """
     pid_tile = tl.program_id(0)
-    pid_bch = tl.program_id(1)
+    pid_bc = tl.program_id(1)
+    pid_h = tl.program_id(2)
 
-    # Decompose: pid_bch = (b * n_chunks + c) * n_heads + h
-    # pid_bc = b * n_chunks + c — used with stride_c since stride_b = nc * stride_c
-    # for contiguous tensors.
-    pid_h = pid_bch % n_heads
-    pid_bc = pid_bch // n_heads
+    pid_b = pid_bc // n_chunks
+    pid_c = pid_bc % n_chunks
 
     # Decompose tile into (head_dim, d_state) coordinates
     n_tiles_n = tl.cdiv(d_state, BLOCK_N)
@@ -733,14 +732,12 @@ def _delta_h_fwd_kernel(
     p_mask = offs_p < head_dim
     n_mask = offs_n < d_state
 
-    # Base pointers using strides (avoids needing n_chunks as constexpr)
-    # pid_bc = batch_idx * n_chunks + chunk_idx
-    # stride_xg_b already accounts for full batch stride
-    base_xg = pid_bc * stride_xg_c + pid_h * stride_xg_h
-    base_xb = pid_bc * stride_xb_c + pid_h * stride_xb_h
-    base_Bg = pid_bc * stride_Bg_c + group_idx * stride_Bg_g
-    base_Bb = pid_bc * stride_Bb_c + group_idx * stride_Bb_g
-    base_dA = pid_bc * stride_dA_c + pid_h * stride_dA_h
+    # Base pointers
+    base_xg = pid_b * stride_xg_b + pid_c * stride_xg_c + pid_h * stride_xg_h
+    base_xb = pid_b * stride_xb_b + pid_c * stride_xb_c + pid_h * stride_xb_h
+    base_Bg = pid_b * stride_Bg_b + pid_c * stride_Bg_c + group_idx * stride_Bg_g
+    base_Bb = pid_b * stride_Bb_b + pid_c * stride_Bb_c + group_idx * stride_Bb_g
+    base_dA = pid_b * stride_dA_b + pid_c * stride_dA_c + pid_h * stride_dA_h
 
     # Load cum_log_dA at L-1 (last position in chunk)
     dA_last = tl.load(cum_log_dA_ptr + base_dA + (chunk_size - 1) * stride_dA_l)
@@ -807,7 +804,7 @@ def _delta_h_fwd_kernel(
             acc += tl.dot(tl.trans(xb_s), bb)
 
     # Store result
-    base_out = pid_bc * stride_dh_c + pid_h * stride_dh_h
+    base_out = pid_b * stride_dh_b + pid_c * stride_dh_c + pid_h * stride_dh_h
     tl.store(
         delta_h_ptr + base_out
         + offs_p[:, None] * stride_dh_p
@@ -839,16 +836,10 @@ def delta_h_fwd(x_dt_g, x_dt_b, Bg_rot, Bb_rot, cum_log_dA):
     delta_h = torch.empty(batch, nc, n_heads, head_dim, d_state,
                            device=x_dt_g.device, dtype=torch.float32)
 
-    # Flatten batch and n_chunks into one grid axis for simplicity.
-    # The stride-based addressing handles the actual memory layout.
-    # We pass x_dt_g pointer with batch stride folded into the chunk stride
-    # by setting base = pid_bc * stride_c where pid_bc = b * nc + c.
-    # This works because tensors are contiguous in (batch, nc, ...) layout,
-    # so stride_b = nc * stride_c for contiguous tensors.
-
     grid = lambda META: (
         triton.cdiv(head_dim, META['BLOCK_P']) * triton.cdiv(d_state, META['BLOCK_N']),
-        batch * nc * n_heads,
+        batch * nc,
+        n_heads,
     )
 
     _delta_h_fwd_kernel[grid](
@@ -875,7 +866,7 @@ def delta_h_fwd(x_dt_g, x_dt_b, Bg_rot, Bb_rot, cum_log_dA):
         # Dimensions
         n_heads=n_heads, ngroups=ngroups, hpg=hpg,
         head_dim=head_dim, d_state=d_state,
-        chunk_size=L, mimo_rank=R,
+        chunk_size=L, n_chunks=nc, mimo_rank=R,
     )
 
     return delta_h
