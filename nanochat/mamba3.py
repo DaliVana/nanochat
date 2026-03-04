@@ -206,7 +206,7 @@ import torch.nn.functional as F
 # Triton kernels for CUDA (optional — falls back to PyTorch on CPU/MPS)
 _HAS_TRITON = False
 try:
-    from nanochat.ssd_triton import mamba3_chunk_scan_fwd
+    from nanochat.ssd_triton import mamba3_chunk_scan_fwd, state_propagation_fwd
     _HAS_TRITON = True
 except ImportError:
     pass
@@ -384,6 +384,47 @@ if _HAS_TRITON:
 
     _mamba3_intra_fwd_op.register_autograd(
         _mamba3_intra_autograd_bwd, setup_context=_mamba3_intra_setup_context)
+
+    # ---- Fused state propagation custom op ----
+
+    @torch.library.custom_op("nanochat::state_propagation_fwd", mutates_args=())
+    def _state_propagation_fwd_op(
+        delta_h: torch.Tensor,
+        chunk_decay: torch.Tensor,
+    ) -> torch.Tensor:
+        return state_propagation_fwd(delta_h, chunk_decay)
+
+    @_state_propagation_fwd_op.register_fake
+    def _state_propagation_fwd_fake(delta_h, chunk_decay):
+        return delta_h.new_empty(delta_h.shape)
+
+    def _state_propagation_autograd_bwd(ctx, d_all_states):
+        """Backward for state propagation — reverse sequential loop.
+
+        aot_autograd (from whole-model torch.compile) traces through this
+        function, so these operations ARE compiled."""
+        all_states, chunk_decay = ctx.saved_tensors
+        nc = all_states.shape[1]
+
+        adjoint = all_states.new_zeros(all_states.shape[0], *all_states.shape[2:])
+        d_delta_h = torch.zeros_like(all_states)
+        d_chunk_decay = torch.zeros_like(chunk_decay)
+
+        for c in range(nc - 2, -1, -1):
+            adjoint = adjoint + d_all_states[:, c + 1]
+            d_delta_h[:, c] = adjoint
+            d_chunk_decay[:, c] = (adjoint * all_states[:, c]).sum(dim=(-2, -1))
+            adjoint = adjoint * chunk_decay[:, c, :, None, None]
+
+        return d_delta_h, d_chunk_decay
+
+    def _state_propagation_setup_context(ctx, inputs, output):
+        _, chunk_decay = inputs
+        ctx.save_for_backward(output, chunk_decay)
+
+    _state_propagation_fwd_op.register_autograd(
+        _state_propagation_autograd_bwd,
+        setup_context=_state_propagation_setup_context)
 
 
 def _apply_rope_pairs(x, cos, sin):
@@ -763,12 +804,15 @@ class Mamba3Layer(nn.Module):
         del x_dt_g, x_dt_b
 
         # Single state propagation pass (instead of two)
-        states = delta_h.new_zeros(batch_size, n_heads, head_dim, d_state)
-        all_states = []
-        for c in range(n_chunks):
-            all_states.append(states)
-            states = chunk_decay[:, c, :, None, None] * states + delta_h[:, c]
-        all_states = torch.stack(all_states, dim=1)
+        if _HAS_TRITON and delta_h.device.type == 'cuda':
+            all_states = _state_propagation_fwd_op(delta_h, chunk_decay)
+        else:
+            states = delta_h.new_zeros(batch_size, n_heads, head_dim, d_state)
+            all_states = []
+            for c in range(n_chunks):
+                all_states.append(states)
+                states = chunk_decay[:, c, :, None, None] * states + delta_h[:, c]
+            all_states = torch.stack(all_states, dim=1)
         del delta_h
 
         # Inter-chunk output — group-aware einsum avoids repeat_interleave.

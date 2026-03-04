@@ -18,7 +18,7 @@ import json
 import torch
 import triton
 
-from nanochat.ssd_triton import mamba3_chunk_scan_fwd, _mamba3_chunk_scan_fwd_kernel
+from nanochat.ssd_triton import mamba3_chunk_scan_fwd, _mamba3_chunk_scan_fwd_kernel, state_propagation_fwd
 
 
 PROFILES = {
@@ -148,6 +148,46 @@ def bench_kernel(cfg, warmup=25, rep=100):
 
     return dict(ms=ms, gb_s=gb_s, tflops=tflops, block_info=block_info,
                 input_mb=input_mb, out_mb=out_mb)
+
+
+# ── State propagation benchmark ────────────────────────────────────────────
+
+def bench_state_propagation(cfg, warmup=25, rep=100):
+    """Benchmark the fused state propagation kernel vs Python loop."""
+    d_inner = cfg["expand"] * cfg["d_model"]
+    n_heads = d_inner // cfg["d_state"]
+    head_dim = d_inner // n_heads
+    d_state = cfg["d_state"]
+    batch = cfg["batch"]
+    nc = cfg["seq_len"] // cfg["chunk_size"]
+
+    delta_h = torch.randn(batch, nc, n_heads, head_dim, d_state,
+                           device="cuda", dtype=torch.float32)
+    chunk_decay = torch.rand(batch, nc, n_heads,
+                              device="cuda", dtype=torch.float32)
+
+    # Triton kernel
+    fn_triton = lambda: state_propagation_fwd(delta_h, chunk_decay)
+    ms_triton = triton.testing.do_bench(fn_triton, warmup=warmup, rep=rep)
+
+    # Python loop reference
+    def fn_python():
+        states = delta_h.new_zeros(batch, n_heads, head_dim, d_state)
+        all_s = []
+        for c in range(nc):
+            all_s.append(states)
+            states = chunk_decay[:, c, :, None, None] * states + delta_h[:, c]
+        return torch.stack(all_s, dim=1)
+    ms_python = triton.testing.do_bench(fn_python, warmup=warmup, rep=rep)
+
+    # Bandwidth: read delta_h + chunk_decay, write all_states
+    total_bytes = (delta_h.nelement() * 4 + chunk_decay.nelement() * 4
+                   + delta_h.nelement() * 4)
+    gb_s = total_bytes / (ms_triton * 1e-3) / 1e9
+
+    speedup = ms_python / ms_triton
+    return dict(ms_triton=ms_triton, ms_python=ms_python, speedup=speedup,
+                gb_s=gb_s, n_chunks=nc)
 
 
 # ── Layer-level benchmark ───────────────────────────────────────────────────
@@ -400,6 +440,17 @@ def main():
                 r = bench_kernel(cfg, args.warmup, args.rep)
                 results[f"kernel/{name}"] = r
                 print_kernel_result(name, cfg, r, peak_bw, peak_tflops, baseline)
+                print("-" * 70)
+
+            print(sep)
+            print("STATE PROPAGATION (Triton vs Python loop)")
+            print(sep)
+            for name, cfg in collect_configs(kernel_profiles):
+                r = bench_state_propagation(cfg, args.warmup, args.rep)
+                results[f"state_prop/{name}"] = r
+                print(f"  [{name}] nc={r['n_chunks']}")
+                print(f"    Triton: {r['ms_triton']:.3f} ms | Python: {r['ms_python']:.3f} ms | "
+                      f"Speedup: {r['speedup']:.2f}x | BW: {r['gb_s']:.0f} GB/s")
                 print("-" * 70)
 
         # Layer benchmarks

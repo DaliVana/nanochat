@@ -514,3 +514,128 @@ def mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
         BLOCK_DSTATE=BLOCK_DSTATE,
     )
     return y_intra, Bg_rot, Bb_rot, C_rot
+
+
+# =============================================================================
+# Fused state propagation kernel (between-chunk sequential scan)
+# =============================================================================
+
+@triton.jit
+def _state_propagation_fwd_kernel(
+    # Inputs
+    delta_h_ptr,       # (batch, n_chunks, n_heads, head_dim, d_state) float32
+    chunk_decay_ptr,   # (batch, n_chunks, n_heads) float32
+    # Output
+    all_states_ptr,    # (batch, n_chunks, n_heads, head_dim, d_state) float32
+    # Strides for delta_h (5D): batch, chunk, head, headdim, dstate
+    stride_dh_b, stride_dh_c, stride_dh_h, stride_dh_p, stride_dh_n,
+    # Strides for chunk_decay (3D): batch, chunk, head
+    stride_cd_b, stride_cd_c, stride_cd_h,
+    # Strides for all_states (5D): batch, chunk, head, headdim, dstate
+    stride_as_b, stride_as_c, stride_as_h, stride_as_p, stride_as_n,
+    # Dimensions
+    n_chunks: tl.constexpr,
+    n_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    d_state: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Fused sequential state propagation across chunks.
+
+    Replaces n_chunks separate kernel launches with a single launch.
+    Each program handles a (BLOCK_P, BLOCK_N) tile of the state matrix
+    for one (batch, head) pair, iterating sequentially over chunks.
+
+    Computes:
+        all_states[0] = zeros
+        all_states[c+1] = chunk_decay[c] * all_states[c] + delta_h[c]  for c=0..nc-2
+
+    Grid: (cdiv(head_dim, BLOCK_P) * cdiv(d_state, BLOCK_N), batch * n_heads)
+    """
+    pid_tile = tl.program_id(0)
+    pid_bh = tl.program_id(1)
+
+    # Decompose batch*head index
+    pid_b = pid_bh // n_heads
+    pid_h = pid_bh % n_heads
+
+    # Decompose tile index into (head_dim, d_state) tile coordinates
+    n_tiles_n = tl.cdiv(d_state, BLOCK_N)
+    pid_p = pid_tile // n_tiles_n
+    pid_n = pid_tile % n_tiles_n
+
+    offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    tile_mask = (offs_p[:, None] < head_dim) & (offs_n[None, :] < d_state)
+
+    # Base pointers for this (batch, head) slice
+    base_dh = pid_b * stride_dh_b + pid_h * stride_dh_h
+    base_cd = pid_b * stride_cd_b + pid_h * stride_cd_h
+    base_as = pid_b * stride_as_b + pid_h * stride_as_h
+
+    # Reusable offset pattern for (head_dim, d_state) tile
+    tile_offsets = offs_p[:, None] * stride_dh_p + offs_n[None, :] * stride_dh_n
+    tile_offsets_as = offs_p[:, None] * stride_as_p + offs_n[None, :] * stride_as_n
+
+    # Initialize state to zeros
+    state = tl.zeros((BLOCK_P, BLOCK_N), dtype=tl.float32)
+
+    for c in range(n_chunks):
+        # Store state BEFORE update: all_states[c] = state
+        tl.store(all_states_ptr + base_as + c * stride_as_c + tile_offsets_as,
+                 state, mask=tile_mask)
+
+        # Load chunk_decay[b, c, h] — scalar per program
+        decay = tl.load(chunk_decay_ptr + base_cd + c * stride_cd_c)
+
+        # Load delta_h[b, c, h, :, :] tile
+        dh = tl.load(delta_h_ptr + base_dh + c * stride_dh_c + tile_offsets,
+                     mask=tile_mask, other=0.0)
+
+        # Recurrence: state = decay * state + delta_h
+        state = decay * state + dh
+
+
+def state_propagation_fwd(delta_h, chunk_decay):
+    """Fused state propagation for between-chunk SSD computation.
+
+    Computes the prefix scan:
+        all_states[0] = zeros
+        all_states[c+1] = chunk_decay[c] * all_states[c] + delta_h[c]  for c=0..nc-2
+
+    Returns all_states[0..nc-1] (state BEFORE each chunk's update).
+
+    Args:
+        delta_h:     (batch, n_chunks, n_heads, head_dim, d_state) float32
+        chunk_decay: (batch, n_chunks, n_heads) float32
+    Returns:
+        all_states:  (batch, n_chunks, n_heads, head_dim, d_state) float32
+    """
+    batch, n_chunks, n_heads, head_dim, d_state = delta_h.shape
+
+    all_states = torch.empty_like(delta_h)
+
+    BLOCK_P = min(64, triton.next_power_of_2(head_dim))
+    BLOCK_N = min(64, triton.next_power_of_2(d_state))
+    num_warps = 2 if BLOCK_P * BLOCK_N <= 2048 else 4
+
+    grid = (
+        triton.cdiv(head_dim, BLOCK_P) * triton.cdiv(d_state, BLOCK_N),
+        batch * n_heads,
+    )
+
+    _state_propagation_fwd_kernel[grid](
+        delta_h, chunk_decay, all_states,
+        delta_h.stride(0), delta_h.stride(1), delta_h.stride(2),
+        delta_h.stride(3), delta_h.stride(4),
+        chunk_decay.stride(0), chunk_decay.stride(1), chunk_decay.stride(2),
+        all_states.stride(0), all_states.stride(1), all_states.stride(2),
+        all_states.stride(3), all_states.stride(4),
+        n_chunks=n_chunks, n_heads=n_heads,
+        head_dim=head_dim, d_state=d_state,
+        BLOCK_P=BLOCK_P, BLOCK_N=BLOCK_N,
+        num_warps=num_warps,
+    )
+
+    return all_states

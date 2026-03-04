@@ -542,6 +542,79 @@ def test_triton_full_layer_gradient():
     return all_ok
 
 
+def test_state_propagation_triton_vs_pytorch():
+    """Verify Triton state propagation kernel matches Python loop reference."""
+    from nanochat.ssd_triton import state_propagation_fwd
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    configs = [
+        (4, 16, 8, 64, 64),    # standard
+        (2, 8, 4, 128, 128),   # large head_dim/d_state (4 tiles)
+        (2, 32, 4, 64, 128),   # asymmetric
+        (2, 1, 4, 64, 64),     # edge case: single chunk (all zeros output)
+    ]
+
+    all_pass = True
+    for batch, nc, n_heads, head_dim, d_state in configs:
+        delta_h = torch.randn(batch, nc, n_heads, head_dim, d_state,
+                               device=device, dtype=torch.float32)
+        chunk_decay = torch.rand(batch, nc, n_heads,
+                                  device=device, dtype=torch.float32)
+
+        # Triton
+        all_states_triton = state_propagation_fwd(delta_h, chunk_decay)
+
+        # Python reference
+        states = torch.zeros(batch, n_heads, head_dim, d_state, device=device)
+        ref = []
+        for c in range(nc):
+            ref.append(states)
+            states = chunk_decay[:, c, :, None, None] * states + delta_h[:, c]
+        all_states_ref = torch.stack(ref, dim=1)
+
+        max_diff = (all_states_triton - all_states_ref).abs().max().item()
+        rel_diff = max_diff / (all_states_ref.abs().max().item() + 1e-8)
+
+        ok = rel_diff < 1e-5
+        if not ok:
+            print(f"    FAIL config ({batch},{nc},{n_heads},{head_dim},{d_state}): "
+                  f"max_abs={max_diff:.8f}, rel={rel_diff:.8f}")
+            all_pass = False
+
+    print(f"  State propagation Triton vs Python ({len(configs)} configs): "
+          f"{'PASS' if all_pass else 'FAIL'}")
+    return all_pass
+
+
+def test_state_propagation_gradient():
+    """Verify backward gradients for fused state propagation custom op."""
+    from nanochat.mamba3 import _HAS_TRITON
+    if not _HAS_TRITON:
+        print("  State propagation gradient: SKIP (no Triton)")
+        return True
+
+    from nanochat.mamba3 import _state_propagation_fwd_op
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    batch, nc, n_heads, head_dim, d_state = 2, 8, 4, 16, 16
+
+    delta_h = torch.randn(batch, nc, n_heads, head_dim, d_state,
+                           device=device, dtype=torch.float64, requires_grad=True)
+    chunk_decay = torch.randn(batch, nc, n_heads,
+                               device=device, dtype=torch.float64, requires_grad=True)
+
+    passed = torch.autograd.gradcheck(
+        _state_propagation_fwd_op, (delta_h, chunk_decay),
+        eps=1e-6, atol=1e-4, rtol=1e-3)
+
+    print(f"  State propagation gradcheck: {'PASS' if passed else 'FAIL'}")
+    return passed
+
+
 def test_fused_rope_full_layer():
     """Test full Mamba3Layer with fused RoPE in Triton kernel (d_state=128, our target config).
 
@@ -652,6 +725,12 @@ if __name__ == "__main__":
 
         print("\n14. Fused RoPE full layer (CPU vs CUDA):")
         all_pass &= test_fused_rope_full_layer()
+
+        print("\n15. State propagation Triton vs Python:")
+        all_pass &= test_state_propagation_triton_vs_pytorch()
+
+        print("\n16. State propagation gradient:")
+        all_pass &= test_state_propagation_gradient()
 
     if all_pass:
         print("\nAll tests PASSED!")
