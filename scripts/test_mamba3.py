@@ -411,21 +411,15 @@ def test_triton_intra_vs_pytorch():
     cum_angles = torch.randn(batch, nc, L, half_d, device=device, dtype=torch.float32) * 0.5
     cum_angles_shifted = torch.randn(batch, nc, L, half_d, device=device, dtype=torch.float32) * 0.5
 
-    # Pre-compute cos/sin (as the kernel now expects)
-    cos_a_f32 = torch.cos(cum_angles)
-    sin_a_f32 = torch.sin(cum_angles)
-    cos_s_f32 = torch.cos(cum_angles_shifted)
-    sin_s_f32 = torch.sin(cum_angles_shifted)
-
-    # Triton path: raw B/C + pre-computed cos/sin (RoPE fused in kernel)
+    # Triton path: raw B/C + raw angles (cos/sin computed in-kernel)
     y_triton, _, _, _ = mamba3_chunk_scan_fwd(Bg_raw, Bb_raw, x_dt_g, x_dt_b, dA_cumsum, C_raw,
-                                               cos_a_f32, sin_a_f32, cos_s_f32, sin_s_f32, scale, L, R)
+                                               cum_angles, cum_angles_shifted, scale, L, R)
 
     # PyTorch path: pre-rotate B/C, then run without angles
-    cos_a = cos_a_f32.unsqueeze(3)       # (batch, nc, L, 1, half_d)
-    sin_a = sin_a_f32.unsqueeze(3)
-    cos_s = cos_s_f32.unsqueeze(3)
-    sin_s = sin_s_f32.unsqueeze(3)
+    cos_a = torch.cos(cum_angles).unsqueeze(3)       # (batch, nc, L, 1, half_d)
+    sin_a = torch.sin(cum_angles).unsqueeze(3)
+    cos_s = torch.cos(cum_angles_shifted).unsqueeze(3)
+    sin_s = torch.sin(cum_angles_shifted).unsqueeze(3)
     Bg_rot = _apply_rope_pairs(Bg_raw, cos_a.unsqueeze(4), sin_a.unsqueeze(4))
     Bb_rot = _apply_rope_pairs(Bb_raw, cos_s.unsqueeze(4), sin_s.unsqueeze(4))
     C_rot = _apply_rope_pairs(C_raw, cos_a, sin_a)
@@ -468,21 +462,15 @@ def test_triton_intra_r4():
     cum_angles = torch.randn(batch, nc, L, half_d, device=device, dtype=torch.float32) * 0.5
     cum_angles_shifted = torch.randn(batch, nc, L, half_d, device=device, dtype=torch.float32) * 0.5
 
-    # Pre-compute cos/sin
-    cos_a_f32 = torch.cos(cum_angles)
-    sin_a_f32 = torch.sin(cum_angles)
-    cos_s_f32 = torch.cos(cum_angles_shifted)
-    sin_s_f32 = torch.sin(cum_angles_shifted)
-
-    # Triton: fused RoPE with pre-computed cos/sin
+    # Triton: raw angles (cos/sin computed in-kernel)
     y_triton, _, _, _ = mamba3_chunk_scan_fwd(Bg_raw, Bb_raw, x_dt_g, x_dt_b, dA_cumsum, C_raw,
-                                               cos_a_f32, sin_a_f32, cos_s_f32, sin_s_f32, scale, L, R)
+                                               cum_angles, cum_angles_shifted, scale, L, R)
 
     # PyTorch: pre-rotate
-    cos_a = cos_a_f32.unsqueeze(3)
-    sin_a = sin_a_f32.unsqueeze(3)
-    cos_s = cos_s_f32.unsqueeze(3)
-    sin_s = sin_s_f32.unsqueeze(3)
+    cos_a = torch.cos(cum_angles).unsqueeze(3)
+    sin_a = torch.sin(cum_angles).unsqueeze(3)
+    cos_s = torch.cos(cum_angles_shifted).unsqueeze(3)
+    sin_s = torch.sin(cum_angles_shifted).unsqueeze(3)
     Bg_rot = _apply_rope_pairs(Bg_raw, cos_a.unsqueeze(4), sin_a.unsqueeze(4))
     Bb_rot = _apply_rope_pairs(Bb_raw, cos_s.unsqueeze(4), sin_s.unsqueeze(4))
     C_rot = _apply_rope_pairs(C_raw, cos_a, sin_a)
@@ -606,7 +594,7 @@ def test_delta_h_triton_vs_pytorch():
 
     all_pass = True
     for B, nc, L, nh, ng, R, hd, ds in configs:
-        hpg = nh // ng
+        nheads_per_group = nh // ng
         x_dt_g = torch.randn(B, nc, L, nh, R, hd, device=device, dtype=torch.bfloat16)
         x_dt_b = torch.randn(B, nc, L, nh, R, hd, device=device, dtype=torch.bfloat16)
         Bg_rot = torch.randn(B, nc, L, ng, R, ds, device=device, dtype=torch.bfloat16)
@@ -620,10 +608,10 @@ def test_delta_h_triton_vs_pytorch():
         decay_to_end = torch.exp(cum_log_dA[:, :, -1:, :] - cum_log_dA)
         delta_h_ref = torch.zeros(B, nc, nh, hd, ds, device=device, dtype=torch.float32)
         if ng < nh:
-            decay_g = decay_to_end.view(B, nc, L, ng, hpg)
+            decay_g = decay_to_end.view(B, nc, L, ng, nheads_per_group)
             for r in range(R):
-                xg_r = x_dt_g[:, :, :, :, r, :].float().view(B, nc, L, ng, hpg, hd)
-                xb_r = x_dt_b[:, :, :, :, r, :].float().view(B, nc, L, ng, hpg, hd)
+                xg_r = x_dt_g[:, :, :, :, r, :].float().view(B, nc, L, ng, nheads_per_group, hd)
+                xb_r = x_dt_b[:, :, :, :, r, :].float().view(B, nc, L, ng, nheads_per_group, hd)
                 delta_h_ref += torch.einsum('bclgk, bclgkp, bclgn -> bcgkpn',
                     decay_g, xg_r, Bg_rot[:, :, :, :, r, :].float()
                 ).reshape(B, nc, nh, hd, ds)
@@ -712,6 +700,218 @@ def test_fused_rope_full_layer():
     return passed
 
 
+def test_ssd_prep_triton_vs_pytorch():
+    """Verify fused SSD prep kernel matches PyTorch reference."""
+    from nanochat.ssd_triton import ssd_prep_fwd
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    batch, T, nheads, R, headdim = 2, 128, 4, 2, 64
+    ngroups, dstate = 2, 64
+    chunk_size = 64
+
+    # Raw inputs (already padded — T is multiple of chunk_size)
+    x_heads = torch.randn(batch, T, nheads, R, headdim, device=device)
+    dt = torch.rand(batch, T, nheads, device=device) * 0.1 + 0.01
+    lambda_raw = torch.randn(batch, T, nheads, device=device)
+    A = -torch.rand(nheads, device=device) * 0.5 - 0.01  # negative
+    B_raw = torch.randn(batch, T, ngroups, R, dstate, device=device)
+
+    # Triton prep
+    x_dt_g_t, x_dt_b_t, Bb_t, cum_log_dA_t, chunk_decay_t = \
+        ssd_prep_fwd(x_heads, dt, lambda_raw, A, B_raw, chunk_size)
+
+    # PyTorch reference
+    nc = T // chunk_size
+    L = chunk_size
+    lam = torch.sigmoid(lambda_raw)
+    alpha = torch.exp(A * dt)
+    coeff_beta = (1 - lam) * alpha
+    x_gamma = x_heads * lam.unsqueeze(-1).unsqueeze(-1)
+    x_beta = F.pad(x_heads[:, :-1], (0, 0, 0, 0, 0, 0, 1, 0)) * coeff_beta.unsqueeze(-1).unsqueeze(-1)
+    B_shifted = F.pad(B_raw[:, :-1], (0, 0, 0, 0, 0, 0, 1, 0))
+
+    x_g = x_gamma.view(batch, nc, L, nheads, R, headdim)
+    x_b = x_beta.view(batch, nc, L, nheads, R, headdim)
+    dt_ = dt.view(batch, nc, L, nheads)
+    dt_broad = dt_.unsqueeze(-1).unsqueeze(-1)
+    x_dt_g_ref = (x_g * dt_broad).bfloat16()
+    x_dt_b_ref = (x_b * dt_broad).bfloat16()
+    log_dA = (A * dt_).float()
+    cum_log_dA_ref = torch.cumsum(log_dA, dim=2)
+    chunk_decay_ref = torch.exp(cum_log_dA_ref[:, :, -1, :])
+    Bb_ref = B_shifted.view(batch, nc, L, ngroups, R, dstate)
+
+    all_ok = True
+    for name, tri, ref in [
+        ("x_dt_g", x_dt_g_t.float(), x_dt_g_ref.float()),
+        ("x_dt_b", x_dt_b_t.float(), x_dt_b_ref.float()),
+        ("Bb", Bb_t.float(), Bb_ref.float()),
+        ("cum_log_dA", cum_log_dA_t, cum_log_dA_ref),
+        ("chunk_decay", chunk_decay_t, chunk_decay_ref),
+    ]:
+        max_diff = (tri - ref).abs().max().item()
+        scale_val = ref.abs().max().item() + 1e-8
+        rel = max_diff / scale_val
+        ok = rel < 0.01
+        all_ok &= ok
+        print(f"    {name}: max_abs={max_diff:.6f}, rel={rel:.6f} {'PASS' if ok else 'FAIL'}")
+
+    return all_ok
+
+
+def test_compute_rope_angles_triton_vs_pytorch():
+    """Verify fused RoPE angle kernel matches PyTorch reference."""
+    from nanochat.ssd_triton import compute_rope_angles_fwd
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    # Test with padding needed (T=100, chunk_size=64 → T_padded=128)
+    batch, T, nheads, dstate = 2, 100, 4, 64
+    chunk_size = 64
+    half_d = dstate // 2
+    pad_len = chunk_size - (T % chunk_size)  # 28
+    T_padded = T + pad_len  # 128
+    nc = T_padded // chunk_size
+
+    dt = (torch.rand(batch, T, nheads, device=device) * 0.1 + 0.01).float()
+    theta_raw = torch.randn(batch, T, half_d, device=device).float()
+
+    # Pad inputs
+    dt_padded = F.pad(dt, (0, 0, 0, pad_len))
+    theta_padded = F.pad(theta_raw, (0, 0, 0, pad_len))
+
+    # Triton kernel
+    angles_chunked_t, angles_shifted_t = compute_rope_angles_fwd(
+        dt_padded, theta_padded, T, chunk_size)
+
+    # PyTorch reference
+    dt_mean = dt.mean(dim=-1, keepdim=True)  # (batch, T, 1)
+    raw_angles = dt_mean * theta_raw
+    cum_angles = -torch.cumsum(raw_angles.float(), dim=1)
+    cum_angles_padded = F.pad(cum_angles, (0, 0, 0, pad_len))
+    angles_chunked_ref = cum_angles_padded.view(batch, nc, chunk_size, half_d)
+    cum_angles_shifted = F.pad(cum_angles_padded[:, :-1], (0, 0, 1, 0), value=0.0)
+    angles_shifted_ref = cum_angles_shifted.view(batch, nc, chunk_size, half_d)
+
+    all_ok = True
+    for name, tri, ref in [
+        ("angles_chunked", angles_chunked_t, angles_chunked_ref),
+        ("angles_shifted", angles_shifted_t, angles_shifted_ref),
+    ]:
+        max_diff = (tri - ref).abs().max().item()
+        scale_val = ref.abs().max().item() + 1e-8
+        rel = max_diff / scale_val
+        ok = rel < 0.01
+        all_ok &= ok
+        print(f"    {name}: max_abs={max_diff:.6f}, rel={rel:.6f} {'PASS' if ok else 'FAIL'}")
+
+    return all_ok
+
+
+def test_trapezoidal_recurrent_triton_vs_pytorch():
+    """Verify fused Triton inference recurrence matches Python RoPE + recurrence."""
+    from nanochat.ssd_triton import trapezoidal_recurrent_fwd
+    from nanochat.mamba3 import _apply_rope_pairs
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    # (batch, T, n_heads, head_dim, d_state, R, ngroups)
+    configs = [
+        (2, 1, 4, 64, 64, 1, 4),     # T=1, R=1, per-head groups
+        (2, 1, 8, 64, 64, 2, 8),     # T=1, R=2, per-head groups
+        (1, 4, 4, 64, 64, 2, 4),     # T=4, R=2
+        (2, 1, 8, 128, 128, 2, 1),   # large dims, shared group
+        (2, 1, 8, 64, 128, 4, 2),    # R=4, asymmetric, grouped
+    ]
+
+    all_pass = True
+    for batch, T, n_heads, head_dim, d_state, R, ngroups in configs:
+        # Generate inputs
+        x = torch.randn(batch, T, n_heads, R, head_dim, device=device, dtype=torch.bfloat16)
+        A = -torch.rand(n_heads, device=device, dtype=torch.float32).abs() - 0.1
+        B = torch.randn(batch, T, ngroups, R, d_state, device=device, dtype=torch.bfloat16)
+        C = torch.randn(batch, T, ngroups, d_state, device=device, dtype=torch.bfloat16)
+        dt = torch.rand(batch, T, n_heads, device=device, dtype=torch.float32) * 0.4 + 0.05
+        lambda_raw = torch.randn(batch, T, n_heads, device=device, dtype=torch.float32)
+        theta_raw = torch.randn(batch, T, d_state // 2, device=device, dtype=torch.float32) * 0.1
+
+        h = torch.randn(batch, n_heads, head_dim, d_state, device=device, dtype=torch.float32) * 0.1
+        prev_bx = torch.randn(batch, n_heads, head_dim, d_state, device=device, dtype=torch.float32) * 0.1
+        scale = 1.0 / (d_state ** 0.5)
+
+        # ── Triton path ──
+        h_tri = h.clone()
+        prev_bx_tri = prev_bx.clone()
+        cum_angles = -torch.cumsum(
+            dt.mean(dim=-1, keepdim=True) * theta_raw, dim=1).float()
+        lam = torch.sigmoid(lambda_raw)
+        y_tri, state_tri = trapezoidal_recurrent_fwd(
+            x, A, B, C, dt, lam, cum_angles,
+            {'h': h_tri, 'prev_Bx': prev_bx_tri},
+            scale, ngroups, n_heads)
+
+        # ── Python reference (RoPE + recurrence) ──
+        h_ref = h.clone()
+        prev_bx_ref = prev_bx.clone()
+        # Apply RoPE
+        cos_a = torch.cos(cum_angles).to(B.dtype).unsqueeze(2)  # (B, T, 1, half)
+        sin_a = torch.sin(cum_angles).to(B.dtype).unsqueeze(2)
+        C_rot = _apply_rope_pairs(C, cos_a, sin_a)
+        B_rot = _apply_rope_pairs(B, cos_a.unsqueeze(3), sin_a.unsqueeze(3))
+
+        # Expand groups
+        heads_per_group = n_heads // ngroups
+        if ngroups != n_heads:
+            B_exp = B_rot.repeat_interleave(heads_per_group, dim=2)
+            C_exp = C_rot.repeat_interleave(heads_per_group, dim=2)
+        else:
+            B_exp = B_rot
+            C_exp = C_rot
+
+        lam_ref = torch.sigmoid(lambda_raw)
+        outputs = []
+        for t in range(T):
+            dt_t = dt[:, t]
+            lam_t = lam_ref[:, t]
+            alpha_t = torch.exp(A * dt_t)
+            beta_t = (1 - lam_t) * dt_t * alpha_t
+            gamma_t = lam_t * dt_t
+            x_t = x[:, t]
+            B_t = B_exp[:, t]
+            Bx_t = torch.einsum('bhri, bhrj -> bhij', x_t.float(), B_t.float())
+            h_ref = (alpha_t[:, :, None, None] * h_ref
+                     + beta_t[:, :, None, None] * prev_bx_ref
+                     + gamma_t[:, :, None, None] * Bx_t)
+            prev_bx_ref = Bx_t
+            C_t = C_exp[:, t]
+            y_t = torch.einsum('bhn, bhpn -> bhp', C_t.float(), h_ref) * scale
+            outputs.append(y_t)
+        y_ref = torch.stack(outputs, dim=1)
+
+        # Compare
+        y_diff = (y_tri - y_ref).abs().max().item()
+        y_scale = y_ref.abs().max().item() + 1e-8
+        y_rel = y_diff / y_scale
+
+        h_diff = (state_tri['h'] - h_ref).abs().max().item()
+        h_scale_val = h_ref.abs().max().item() + 1e-8
+        h_rel = h_diff / h_scale_val
+
+        ok = y_rel < 1e-3 and h_rel < 1e-3
+        if not ok:
+            print(f"    FAIL ({batch},{T},{n_heads},{head_dim},{d_state},{R},{ngroups}): "
+                  f"y_rel={y_rel:.6f}, h_rel={h_rel:.6f}")
+            all_pass = False
+
+    print(f"  Trapezoidal recurrent Triton vs Python ({len(configs)} configs): "
+          f"{'PASS' if all_pass else 'FAIL'}")
+    return all_pass
+
+
 if __name__ == "__main__":
     use_cuda = "--cuda" in sys.argv
 
@@ -768,6 +968,15 @@ if __name__ == "__main__":
 
         print("\n16. delta_h Triton vs Python:")
         all_pass &= test_delta_h_triton_vs_pytorch()
+
+        print("\n17. SSD prep Triton vs Python:")
+        all_pass &= test_ssd_prep_triton_vs_pytorch()
+
+        print("\n18. RoPE angles Triton vs Python:")
+        all_pass &= test_compute_rope_angles_triton_vs_pytorch()
+
+        print("\n19. Trapezoidal recurrent Triton vs Python:")
+        all_pass &= test_trapezoidal_recurrent_triton_vs_pytorch()
 
     if all_pass:
         print("\nAll tests PASSED!")

@@ -206,7 +206,11 @@ import torch.nn.functional as F
 # Triton kernels for CUDA (optional — falls back to PyTorch on CPU/MPS)
 _HAS_TRITON = False
 try:
-    from nanochat.ssd_triton import mamba3_chunk_scan_fwd, state_propagation_fwd, delta_h_fwd
+    from nanochat.ssd_triton import (
+        _mamba3_intra_fwd_op, _inter_chunk_output_fwd_op, _delta_h_fwd_op,
+        _state_propagation_fwd_op, _compute_rope_angles_fwd_op,
+        _ssd_prep_fwd_op, trapezoidal_recurrent_fwd,
+    )
     _HAS_TRITON = True
 except ImportError:
     pass
@@ -239,7 +243,7 @@ def _mamba3_intra_pytorch(Bg, Bb, x_dt_g, x_dt_b, cum_log_dA, C, scale, R, causa
     decay_matrix = torch.exp(log_decay_matrix)
     del log_decay_matrix
 
-    hpg = n_heads // ngroups
+    nheads_per_group = n_heads // ngroups
 
     # Batch CB scores across all R ranks in one GEMM (instead of R separate launches).
     # einsum handles the non-adjacent G dimension correctly (no manual reshape needed).
@@ -256,7 +260,7 @@ def _mamba3_intra_pytorch(Bg, Bb, x_dt_g, x_dt_b, cum_log_dA, C, scale, R, causa
 
         if ngroups < n_heads:
             decay_grouped = decay_matrix.view(
-                batch_size, n_chunks, L, L, ngroups, hpg)
+                batch_size, n_chunks, L, L, ngroups, nheads_per_group)
             scores_g = (scores_g.unsqueeze(-1) * decay_grouped
                         ).reshape(batch_size, n_chunks, L, L, n_heads)
             scores_b = (scores_b.unsqueeze(-1) * decay_grouped
@@ -274,36 +278,118 @@ def _mamba3_intra_pytorch(Bg, Bb, x_dt_g, x_dt_b, cum_log_dA, C, scale, R, causa
     return y_intra
 
 
+def _apply_rope_pairs(x, cos, sin):
+    """Apply RoPE rotation to tensor with paired dimensions.
 
-# ---- Custom ops for torch.compile compatibility (Triton path) ----
+    x:   (..., d_state)  where d_state is even
+    cos: (..., d_state//2) broadcastable to x's leading dims
+    sin: (..., d_state//2) broadcastable to x's leading dims
+
+    Splits d_state into first-half / second-half pairs and applies 2D rotation.
+    """
+    half = x.shape[-1] // 2
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+
+
+# ---- Shared PyTorch helpers (used by both CPU fallback and Triton backward) ----
+
+def _inter_chunk_output_pytorch(C_rot, all_states, cum_log_dA, scale, nheads_per_group):
+    """PyTorch inter-chunk output: y_inter = scale * exp(cum_log_dA) * einsum(C, states).
+
+    Args:
+        C_rot:             (batch, nc, L, ngroups, dstate) float32 — rotated C
+        all_states:        (batch, nc, nheads, headdim, dstate) float32 — accumulated states
+        cum_log_dA:        (batch, nc, L, nheads) float32 — cumulative log-decay
+        scale:             float — normalization scale (1/sqrt(dstate * R))
+        nheads_per_group:  int — heads per group (nheads // ngroups)
+    Returns:
+        y_inter: (batch, nc, L, nheads, headdim) float32
+    """
+    C_rot_f = C_rot.float()
+    ngroups = C_rot.shape[3]
+    n_heads = cum_log_dA.shape[-1]
+    if ngroups < n_heads:
+        batch, nc, L = C_rot.shape[:3]
+        head_dim, d_state = all_states.shape[-2], all_states.shape[-1]
+        all_states_g = all_states.view(
+            batch, nc, ngroups, nheads_per_group, head_dim, d_state)
+        y_inter = torch.einsum('bcign, bcgkpn -> bcigkp', C_rot_f, all_states_g)
+        y_inter = y_inter.reshape(batch, nc, L, n_heads, head_dim)
+    else:
+        y_inter = torch.einsum('bcihn, bchpn -> bcihp', C_rot_f, all_states)
+    return y_inter * (torch.exp(cum_log_dA).unsqueeze(-1) * scale)
+
+
+def _delta_h_pytorch(x_dt_g, x_dt_b, Bg_rot, Bb_rot, cum_log_dA):
+    """PyTorch delta_h: sum_r einsum(decay_to_end * x_dt, B_rot) over MIMO ranks.
+
+    Args:
+        x_dt_g:     (batch, nc, L, nheads, R, headdim) — gamma-weighted x*dt
+        x_dt_b:     (batch, nc, L, nheads, R, headdim) — beta-weighted x*dt
+        Bg_rot:     (batch, nc, L, ngroups, R, dstate) — rotated B (gamma)
+        Bb_rot:     (batch, nc, L, ngroups, R, dstate) — rotated B (beta/shifted)
+        cum_log_dA: (batch, nc, L, nheads) float32 — cumulative log-decay
+    Returns:
+        delta_h: (batch, nc, nheads, headdim, dstate) float32
+    """
+    batch, nc, L, n_heads, R, head_dim = x_dt_g.shape
+    ngroups = Bg_rot.shape[3]
+    d_state = Bg_rot.shape[5]
+    nheads_per_group = n_heads // ngroups
+    decay_to_end = torch.exp(cum_log_dA[:, :, -1:, :] - cum_log_dA)
+    delta_h = torch.zeros(batch, nc, n_heads, head_dim, d_state,
+                          device=x_dt_g.device, dtype=torch.float32)
+    if ngroups < n_heads:
+        decay_to_end_g = decay_to_end.view(batch, nc, L, ngroups, nheads_per_group)
+        for r in range(R):
+            xg_r = x_dt_g[:, :, :, :, r, :].view(
+                batch, nc, L, ngroups, nheads_per_group, head_dim)
+            xb_r = x_dt_b[:, :, :, :, r, :].view(
+                batch, nc, L, ngroups, nheads_per_group, head_dim)
+            delta_h = delta_h + (
+                torch.einsum('bclgk, bclgkp, bclgn -> bcgkpn',
+                             decay_to_end_g, xg_r,
+                             Bg_rot[:, :, :, :, r, :].float())
+                + torch.einsum('bclgk, bclgkp, bclgn -> bcgkpn',
+                               decay_to_end_g, xb_r,
+                               Bb_rot[:, :, :, :, r, :].float())
+            ).reshape(batch, nc, n_heads, head_dim, d_state)
+    else:
+        for r in range(R):
+            delta_h = delta_h + (
+                torch.einsum('bclh, bclhp, bclhn -> bchpn',
+                             decay_to_end, x_dt_g[:, :, :, :, r, :],
+                             Bg_rot[:, :, :, :, r, :].float())
+                + torch.einsum('bclh, bclhp, bclhn -> bchpn',
+                               decay_to_end, x_dt_b[:, :, :, :, r, :],
+                               Bb_rot[:, :, :, :, r, :].float()))
+    return delta_h
+
+
+def _state_propagation_pytorch(delta_h, chunk_decay):
+    """PyTorch state propagation: sequential prefix scan over chunks.
+
+    Args:
+        delta_h:     (batch, nc, nheads, headdim, dstate) float32 — per-chunk state deltas
+        chunk_decay: (batch, nc, nheads) float32 — exp(cum_log_dA[:, :, -1, :])
+    Returns:
+        all_states: (batch, nc, nheads, headdim, dstate) float32 — accumulated states
+                    (state *before* each chunk's delta is applied)
+    """
+    batch, n_chunks, n_heads, head_dim, d_state = delta_h.shape
+    states = delta_h.new_zeros(batch, n_heads, head_dim, d_state)
+    all_states = []
+    for c in range(n_chunks):
+        all_states.append(states)
+        states = chunk_decay[:, c, :, None, None] * states + delta_h[:, c]
+    return torch.stack(all_states, dim=1)
+
+
+# ---- Backward registrations for Triton custom ops ----
 if _HAS_TRITON:
-    @torch.library.custom_op("nanochat::mamba3_intra_fwd", mutates_args=())
-    def _mamba3_intra_fwd_op(
-        Bg: torch.Tensor, Bb: torch.Tensor,
-        x_dt_g: torch.Tensor, x_dt_b: torch.Tensor,
-        dA_cumsum: torch.Tensor, C: torch.Tensor,
-        cos_ang: torch.Tensor, sin_ang: torch.Tensor,
-        cos_angs: torch.Tensor, sin_angs: torch.Tensor,
-        scale: float, chunk_size: int, mimo_rank: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
-                                     cos_ang, sin_ang, cos_angs, sin_angs,
-                                     scale, chunk_size, mimo_rank)
-
-    @_mamba3_intra_fwd_op.register_fake
-    def _mamba3_intra_fwd_fake(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
-                                cos_ang, sin_ang, cos_angs, sin_angs,
-                                scale, chunk_size, mimo_rank):
-        batch, nchunks, L, nheads, R, headdim = x_dt_g.shape
-        ngroups = C.shape[3]
-        dstate = C.shape[4]
-        return (
-            x_dt_g.new_empty(batch, nchunks, L, nheads, headdim, dtype=torch.bfloat16),
-            Bg.new_empty(batch, nchunks, L, ngroups, R, dstate, dtype=torch.bfloat16),
-            Bb.new_empty(batch, nchunks, L, ngroups, R, dstate, dtype=torch.bfloat16),
-            C.new_empty(batch, nchunks, L, ngroups, dstate),
-        )
-
+    # -- mamba3_intra backward --
     def _mamba3_intra_autograd_bwd(ctx, dy_intra, dBg_rot_ext, dBb_rot_ext, dC_rot_ext):
         """Backward for within-chunk + between-chunk gradient accumulation.
 
@@ -315,18 +401,18 @@ if _HAS_TRITON:
         aot_autograd (from whole-model torch.compile) traces through this function,
         so these operations ARE compiled."""
         (Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
-         cos_ang, sin_ang, cos_angs, sin_angs) = ctx.saved_tensors
+         angles, angles_shifted) = ctx.saved_tensors
         scale = ctx.scale
         R = ctx.mimo_rank
         L = ctx.chunk_size
 
-        # Reconstruct rotated B/C from saved cos/sin (no trig recomputation)
-        fused = cos_ang.numel() > 0
+        # Recompute cos/sin from saved raw angles (saves 2 tensors vs saving cos/sin)
+        fused = angles.numel() > 0
         if fused:
-            cos_a = cos_ang.unsqueeze(3)    # (batch, nc, L, 1, half_d)
-            sin_a = sin_ang.unsqueeze(3)
-            cos_s = cos_angs.unsqueeze(3)
-            sin_s = sin_angs.unsqueeze(3)
+            cos_a = torch.cos(angles).unsqueeze(3)    # (batch, nc, L, 1, half_d)
+            sin_a = torch.sin(angles).unsqueeze(3)
+            cos_s = torch.cos(angles_shifted).unsqueeze(3)
+            sin_s = torch.sin(angles_shifted).unsqueeze(3)
             C_rot = _apply_rope_pairs(C, cos_a, sin_a).float()
             Bg_rot = _apply_rope_pairs(Bg, cos_a.unsqueeze(4), sin_a.unsqueeze(4))
             Bb_rot = _apply_rope_pairs(Bb, cos_s.unsqueeze(4), sin_s.unsqueeze(4))
@@ -348,17 +434,14 @@ if _HAS_TRITON:
             y_intra.backward(dy_intra)
 
         # Inverse-rotate gradients: dL/dBg_raw = R^{-1}(dL/dBg_rot)
-        # Inverse rotation uses -sin (negate sin_a/sin_s).
         if fused:
             neg_sin_a = (-sin_a).unsqueeze(4)
             neg_sin_s = (-sin_s).unsqueeze(4)
             cos_a4 = cos_a.unsqueeze(4)
             cos_s4 = cos_s.unsqueeze(4)
-            # Within-chunk gradients (from dy_intra)
             dBg = _apply_rope_pairs(Bg_.grad, cos_a4, neg_sin_a)
             dBb = _apply_rope_pairs(Bb_.grad, cos_s4, neg_sin_s)
             dC = _apply_rope_pairs(C_.grad, cos_a, -sin_a)
-            # Between-chunk gradients (from rotated tensor outputs)
             if dBg_rot_ext is not None:
                 dBg = dBg + _apply_rope_pairs(
                     dBg_rot_ext.float(), cos_a4, neg_sin_a)
@@ -371,13 +454,13 @@ if _HAS_TRITON:
             dC = C_.grad
 
         return (dBg, dBb, x_dt_g_.grad, x_dt_b_.grad,
-                dA_cumsum_.grad, dC, None, None, None, None, None, None, None)
+                dA_cumsum_.grad, dC, None, None, None, None, None)
 
     def _mamba3_intra_setup_context(ctx, inputs, output):
         (Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
-         cos_ang, sin_ang, cos_angs, sin_angs, scale, chunk_size, mimo_rank) = inputs
+         angles, angles_shifted, scale, chunk_size, mimo_rank) = inputs
         ctx.save_for_backward(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
-                              cos_ang, sin_ang, cos_angs, sin_angs)
+                              angles, angles_shifted)
         ctx.scale = scale
         ctx.chunk_size = chunk_size
         ctx.mimo_rank = mimo_rank
@@ -385,21 +468,140 @@ if _HAS_TRITON:
     _mamba3_intra_fwd_op.register_autograd(
         _mamba3_intra_autograd_bwd, setup_context=_mamba3_intra_setup_context)
 
+    # -- inter_chunk_output backward --
+    def _inter_chunk_output_bwd(ctx, dy):
+        C_rot, all_states, cum_log_dA = ctx.saved_tensors
+        scale = ctx.scale
+        nheads_per_group = ctx.nheads_per_group
+        with torch.enable_grad():
+            C_rot_ = C_rot.detach().requires_grad_()
+            all_states_ = all_states.detach().requires_grad_()
+            cum_log_dA_ = cum_log_dA.detach().requires_grad_()
+            y_inter = _inter_chunk_output_pytorch(
+                C_rot_, all_states_, cum_log_dA_, scale, nheads_per_group)
+            y_inter.backward(dy.float())
+        # dy passes through for y_intra: fused kernel computes y = y_inter + y_intra,
+        # so dy/d(y_intra) = dy unchanged.
+        return C_rot_.grad, all_states_.grad, cum_log_dA_.grad, dy, None, None
 
+    def _inter_chunk_output_setup_context(ctx, inputs, output):
+        C_rot, all_states, cum_log_dA, y_intra, scale, nheads_per_group = inputs
+        ctx.save_for_backward(C_rot, all_states, cum_log_dA)
+        ctx.scale = scale
+        ctx.nheads_per_group = nheads_per_group
 
-def _apply_rope_pairs(x, cos, sin):
-    """Apply RoPE rotation to tensor with paired dimensions.
+    _inter_chunk_output_fwd_op.register_autograd(
+        _inter_chunk_output_bwd,
+        setup_context=_inter_chunk_output_setup_context)
 
-    x:   (..., d_state)  where d_state is even
-    cos: (..., d_state//2) broadcastable to x's leading dims
-    sin: (..., d_state//2) broadcastable to x's leading dims
+    # -- delta_h backward --
+    def _delta_h_bwd(ctx, d_delta_h):
+        x_dt_g, x_dt_b, Bg_rot, Bb_rot, cum_log_dA = ctx.saved_tensors
+        with torch.enable_grad():
+            x_dt_g_ = x_dt_g.float().detach().requires_grad_()
+            x_dt_b_ = x_dt_b.float().detach().requires_grad_()
+            Bg_rot_ = Bg_rot.float().detach().requires_grad_()
+            Bb_rot_ = Bb_rot.float().detach().requires_grad_()
+            cum_log_dA_ = cum_log_dA.detach().requires_grad_()
+            delta_h = _delta_h_pytorch(
+                x_dt_g_, x_dt_b_, Bg_rot_, Bb_rot_, cum_log_dA_)
+            delta_h.backward(d_delta_h)
+        return x_dt_g_.grad, x_dt_b_.grad, Bg_rot_.grad, Bb_rot_.grad, cum_log_dA_.grad
 
-    Splits d_state into first-half / second-half pairs and applies 2D rotation.
-    """
-    half = x.shape[-1] // 2
-    x1 = x[..., :half]
-    x2 = x[..., half:]
-    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+    def _delta_h_setup_context(ctx, inputs, output):
+        x_dt_g, x_dt_b, Bg_rot, Bb_rot, cum_log_dA = inputs
+        ctx.save_for_backward(x_dt_g, x_dt_b, Bg_rot, Bb_rot, cum_log_dA)
+
+    _delta_h_fwd_op.register_autograd(
+        _delta_h_bwd, setup_context=_delta_h_setup_context)
+
+    # -- state_propagation backward --
+    def _state_propagation_bwd(ctx, d_all_states):
+        delta_h, chunk_decay = ctx.saved_tensors
+        with torch.enable_grad():
+            delta_h_ = delta_h.detach().requires_grad_()
+            chunk_decay_ = chunk_decay.detach().requires_grad_()
+            all_states = _state_propagation_pytorch(delta_h_, chunk_decay_)
+            all_states.backward(d_all_states)
+        return delta_h_.grad, chunk_decay_.grad
+
+    def _state_propagation_setup_context(ctx, inputs, output):
+        delta_h, chunk_decay = inputs
+        ctx.save_for_backward(delta_h, chunk_decay)
+
+    _state_propagation_fwd_op.register_autograd(
+        _state_propagation_bwd, setup_context=_state_propagation_setup_context)
+
+    # -- compute_rope_angles backward --
+    def _compute_rope_angles_bwd(ctx, d_angles_chunked, d_angles_shifted):
+        return None, None, None, None
+
+    def _compute_rope_angles_setup_context(ctx, inputs, output):
+        pass
+
+    _compute_rope_angles_fwd_op.register_autograd(
+        _compute_rope_angles_bwd,
+        setup_context=_compute_rope_angles_setup_context)
+
+    # -- ssd_prep backward --
+    def _ssd_prep_pytorch_ref(x_heads, dt, lambda_raw, A, B_raw, chunk_size):
+        """PyTorch reference for SSD prep (backward recomputation)."""
+        lam = torch.sigmoid(lambda_raw)
+        alpha = torch.exp(A * dt)
+        coeff_beta = (1 - lam) * alpha
+        lam_x = lam.unsqueeze(-1).unsqueeze(-1)
+        coeff_beta_x = coeff_beta.unsqueeze(-1).unsqueeze(-1)
+
+        x_gamma = x_heads * lam_x
+        x_beta = F.pad(x_heads[:, :-1], (0, 0, 0, 0, 0, 0, 1, 0)) * coeff_beta_x
+        B_shifted = F.pad(B_raw[:, :-1], (0, 0, 0, 0, 0, 0, 1, 0))
+
+        batch_size, T = x_heads.shape[:2]
+        nh = x_heads.shape[2]
+        R = x_heads.shape[3]
+        hd = x_heads.shape[4]
+        nc = T // chunk_size
+        L = chunk_size
+
+        x_g = x_gamma.view(batch_size, nc, L, nh, R, hd)
+        x_b = x_beta.view(batch_size, nc, L, nh, R, hd)
+        dt_chunked = dt.view(batch_size, nc, L, nh)
+        dt_broad = dt_chunked.unsqueeze(-1).unsqueeze(-1)
+        x_dt_g = (x_g * dt_broad).bfloat16()
+        x_dt_b = (x_b * dt_broad).bfloat16()
+
+        log_dA = (A * dt_chunked).float()
+        cum_log_dA = torch.cumsum(log_dA, dim=2)
+        chunk_decay = torch.exp(cum_log_dA[:, :, -1, :])
+
+        ng = B_raw.shape[2]
+        ds = B_raw.shape[4]
+        Bb = B_shifted.view(batch_size, nc, L, ng, R, ds)
+        return x_dt_g, x_dt_b, Bb, cum_log_dA, chunk_decay
+
+    def _ssd_prep_bwd(ctx, d_x_dt_g, d_x_dt_b, d_Bb, d_cum_log_dA,
+                      d_chunk_decay):
+        x_heads, dt, lambda_raw, A, B_raw = ctx.saved_tensors
+        chunk_size = ctx.chunk_size
+        with torch.enable_grad():
+            xh = x_heads.detach().requires_grad_()
+            dt_ = dt.detach().requires_grad_()
+            lr = lambda_raw.detach().requires_grad_()
+            A_ = A.detach().requires_grad_()
+            Br = B_raw.detach().requires_grad_()
+            outs = _ssd_prep_pytorch_ref(xh, dt_, lr, A_, Br, chunk_size)
+            grads = [d_x_dt_g.float(), d_x_dt_b.float(), d_Bb,
+                     d_cum_log_dA, d_chunk_decay]
+            torch.autograd.backward(outs, grads)
+        return xh.grad, dt_.grad, lr.grad, A_.grad, Br.grad, None
+
+    def _ssd_prep_setup_context(ctx, inputs, output):
+        x_heads, dt, lambda_raw, A, B_raw, chunk_size = inputs
+        ctx.save_for_backward(x_heads, dt, lambda_raw, A, B_raw)
+        ctx.chunk_size = chunk_size
+
+    _ssd_prep_fwd_op.register_autograd(
+        _ssd_prep_bwd, setup_context=_ssd_prep_setup_context)
 
 
 class Mamba3Layer(nn.Module):
@@ -517,30 +719,37 @@ class Mamba3Layer(nn.Module):
         # 6. SSD computation
         if ssm_state is None:
             # Training: Two-SSD decomposition
-            # Triton path: pass raw B/C + cum_angles, fuse RoPE inside kernel
+            # Triton path: pass raw B/C + theta_raw, fuse RoPE inside kernel
             # CPU fallback: pre-rotate B/C in Python
             if _HAS_TRITON and B_mat.device.type == 'cuda':
-                cum_angles = self._compute_rope_angles(dt, theta_raw)
-                y_heads = self._two_ssd_forward(
-                    x_heads, A, B_mat, C_mat, dt, lambda_raw,
-                    cum_angles=cum_angles)
+                y_heads = self._two_ssd_forward_triton(
+                    x_heads, A, B_mat, C_mat, dt, lambda_raw, theta_raw)
             else:
                 B_mat, C_mat = self._apply_data_dependent_rope(
                     B_mat, C_mat, dt, theta_raw)
-                y_heads = self._two_ssd_forward(
+                y_heads = self._two_ssd_forward_pytorch(
                     x_heads, A, B_mat, C_mat, dt, lambda_raw)
         else:
-            # Inference: trapezoidal recurrence (always pre-rotate)
-            B_mat, C_mat = self._apply_data_dependent_rope(
-                B_mat, C_mat, dt, theta_raw)
-            y_heads, ssm_state = self._trapezoidal_recurrent(
-                x_heads, A, B_mat, C_mat, dt, lambda_raw, ssm_state)
+            # Inference: trapezoidal recurrence
+            if _HAS_TRITON and x_heads.device.type == 'cuda':
+                # Fused Triton: RoPE + state update + output in one kernel
+                cum_angles = self._compute_rope_angles(dt, theta_raw)
+                lam = torch.sigmoid(lambda_raw)
+                y_heads, ssm_state = trapezoidal_recurrent_fwd(
+                    x_heads, A, B_mat, C_mat, dt, lam, cum_angles,
+                    ssm_state, self._ssd_scale, self.ngroups, self.n_heads)
+            else:
+                # CPU fallback: pre-rotate then recur
+                B_mat, C_mat = self._apply_data_dependent_rope(
+                    B_mat, C_mat, dt, theta_raw)
+                y_heads, ssm_state = self._trapezoidal_recurrent(
+                    x_heads, A, B_mat, C_mat, dt, lambda_raw, ssm_state)
 
-        # 8. Output gate: norm then gate with z
+        # 7. Output gate: norm then gate with z
         y = y_heads.reshape(B, T, self.d_inner)
         y = self._fused_norm_gate(y, z)
 
-        # 9. Output projection
+        # 8. Output projection
         y = self.out_proj(y)
 
         return y, ssm_state, None
@@ -614,36 +823,102 @@ class Mamba3Layer(nn.Module):
 
         return B_rotated, C_rotated
 
-    def _two_ssd_forward(self, x_heads, A, B, C, dt, lambda_raw,
-                         cum_angles=None):
-        """Two-SSD decomposition for trapezoidal discretization (training).
+    def _two_ssd_forward_triton(self, x_heads, A, B, C, dt, lambda_raw,
+                                theta_raw):
+        """Two-SSD forward using Triton kernels (CUDA only).
 
-        Decomposes the trapezoidal recurrence into two standard SSD calls:
-        - gamma-SSD: current timestep contribution (weighted by lambda)
-        - beta-SSD:  previous timestep contribution (weighted by (1-lambda)*alpha)
-
-        Fused implementation: shared decay infrastructure + combined state
-        propagation (one sequential loop instead of two).
+        B/C are raw (not pre-rotated); RoPE is fused inside the Triton kernel.
+        All preprocessing (lambda gating, x*dt, B shift, cumsum, cos/sin) is
+        handled by Triton custom_ops — only input padding remains in PyTorch.
 
         Args:
             x_heads:    (B, T, n_heads, R, head_dim)
             A:          (n_heads,)
-            B:          (B, T, ngroups, R, d_state) — after QK-norm (raw if cum_angles given)
-            C:          (B, T, ngroups, d_state) — after QK-norm (raw if cum_angles given)
+            B:          (B, T, ngroups, R, d_state) — raw (before RoPE)
+            C:          (B, T, ngroups, d_state) — raw (before RoPE)
             dt:         (B, T, n_heads)
             lambda_raw: (B, T, n_heads)
-            cum_angles: (B, T, d_state//2) float32, or None if B/C already rotated
+            theta_raw:  (B, T, d_state//2)
         Returns:
             y: (B, T, n_heads, head_dim)
         """
-        fused_rope = cum_angles is not None
+        R = self.mimo_rank
+        batch_size, T, n_heads, _, head_dim = x_heads.shape
+        d_state = C.shape[-1]
+        ngroups = C.shape[-2]
+        scale = self._ssd_scale
+        chunk_size = min(self.chunk_size, T)
 
+        # Pad T to multiple of chunk_size
+        pad_len = 0
+        if T % chunk_size != 0:
+            pad_len = chunk_size - (T % chunk_size)
+            x_heads    = F.pad(x_heads,    (0, 0, 0, 0, 0, 0, 0, pad_len))
+            dt         = F.pad(dt,         (0, 0, 0, pad_len))
+            lambda_raw = F.pad(lambda_raw, (0, 0, 0, pad_len))
+            B          = F.pad(B,          (0, 0, 0, 0, 0, 0, 0, pad_len))
+            C          = F.pad(C,          (0, 0, 0, 0, 0, pad_len))
+            theta_raw  = F.pad(theta_raw,  (0, 0, 0, pad_len))
+        T_padded = T + pad_len
+        n_chunks = T_padded // chunk_size
+        L = chunk_size
+
+        # === FUSED ROPE ANGLES (single Triton kernel) ===
+        # Replaces _compute_rope_angles (mean, multiply, cumsum) + angle shift.
+        angles_chunked, angles_shifted = _compute_rope_angles_fwd_op(
+            dt, theta_raw, T, chunk_size)
+
+        # === FUSED PREP (custom_op → 3 Triton sub-kernels) ===
+        # Replaces ~20 PyTorch ops: sigmoid, exp, pad-shift, cumsum, x*dt.
+        x_dt_g, x_dt_b, Bb, cum_log_dA, chunk_decay = \
+            _ssd_prep_fwd_op(x_heads, dt, lambda_raw, A, B, chunk_size)
+
+        # Views (free metadata ops)
+        Bg = B.view(batch_size, n_chunks, L, ngroups, R, d_state)
+        C_chunked = C.view(batch_size, n_chunks, L, ngroups, d_state)
+        nheads_per_group = n_heads // ngroups
+
+        # === WITHIN-CHUNK (Triton — L never materialized) ===
+        # cos/sin are computed in-kernel from raw angles (eliminates 4 HBM tensors).
+        y_intra, Bg_rot, Bb_rot, C_rot = _mamba3_intra_fwd_op(
+            Bg, Bb, x_dt_g, x_dt_b, cum_log_dA, C_chunked.float(),
+            angles_chunked, angles_shifted,
+            scale, L, R)
+
+        # === BETWEEN-CHUNK (all Triton custom_ops) ===
+        delta_h = _delta_h_fwd_op(x_dt_g, x_dt_b, Bg_rot, Bb_rot, cum_log_dA)
+        del x_dt_g, x_dt_b, Bg_rot, Bb_rot
+
+        all_states = _state_propagation_fwd_op(delta_h, chunk_decay)
+        del delta_h, chunk_decay
+
+        y = _inter_chunk_output_fwd_op(
+            C_rot, all_states, cum_log_dA, y_intra, scale, nheads_per_group)
+        y = y.contiguous().view(batch_size, T_padded, n_heads, head_dim)
+        if pad_len > 0:
+            y = y[:, :T]
+        return y
+
+    def _two_ssd_forward_pytorch(self, x_heads, A, B, C, dt, lambda_raw):
+        """Two-SSD forward using pure PyTorch (CPU/MPS fallback).
+
+        B/C must be pre-rotated by the caller (no fused RoPE).
+
+        Args:
+            x_heads:    (B, T, n_heads, R, head_dim)
+            A:          (n_heads,)
+            B:          (B, T, ngroups, R, d_state) — after QK-norm and RoPE
+            C:          (B, T, ngroups, d_state) — after QK-norm and RoPE
+            dt:         (B, T, n_heads)
+            lambda_raw: (B, T, n_heads)
+        Returns:
+            y: (B, T, n_heads, head_dim)
+        """
         R = self.mimo_rank
         lam = torch.sigmoid(lambda_raw)       # (B, T, n_heads) in (0, 1)
         alpha = torch.exp(A * dt)             # (B, T, n_heads) decay
         coeff_beta = (1 - lam) * alpha
 
-        # x is (B, T, nh, R, hd), need extra unsqueezes for broadcasting
         lam_x = lam.unsqueeze(-1).unsqueeze(-1)               # (B, T, nh, 1, 1)
         coeff_beta_x = coeff_beta.unsqueeze(-1).unsqueeze(-1)
 
@@ -652,11 +927,6 @@ class Mamba3Layer(nn.Module):
         B_shifted = F.pad(B[:, :-1], (0, 0, 0, 0, 0, 0, 1, 0))
         del lam, coeff_beta
 
-        # Shifted cum_angles for Bb: position t-1 angles (Bb uses B from prev timestep)
-        if fused_rope:
-            cum_angles_shifted = F.pad(cum_angles[:, :-1], (0, 0, 1, 0), value=0.0)
-
-        # Fused Two-SSD: shared decay + combined state propagation
         batch_size, T, n_heads, _, head_dim = x_gamma.shape
         d_state = C.shape[-1]
         ngroups = C.shape[-2]
@@ -673,9 +943,6 @@ class Mamba3Layer(nn.Module):
             B_shifted = F.pad(B_shifted, (0, 0, 0, 0, 0, 0, 0, pad_len))
             C       = F.pad(C,       (0, 0, 0, 0, 0, pad_len))
             dt      = F.pad(dt,      (0, 0, 0, pad_len))
-            if fused_rope:
-                cum_angles = F.pad(cum_angles, (0, 0, 0, pad_len))
-                cum_angles_shifted = F.pad(cum_angles_shifted, (0, 0, 0, pad_len))
         T_padded = T + pad_len
         n_chunks = T_padded // chunk_size
         L = chunk_size
@@ -685,122 +952,35 @@ class Mamba3Layer(nn.Module):
         x_b = x_beta.view(batch_size, n_chunks, L, n_heads, R, head_dim)
         Bg  = B.view(batch_size, n_chunks, L, ngroups, R, d_state)
         Bb  = B_shifted.view(batch_size, n_chunks, L, ngroups, R, d_state)
-        C_  = C.view(batch_size, n_chunks, L, ngroups, d_state)
-        dt_ = dt.view(batch_size, n_chunks, L, n_heads)
-
-        if fused_rope:
-            half_d = d_state // 2
-            angles_chunked = cum_angles.view(batch_size, n_chunks, L, half_d)
-            angles_shifted_chunked = cum_angles_shifted.view(
-                batch_size, n_chunks, L, half_d)
-            # Pre-compute cos/sin once for the within-chunk kernel.
-            # Eliminates trig from Triton kernel.
-            cos_a_f32 = torch.cos(angles_chunked)   # (batch, nc, L, half_d) float32
-            sin_a_f32 = torch.sin(angles_chunked)
-            cos_s_f32 = torch.cos(angles_shifted_chunked)
-            sin_s_f32 = torch.sin(angles_shifted_chunked)
+        C_chunked = C.view(batch_size, n_chunks, L, ngroups, d_state)
+        dt_chunked = dt.view(batch_size, n_chunks, L, n_heads)
 
         # === SHARED DECAY (computed once instead of twice) ===
-        log_dA = (A * dt_).float()
+        log_dA = (A * dt_chunked).float()
         cum_log_dA = torch.cumsum(log_dA, dim=2)
 
         # Pre-compute x*dt for all ranks (reused in within-chunk and between-chunk)
-        dt_broad = dt_.unsqueeze(-1).unsqueeze(-1)  # (batch, nc, L, nh, 1, 1)
+        dt_broad = dt_chunked.unsqueeze(-1).unsqueeze(-1)  # (batch, nc, L, nh, 1, 1)
         x_dt_g = (x_g * dt_broad).bfloat16()
         x_dt_b = (x_b * dt_broad).bfloat16()
 
-        # === WITHIN-CHUNK: Triton on CUDA (L never materialized), PyTorch fallback ===
-        hpg = n_heads // ngroups
-        C_f = C_.float()
-        if _HAS_TRITON and x_gamma.device.type == 'cuda':
-            assert fused_rope, "Triton path requires fused RoPE (cum_angles must be provided)"
-            # Custom op returns pre-rotated B/C alongside y_intra — rotation
-            # happens once (inside the scan kernel) and is shared with between-chunk.
-            y_intra, Bg_rot, Bb_rot, C_rot = _mamba3_intra_fwd_op(
-                Bg, Bb, x_dt_g, x_dt_b, cum_log_dA, C_f,
-                cos_a_f32, sin_a_f32, cos_s_f32, sin_s_f32,
-                scale, L, R)
-            del cos_a_f32, sin_a_f32, cos_s_f32, sin_s_f32
-        else:
-            y_intra = _mamba3_intra_pytorch(
-                Bg.float(), Bb.float(), x_dt_g.float(), x_dt_b.float(),
-                cum_log_dA, C_f, scale, R, self._causal_mask)
-            # B/C already rotated in non-fused path
-            C_rot = C_
-            Bg_rot = Bg
-            Bb_rot = Bb
+        # === WITHIN-CHUNK (PyTorch — materializes L×L decay matrix) ===
+        nheads_per_group = n_heads // ngroups
+        C_f = C_chunked.float()
+        y_intra = _mamba3_intra_pytorch(
+            Bg.float(), Bb.float(), x_dt_g.float(), x_dt_b.float(),
+            cum_log_dA, C_f, scale, R, self._causal_mask)
 
         chunk_decay = torch.exp(cum_log_dA[:, :, -1, :])
 
-        # Between-chunk delta_h: outer-product reduction over (L, R).
-        # Triton kernel computes decay_to_end in registers from cum_log_dA.
-        if (_HAS_TRITON and x_gamma.device.type == 'cuda'
-                and not torch.compiler.is_compiling()):
-            delta_h = delta_h_fwd(x_dt_g, x_dt_b, Bg_rot, Bb_rot, cum_log_dA)
-        else:
-            decay_to_end = torch.exp(cum_log_dA[:, :, -1:, :] - cum_log_dA)
-            delta_h = torch.zeros(batch_size, n_chunks, n_heads, head_dim, d_state,
-                                   device=x_gamma.device, dtype=torch.float32)
-            if ngroups < n_heads:
-                decay_to_end_g = decay_to_end.view(
-                    batch_size, n_chunks, L, ngroups, hpg)
-                for r in range(R):
-                    xg_r = x_dt_g[:, :, :, :, r, :].view(
-                        batch_size, n_chunks, L, ngroups, hpg, head_dim)
-                    xb_r = x_dt_b[:, :, :, :, r, :].view(
-                        batch_size, n_chunks, L, ngroups, hpg, head_dim)
-                    delta_h = delta_h + (
-                        torch.einsum('bclgk, bclgkp, bclgn -> bcgkpn',
-                                     decay_to_end_g, xg_r,
-                                     Bg_rot[:, :, :, :, r, :].float())
-                        + torch.einsum('bclgk, bclgkp, bclgn -> bcgkpn',
-                                       decay_to_end_g, xb_r,
-                                       Bb_rot[:, :, :, :, r, :].float())
-                    ).reshape(batch_size, n_chunks, n_heads, head_dim, d_state)
-            else:
-                for r in range(R):
-                    delta_h = delta_h + (
-                        torch.einsum('bclh, bclhp, bclhn -> bchpn',
-                                     decay_to_end, x_dt_g[:, :, :, :, r, :],
-                                     Bg_rot[:, :, :, :, r, :].float())
-                        + torch.einsum('bclh, bclhp, bclhn -> bchpn',
-                                       decay_to_end, x_dt_b[:, :, :, :, r, :],
-                                       Bb_rot[:, :, :, :, r, :].float()))
+        # Between-chunk: delta_h, state propagation, inter-chunk output
+        delta_h = _delta_h_pytorch(x_dt_g, x_dt_b, Bg, Bb, cum_log_dA)
         del x_dt_g, x_dt_b
 
-        # Single state propagation pass (instead of two)
-        # Use Triton kernel only outside torch.compile — the custom_op boundary
-        # fragments compile's backward graph, causing worse fusion overall.
-        # Under torch.compile, the Python loop is traced and fused natively.
-        if (_HAS_TRITON and delta_h.device.type == 'cuda'
-                and not torch.compiler.is_compiling()):
-            all_states = state_propagation_fwd(delta_h, chunk_decay)
-        else:
-            states = delta_h.new_zeros(batch_size, n_heads, head_dim, d_state)
-            all_states = []
-            for c in range(n_chunks):
-                all_states.append(states)
-                states = chunk_decay[:, c, :, None, None] * states + delta_h[:, c]
-            all_states = torch.stack(all_states, dim=1)
-        del delta_h
+        all_states = _state_propagation_pytorch(delta_h, chunk_decay)
+        del delta_h, chunk_decay
 
-        # Inter-chunk output — group-aware einsum avoids repeat_interleave.
-        # For ngroups=1: saves 268 MB (no C expansion) and uses 1 large matmul
-        # instead of n_heads small ones.
-        C_rot_f = C_rot.float() if fused_rope else C_f
-        decay_from_start = torch.exp(cum_log_dA)
-        if ngroups < n_heads:
-            # all_states: (B, nc, nheads, headdim, dstate) -> (B, nc, ngroups, hpg, headdim, dstate)
-            all_states_g = all_states.view(
-                batch_size, n_chunks, ngroups, hpg, head_dim, d_state)
-            state_contribution = torch.einsum(
-                'bcign, bcgkpn -> bcigkp', C_rot_f, all_states_g)
-            state_contribution = state_contribution.reshape(
-                batch_size, n_chunks, L, n_heads, head_dim)
-        else:
-            state_contribution = torch.einsum(
-                'bcihn, bchpn -> bcihp', C_rot_f, all_states)
-        y_inter = state_contribution * (decay_from_start.unsqueeze(-1) * scale)
+        y_inter = _inter_chunk_output_pytorch(C_f, all_states, cum_log_dA, scale, nheads_per_group)
 
         y = (y_intra + y_inter).to(x_gamma.dtype)
         y = y.contiguous().view(batch_size, T_padded, n_heads, head_dim)

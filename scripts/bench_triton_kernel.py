@@ -80,15 +80,11 @@ def make_inputs(batch, seq_len, d_model, expand, d_state, chunk_size, mimo_rank,
 
     angles = torch.randn(batch, nc, L, half_d, device=device, dtype=torch.float32) * 0.5
     angles_s = torch.randn(batch, nc, L, half_d, device=device, dtype=torch.float32) * 0.5
-    cos_ang = torch.cos(angles)
-    sin_ang = torch.sin(angles)
-    cos_angs = torch.cos(angles_s)
-    sin_angs = torch.sin(angles_s)
 
     scale = (d_state * R) ** -0.5
 
     return (Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
-            cos_ang, sin_ang, cos_angs, sin_angs, scale, L, R,
+            angles, angles_s, scale, L, R,
             n_heads, headdim, nc)
 
 
@@ -99,7 +95,7 @@ def compute_bytes(batch, nc, L, ngroups, R, d_state, n_heads, headdim):
     xdt_bytes = 2 * (batch * nc * L * n_heads * R * headdim * 2)  # bf16 x_dt
     dA_bytes = batch * nc * L * n_heads * 4
     c_bytes = batch * nc * L * ngroups * d_state * 4
-    cs_bytes = 4 * (batch * nc * L * half_d * 4)
+    cs_bytes = 2 * (batch * nc * L * half_d * 4)  # 2 angle tensors (was 4 cos/sin)
     out_bytes = batch * nc * L * n_heads * headdim * 2  # bf16 output
     return b_bytes + xdt_bytes + dA_bytes + c_bytes + cs_bytes + out_bytes
 
@@ -120,14 +116,14 @@ def compute_flops(batch, nc, L, n_heads, R, d_state, headdim):
 def bench_kernel(cfg, warmup=25, rep=100):
     """Benchmark the Triton forward kernel for one config."""
     inputs = make_inputs(**cfg)
-    Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, cos_ang, sin_ang, cos_angs, sin_angs, scale, L, R, n_heads, headdim, nc = inputs
+    Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C, angles, angles_s, scale, L, R, n_heads, headdim, nc = inputs
 
     d_state = cfg["d_state"]
     ngroups = cfg["ngroups"]
     batch = cfg["batch"]
 
     fn = lambda: mamba3_chunk_scan_fwd(Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
-                                        cos_ang, sin_ang, cos_angs, sin_angs,
+                                        angles, angles_s,
                                         scale, L, R)
     ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
 
@@ -143,7 +139,7 @@ def bench_kernel(cfg, warmup=25, rep=100):
     tflops = total_flops / (ms * 1e-3) / 1e12
 
     input_mb = sum(t.nelement() * t.element_size() for t in [Bg, Bb, x_dt_g, x_dt_b, dA_cumsum, C,
-                                                               cos_ang, sin_ang, cos_angs, sin_angs]) / 1e6
+                                                               angles, angles_s]) / 1e6
     out_mb = (batch * nc * L * n_heads * headdim * 2) / 1e6  # bf16 output
 
     return dict(ms=ms, gb_s=gb_s, tflops=tflops, block_info=block_info,
@@ -227,6 +223,77 @@ def bench_delta_h(cfg, warmup=25, rep=100):
                                decay_to_end, x_dt_b[:, :, :, :, r, :].float(),
                                Bb_rot[:, :, :, :, r, :].float()))
         return dh
+    ms_python = triton.testing.do_bench(fn_python, warmup=warmup, rep=rep)
+
+    speedup = ms_python / ms_triton
+    return dict(ms_triton=ms_triton, ms_python=ms_python, speedup=speedup)
+
+
+# ── Recurrent step benchmark ──────────────────────────────────────────────
+
+def bench_recurrent_step(cfg, warmup=25, rep=100):
+    """Benchmark fused Triton recurrent step vs Python (RoPE + recurrence) for T=1."""
+    from nanochat.ssd_triton import trapezoidal_recurrent_fwd
+    from nanochat.mamba3 import _apply_rope_pairs
+
+    d_inner = cfg["expand"] * cfg["d_model"]
+    n_heads = d_inner // cfg["d_state"]
+    head_dim = d_inner // n_heads
+    d_state = cfg["d_state"]
+    batch = cfg["batch"]
+    R = cfg["mimo_rank"]
+    ngroups = cfg["ngroups"]
+    T = 1
+
+    x = torch.randn(batch, T, n_heads, R, head_dim, device="cuda", dtype=torch.bfloat16)
+    A = -torch.rand(n_heads, device="cuda", dtype=torch.float32).abs() - 0.1
+    B = torch.randn(batch, T, ngroups, R, d_state, device="cuda", dtype=torch.bfloat16)
+    C = torch.randn(batch, T, ngroups, d_state, device="cuda", dtype=torch.bfloat16)
+    dt = torch.rand(batch, T, n_heads, device="cuda", dtype=torch.float32) * 0.4 + 0.05
+    lambda_raw = torch.randn(batch, T, n_heads, device="cuda", dtype=torch.float32)
+    theta_raw = torch.randn(batch, T, d_state // 2, device="cuda", dtype=torch.float32) * 0.1
+
+    h = torch.randn(batch, n_heads, head_dim, d_state, device="cuda", dtype=torch.float32) * 0.1
+    prev_bx = torch.randn_like(h) * 0.1
+    scale = 1.0 / (d_state ** 0.5)
+
+    # Triton
+    cum_angles = -torch.cumsum(dt.mean(dim=-1, keepdim=True) * theta_raw, dim=1).float()
+    lam = torch.sigmoid(lambda_raw)
+
+    def fn_triton():
+        h_t, pbx_t = h.clone(), prev_bx.clone()
+        return trapezoidal_recurrent_fwd(
+            x, A, B, C, dt, lam, cum_angles,
+            {'h': h_t, 'prev_Bx': pbx_t}, scale, ngroups, n_heads)
+    ms_triton = triton.testing.do_bench(fn_triton, warmup=warmup, rep=rep)
+
+    # Python reference
+    def fn_python():
+        h_r, pbx_r = h.clone(), prev_bx.clone()
+        # RoPE
+        cos_a = torch.cos(cum_angles).to(B.dtype).unsqueeze(2)
+        sin_a = torch.sin(cum_angles).to(B.dtype).unsqueeze(2)
+        C_rot = _apply_rope_pairs(C, cos_a, sin_a)
+        B_rot = _apply_rope_pairs(B, cos_a.unsqueeze(3), sin_a.unsqueeze(3))
+        heads_per_group = n_heads // ngroups
+        if ngroups != n_heads:
+            B_exp = B_rot.repeat_interleave(heads_per_group, dim=2)
+            C_exp = C_rot.repeat_interleave(heads_per_group, dim=2)
+        else:
+            B_exp, C_exp = B_rot, C_rot
+        # Recurrence
+        lam_ref = torch.sigmoid(lambda_raw)
+        for t in range(T):
+            dt_t, lam_t = dt[:, t], lam_ref[:, t]
+            alpha_t = torch.exp(A * dt_t)
+            beta_t = (1 - lam_t) * dt_t * alpha_t
+            gamma_t = lam_t * dt_t
+            Bx_t = torch.einsum('bhri, bhrj -> bhij', x[:, t].float(), B_exp[:, t].float())
+            h_r = alpha_t[:, :, None, None] * h_r + beta_t[:, :, None, None] * pbx_r + gamma_t[:, :, None, None] * Bx_t
+            pbx_r = Bx_t
+            y_t = torch.einsum('bhn, bhpn -> bhp', C_exp[:, t].float(), h_r) * scale
+        return y_t, {'h': h_r, 'prev_Bx': pbx_r}
     ms_python = triton.testing.do_bench(fn_python, warmup=warmup, rep=rep)
 
     speedup = ms_python / ms_triton
@@ -502,6 +569,17 @@ def main():
             for name, cfg in collect_configs(kernel_profiles):
                 r = bench_delta_h(cfg, args.warmup, args.rep)
                 results[f"delta_h/{name}"] = r
+                print(f"  [{name}] ({cfg_desc(cfg)})")
+                print(f"    Triton: {r['ms_triton']:.3f} ms | Python: {r['ms_python']:.3f} ms | "
+                      f"Speedup: {r['speedup']:.2f}x")
+                print("-" * 70)
+
+            print(sep)
+            print("RECURRENT STEP (Triton fused vs Python RoPE+recurrence, T=1)")
+            print(sep)
+            for name, cfg in collect_configs(kernel_profiles):
+                r = bench_recurrent_step(cfg, args.warmup, args.rep)
+                results[f"recurrent/{name}"] = r
                 print(f"  [{name}] ({cfg_desc(cfg)})")
                 print(f"    Triton: {r['ms_triton']:.3f} ms | Python: {r['ms_python']:.3f} ms | "
                       f"Speedup: {r['speedup']:.2f}x")
