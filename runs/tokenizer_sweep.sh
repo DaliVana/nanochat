@@ -58,7 +58,7 @@ run_experiment() {
 
     # 3) Run pretraining
     echo ">>> Starting pretraining (d${DEPTH})..."
-    torchrun --standalone --nproc_per_node=2 -m scripts.base_train -- \
+    uv run torchrun --standalone --nproc_per_node=2 -m scripts.base_train -- \
         --depth="${DEPTH}" \
         --run="${run_name}" \
         --model-tag="${run_name}" \
