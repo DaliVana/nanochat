@@ -28,7 +28,7 @@ import torch.distributed as dist
 from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
-from nanochat.tokenizer import get_tokenizer, get_token_bytes
+from nanochat.tokenizer import get_tokenizer, get_token_bytes, HuggingFaceTokenizer
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
@@ -78,6 +78,7 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+parser.add_argument("--tokenizer", type=str, default=None, help="path to a HuggingFace tokenizer JSON file (default: use cached RustBPE tokenizer)")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -119,8 +120,28 @@ else:
 
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
-tokenizer = get_tokenizer()
-token_bytes = get_token_bytes(device=device)
+if args.tokenizer is not None:
+    # Load a HuggingFace tokenizer from the specified JSON file path
+    tokenizer_path = args.tokenizer
+    assert os.path.exists(tokenizer_path), f"Tokenizer file not found: {tokenizer_path}"
+    from tokenizers import Tokenizer as HFTokenizer
+    hf_tok = HFTokenizer.from_file(tokenizer_path)
+    tokenizer = HuggingFaceTokenizer(hf_tok)
+    # Compute token_bytes on the fly for BPB evaluation
+    _vocab_size = tokenizer.get_vocab_size()
+    _special_set = set(tokenizer.get_special_tokens())
+    _token_bytes_list = []
+    for tid in range(_vocab_size):
+        ts = tokenizer.decode([tid])
+        if ts in _special_set:
+            _token_bytes_list.append(0)
+        else:
+            _token_bytes_list.append(len(ts.encode("utf-8")))
+    token_bytes = torch.tensor(_token_bytes_list, dtype=torch.int32, device=device)
+    print0(f"Loaded HuggingFace tokenizer from {tokenizer_path}")
+else:
+    tokenizer = get_tokenizer()
+    token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 
