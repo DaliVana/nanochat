@@ -133,11 +133,26 @@ class HuggingFaceTokenizer:
         assert bos is not None, "Failed to find BOS token in tokenizer"
         return bos
 
-    def encode(self, text, *args, **kwargs):
+    def encode(self, text, prepend=None, append=None, num_threads=None):
         if isinstance(text, str):
-            return self._encode_one(text, *args, **kwargs)
+            return self._encode_one(text, prepend=prepend, append=append)
         elif isinstance(text, list):
-            return [self._encode_one(t, *args, **kwargs) for t in text]
+            # Use encode_batch for parallel Rust-backed encoding
+            results = self.tokenizer.encode_batch(text, add_special_tokens=False)
+            if prepend is not None:
+                prepend_id = prepend if isinstance(prepend, int) else self.encode_special(prepend)
+            if append is not None:
+                append_id = append if isinstance(append, int) else self.encode_special(append)
+            token_lists = []
+            for enc in results:
+                ids = []
+                if prepend is not None:
+                    ids.append(prepend_id)
+                ids.extend(enc.ids)
+                if append is not None:
+                    ids.append(append_id)
+                token_lists.append(ids)
+            return token_lists
         else:
             raise ValueError(f"Invalid input type: {type(text)}")
 
