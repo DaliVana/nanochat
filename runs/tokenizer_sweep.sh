@@ -62,7 +62,8 @@ run_experiment() {
         --depth="${DEPTH}" \
         --run="${run_name}" \
         --model-tag="${run_name}" \
-        --device-batch-size=16
+        --target-flops=5e18 \
+        --device-batch-size=32
 
     echo ">>> Experiment ${run_name} complete."
 }
@@ -75,9 +76,9 @@ uv run python -m nanochat.dataset -n 170
 # --- Run all experiments ------------------------------------------------------
 
 # Pattern A sweep
-for i in "${!VOCAB_SIZES[@]}"; do
-    run_experiment "patA" "$PATTERN_A" "${VOCAB_SIZES[$i]}" "${VOCAB_LABELS[$i]}"
-done
+# for i in "${!VOCAB_SIZES[@]}"; do
+#     run_experiment "patA" "$PATTERN_A" "${VOCAB_SIZES[$i]}" "${VOCAB_LABELS[$i]}"
+# done
 
 # Pattern B sweep
 for i in "${!VOCAB_SIZES[@]}"; do
