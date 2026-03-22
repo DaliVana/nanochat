@@ -29,7 +29,7 @@ PATTERN_A="'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L
 # Pattern B: user-provided alternative pattern
 PATTERN_B="[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+(?:'[\p{L}\p{M}]+)*|0[xXbBoO][\p{N}a-fA-F]+|\p{N}{1,1}| ?[^\s\p{L}\p{N}]++[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 
-DEPTH=16
+DEPTH=20
 
 # --- Helper functions --------------------------------------------------------
 
@@ -39,7 +39,7 @@ run_experiment() {
     local vocab_size="$3"
     local vocab_label="$4"
 
-    local run_name="tok-${pattern_name}-D${DEPTH}-${vocab_label}"
+    local run_name="tok-${pattern_name}-${DEPTH}-${vocab_label}"
 
     echo ""
     echo "=============================================================================="
@@ -63,7 +63,7 @@ run_experiment() {
         --run="${run_name}" \
         --model-tag="${run_name}" \
         --target-flops=5e18 \
-        --device-batch-size=32
+        --device-batch-size=8
 
     echo ">>> Experiment ${run_name} complete."
 }
