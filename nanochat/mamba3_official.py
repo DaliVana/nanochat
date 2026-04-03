@@ -17,13 +17,16 @@ Limitations:
 import torch
 import torch.nn as nn
 
-try:
-    from mamba_ssm.modules.mamba3 import Mamba3
-except ImportError:
-    raise ImportError(
-        "mamba_ssm package is required for the official Mamba-3 backend. "
-        "Install with: uv sync --extra official-mamba"
-    )
+
+def _get_mamba3_cls():
+    try:
+        from mamba_ssm.modules.mamba3 import Mamba3
+        return Mamba3
+    except ImportError:
+        raise ImportError(
+            "mamba_ssm package is required for the official Mamba-3 backend. "
+            "Install with: uv sync --extra official-mamba"
+        )
 
 
 class Mamba3LayerOfficial(nn.Module):
@@ -55,6 +58,7 @@ class Mamba3LayerOfficial(nn.Module):
         assert self.n_heads % ngroups == 0, "n_heads must be divisible by ngroups"
 
         # Build the official Mamba3 with translated args
+        Mamba3 = _get_mamba3_cls()
         self._inner = Mamba3(
             d_model=d_model,
             d_state=d_state,
