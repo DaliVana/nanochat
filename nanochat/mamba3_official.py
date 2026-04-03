@@ -37,6 +37,12 @@ class Mamba3LayerOfficial(nn.Module):
     official implementation for its optimized kernels.
     """
 
+    # The official SISO kernel materializes a [chunk_size, chunk_size] QK score
+    # matrix in SRAM. At chunk_size=128 the working set (~307 KB) exceeds H100
+    # per-SM SRAM (228 KB), forcing a slow two-phase global-memory roundtrip.
+    # Cap at 64 (the official's own default) to keep everything in SRAM (~160 KB).
+    _OFFICIAL_MAX_CHUNK_SIZE = 64
+
     def __init__(self, d_model, d_state=64, expand=2, n_heads=None, ngroups=1,
                  chunk_size=256, mimo_rank=1, **official_kwargs):
         super().__init__()
@@ -48,9 +54,12 @@ class Mamba3LayerOfficial(nn.Module):
         self.n_heads = n_heads if n_heads is not None else self.d_inner // d_state
         self.head_dim = self.d_inner // self.n_heads
         self.ngroups = ngroups
-        self.chunk_size = chunk_size
         self.mimo_rank = mimo_rank
         self._ssd_scale = (d_state * mimo_rank) ** -0.5
+
+        # Cap chunk_size to avoid SRAM overflow in the official kernel
+        official_chunk_size = min(chunk_size, self._OFFICIAL_MAX_CHUNK_SIZE)
+        self.chunk_size = official_chunk_size
 
         assert d_state % 2 == 0, "d_state must be even for RoPE"
         assert mimo_rank >= 1, "mimo_rank must be >= 1"
@@ -68,7 +77,7 @@ class Mamba3LayerOfficial(nn.Module):
             rope_fraction=1.0,  # nanochat always uses full d_state for RoPE
             is_mimo=(mimo_rank > 1),
             mimo_rank=mimo_rank,
-            chunk_size=chunk_size,
+            chunk_size=official_chunk_size,
             **official_kwargs,
         )
 
