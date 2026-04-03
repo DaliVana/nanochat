@@ -104,6 +104,7 @@ class Mamba3LayerOfficial(nn.Module):
     # Forward
     # ------------------------------------------------------------------
 
+    @torch.compiler.disable
     def forward(self, x, ssm_state=None):
         """
         Args:
