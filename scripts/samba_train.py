@@ -27,7 +27,7 @@ import torch
 from nanochat.gpt_samba import GPTSamba as GPT, GPTConfigSamba as GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
-from nanochat.tokenizer import get_o200k_harmony_tokenizer, compute_token_bytes
+from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, find_last_step
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
@@ -147,8 +147,8 @@ else:
 
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
-tokenizer = get_o200k_harmony_tokenizer()
-token_bytes = compute_token_bytes(tokenizer, device=device)
+tokenizer = get_tokenizer()
+token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 
