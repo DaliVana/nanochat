@@ -136,5 +136,5 @@ class Mamba3LayerOfficial(nn.Module):
         # backward (SSM_States, Q_rot, K_scaled, Out_v, ...) — ~500 MB/layer in
         # bf16. Gradient checkpointing frees them after forward and recomputes
         # one layer at a time during backward, matching nanochat's memory profile.
-        y = grad_checkpoint(self._inner, x, use_reentrant=False)
+        y = grad_checkpoint(self._inner, x, use_reentrant=True)
         return y, None, None
