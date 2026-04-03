@@ -58,6 +58,7 @@ parser.add_argument("--mamba-expand", type=int, default=1, help="Mamba-3 expansi
 parser.add_argument("--mamba-ngroups", type=int, default=1, help="Mamba-3 B/C group count (1=max sharing, -1=per-head)")
 parser.add_argument("--mamba-chunk-size", type=int, default=128, help="Mamba-3 chunk size for SSD algorithm")
 parser.add_argument("--mimo-rank", type=int, default=1, help="MIMO rank (1=SISO, 2-4=rank-R shared-state MIMO, higher=more FLOPs/byte)")
+parser.add_argument("--mamba-backend", type=str, default="nanochat", choices=["nanochat", "official"], help="Mamba-3 kernel backend: 'nanochat' (custom Triton) or 'official' (mamba-ssm)")
 parser.add_argument("--gradient-checkpointing", action="store_true", help="recompute forward during backward to save memory (slower but fits longer contexts)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
@@ -173,6 +174,7 @@ def build_model_meta(depth):
         mamba_ngroups=mamba_ngroups,
         mamba_chunk_size=args.mamba_chunk_size,
         mimo_rank=args.mimo_rank,
+        mamba_backend=args.mamba_backend,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

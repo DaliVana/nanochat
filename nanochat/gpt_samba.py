@@ -55,6 +55,7 @@ class GPTConfigSamba:
     mamba_ngroups: int = 1      # B/C group count (1=max sharing, n_heads=per-head like original)
     mamba_chunk_size: int = 256 # chunk size for SSD algorithm
     mimo_rank: int = 1          # MIMO rank (1=SISO, >1=rank-R shared-state MIMO)
+    mamba_backend: str = "nanochat"  # "nanochat" (custom Triton) or "official" (mamba-ssm)
 
 
 def norm(x):
@@ -165,7 +166,12 @@ class MambaBlock(nn.Module):
     """
     def __init__(self, config):
         super().__init__()
-        self.mamba = Mamba3Layer(
+        if config.mamba_backend == "official":
+            from nanochat.mamba3_official import Mamba3LayerOfficial
+            MambaImpl = Mamba3LayerOfficial
+        else:
+            MambaImpl = Mamba3Layer
+        self.mamba = MambaImpl(
             d_model=config.n_embd,
             d_state=config.mamba_d_state,
             expand=config.mamba_expand,
@@ -265,15 +271,15 @@ class GPTSamba(nn.Module):
                 # Mamba block
                 mamba = block.mamba
                 torch.nn.init.uniform_(mamba.in_proj.weight, -s, s)
-                # A_log: log(1..n_heads) for diverse timescales
-                mamba.A_log.copy_(torch.log(torch.linspace(0.001, mamba.n_heads, mamba.n_heads, dtype=torch.float32, device=mamba.A_log.device)))
-                # dt_bias: softplus(-4..-2) gives ~0.02-0.13
                 torch.nn.init.uniform_(mamba.dt_bias, -4.0, -2.0)
                 torch.nn.init.zeros_(mamba.out_proj.weight)
                 mamba.B_norm_bias.fill_(1.0)
                 mamba.C_norm_bias.fill_(1.0)
-                # Re-initialize causal mask buffer (was garbage after to_empty from meta device)
-                mamba._causal_mask.copy_(torch.triu(torch.ones(mamba.chunk_size, mamba.chunk_size, dtype=torch.bool, device=mamba._causal_mask.device), diagonal=1))
+                if isinstance(mamba, Mamba3Layer):
+                    # Nanochat backend: fixed learned A_log + causal mask buffer
+                    mamba.A_log.copy_(torch.log(torch.linspace(0.001, mamba.n_heads, mamba.n_heads, dtype=torch.float32, device=mamba.A_log.device)))
+                    mamba._causal_mask.copy_(torch.triu(torch.ones(mamba.chunk_size, mamba.chunk_size, dtype=torch.bool, device=mamba._causal_mask.device), diagonal=1))
+                # Official backend: data-dependent A (no A_log), no causal mask buffer
 
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)
@@ -331,7 +337,8 @@ class GPTSamba(nn.Module):
         # Exclude non-matmul params
         mamba_scalar_numel = 0
         for name, p in self.named_parameters():
-            if 'A_log' in name or 'dt_bias' in name or 'B_norm_bias' in name or 'C_norm_bias' in name:
+            if any(k in name for k in ('A_log', 'dt_bias', 'B_norm_bias', 'C_norm_bias',
+                                        'B_bias', 'C_bias', '.D')):
                 mamba_scalar_numel += p.numel()
 
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
@@ -405,7 +412,8 @@ class GPTSamba(nn.Module):
         mamba_matrix_params = []
         attn_matrix_params = []
         for name, p in self.transformer.h.named_parameters():
-            if 'A_log' in name or 'dt_bias' in name or 'B_norm_bias' in name or 'C_norm_bias' in name:
+            if any(k in name for k in ('A_log', 'dt_bias', 'B_norm_bias', 'C_norm_bias',
+                                        'B_bias', 'C_bias', '.D')):
                 mamba_scalar_params.append(p)
             elif 'mamba.' in name:
                 mamba_matrix_params.append(p)

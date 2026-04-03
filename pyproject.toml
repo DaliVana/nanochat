@@ -64,6 +64,9 @@ cpu = [
 gpu = [
     "torch==2.9.1",
 ]
+official-mamba = [
+    "mamba-ssm>=2.3.0",
+]
 
 [tool.uv]
 conflicts = [
