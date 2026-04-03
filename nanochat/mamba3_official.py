@@ -16,6 +16,7 @@ Limitations:
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 
 def _get_mamba3_cls():
@@ -131,5 +132,9 @@ class Mamba3LayerOfficial(nn.Module):
                 "(4 separate tensors vs nanochat's dict). Use mamba_ssm.Mamba3.step() "
                 "directly for inference."
             )
-        y = self._inner(x)
+        # The official kernel saves ~27 large intermediate tensors per layer for
+        # backward (SSM_States, Q_rot, K_scaled, Out_v, ...) — ~500 MB/layer in
+        # bf16. Gradient checkpointing frees them after forward and recomputes
+        # one layer at a time during backward, matching nanochat's memory profile.
+        y = grad_checkpoint(self._inner, x, use_reentrant=False)
         return y, None, None
